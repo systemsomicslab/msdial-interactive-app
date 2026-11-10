@@ -4,6 +4,34 @@ Notable changes to MS-DIAL Interactive. The package version is kept in
 `pyproject.toml` and `msdial_app/__init__.py`; the Agent API version is separate.
 Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
 
+## [0.5.66] - Unreleased
+
+### Changed
+- **A campaign unit keeps its automatic alignment RT correction map, and a viewing restore puts it back.**
+  - Why: since MsdialWorkbench#884 the Console writes `AlignResult-<ts>.rtcorrection.tsv` beside the
+    alignment result whenever the automatic alignment RT correction ran. It holds the maps the alignment was
+    made with, and the MS-DIAL GUI reads it from beside the `.arf2` to move RTs between each file's measured
+    axis and the reference file's axis in its curation windows. Finalisation moved the alignment's other
+    containers out of the raw tree but not this file, so it was deleted with the raw data, and a reopened
+    project fell back to each peak's stored bounds.
+  - Now finalisation moves it into `output/msdial-intermediates/` with the rest of the alignment set,
+    inventories it as an `msdial_intermediate`, and `msdial_restore_project_for_viewing` copies it back beside
+    the `.arf2` (and its undo removes it) like every other moved container. A run without the correction
+    writes no map, and nothing changes for it. A laboratory or trial run leaves it beside its inputs, as it
+    leaves the other containers.
+- **The merged lipidome says which RT axis each polarity's rows are on.**
+  - Why: since #884 a Console run whose alignment the automatic RT correction moved onto a reference file's
+    axis writes a note in the first cell of its alignment exports' first line ("RT axis: aligned RTs are on
+    the RT axis of reference file ..."), appends `rt_original_min` to `.mdprovenance.tsv`, and adds one
+    `custom[n]` line to the mzTab-M. Interactive reads all three as before: every alignment export reader
+    finds the samples from the `Class` label, the provenance table has no reader here, and the mzTab-M
+    redaction numbers its own `custom[n]` after the highest. But `msdial_lipidomics_merge` wrote the
+    positive export's header over rows of both polarities, so its note named the positive reference for
+    negative rows aligned on the negative reference's axis.
+  - Now, when either polarity carries a note, the merged table's first cell, and that of its not-quantified side
+    table, names both: `Positive rows: ... | Negative rows: ...`, with "no automatic alignment
+    RT correction" for a polarity without one. Exports without a note merge to the same bytes as before.
+
 ## [0.5.65] - Unreleased
 
 Follow-ups to 0.5.64's anchor preview and approval, from a multi-agent review of the automatic alignment RT

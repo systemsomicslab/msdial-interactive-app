@@ -452,6 +452,39 @@ def describe_export(path: str | Path) -> dict[str, Any]:
     }
 
 
+def rt_axis_note(export: dict[str, Any]) -> str:
+    """The RT axis note an export carries in its first cell, or "" when it carries none.
+
+    Since MsdialWorkbench#884 an alignment the automatic alignment RT correction moved onto a reference
+    file's RT axis says so in the first cell of its first header line, which is otherwise empty. The cell
+    is the note only when the Class label stands further right.
+    """
+    header = export.get("header") or []
+    if export.get("first_sample_column", 0) <= 1 or not header or not header[CLASS_ROW]:
+        return ""
+    return header[CLASS_ROW][0].strip()
+
+
+def merged_header(positive: dict[str, Any], negative: dict[str, Any]) -> list[list[str]]:
+    """The positive export's header lines, with an RT axis note that is true of the merged rows.
+
+    The merged table holds rows of both polarities, each aligned on its own run's RT axis. The positive
+    header's note names only the positive run's reference file, so a run whose either polarity was
+    automatically RT corrected gets a note naming both; with neither, the header is the positive one as it
+    was. Commas and tabs never reach the note, which is written unquoted into a CSV or a TSV.
+    """
+    header = [list(row) for row in positive["header"]]
+    notes = (rt_axis_note(positive), rt_axis_note(negative))
+    if not any(notes) or positive.get("first_sample_column", 0) <= 1:
+        return header
+    uncorrected = "no automatic alignment RT correction; aligned RTs are on the alignment reference file's axis"
+    text = " | ".join(
+        f"{label} rows: {note or uncorrected}" for label, note in zip(("Positive", "Negative"), notes)
+    )
+    header[CLASS_ROW][0] = re.sub(r"[\t,\r\n]", " ", text)
+    return header
+
+
 def compare_sample_order(positive: dict[str, Any], negative: dict[str, Any]) -> dict[str, Any]:
     """Whether the two exports describe the same samples in the same order.
 
@@ -1586,8 +1619,9 @@ def merge_pos_neg(
             "injection order, which metabolomics_service.R compares as a group of its own."
         )
     delimiter = "," if output_path.suffix.lower() == ".csv" else "\t"
-    main_lines = [delimiter.join(cells) for cells in positive["header"]] + [delimiter.join(row) for _, row in kept]
-    with_delimiter = (["header"] if any(delimiter in cell for cells in positive["header"] for cell in cells) else []) + [
+    header = merged_header(positive, negative)
+    main_lines = [delimiter.join(cells) for cells in header] + [delimiter.join(row) for _, row in kept]
+    with_delimiter = (["header"] if any(delimiter in cell for cells in header for cell in cells) else []) + [
         _field(row, columns, "alignment_id") for _, row in kept if any(delimiter in cell for cell in row)
     ]
     if with_delimiter:
@@ -1604,7 +1638,7 @@ def merge_pos_neg(
     dotplots = {relative: _encode(lines) for relative, lines in tables["dotplots"].items()}
     side_lines = None
     if not_quantified_path is not None:
-        side_lines = [delimiter.join(cells) for cells in positive["header"]] + [
+        side_lines = [delimiter.join(cells) for cells in header] + [
             delimiter.join(row) for _, row, _ in not_quantified
         ]
     not_ascii = sorted(name for name, data in {**planned, **dotplots}.items() if not data.isascii())
