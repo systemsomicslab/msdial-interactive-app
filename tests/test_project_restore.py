@@ -88,7 +88,9 @@ class _Finalised(unittest.TestCase):
             for name in self.INPUTS:
                 writer.writerow([str(self.data / f"{name}.mzML"), name])
         self.relatives = [f"data/{name}_{TS}{suffix}" for name in self.INPUTS for suffix in (".dcl", ".pai2", "_tags.xml")]
-        self.relatives += [f"data/AlignResult-{TS}{suffix}" for suffix in (".arf2", ".dcl", ".EIC.aef", "_PeakProperties.arf")]
+        # The automatic alignment RT correction's map (MsdialWorkbench#884) goes back beside the .arf2 with it.
+        self.relatives += [f"data/AlignResult-{TS}{suffix}"
+                           for suffix in (".arf2", ".dcl", ".EIC.aef", "_PeakProperties.arf", ".rtcorrection.tsv")]
         moved, inventory = [], []
         for relative in self.relatives:
             path = self.retained / relative
@@ -167,6 +169,7 @@ class TheRestore(_Finalised):
         self.assertFalse(tool["restored"])
         self.assertEqual((len(self.relatives), True), (preview["containers"], preview["raw_files_present"]))
         self.assertIn(f"metabolights/MTBLS-SYN/unit-syn/raw/data/Sample_A_{TS}.dcl", preview["targets"])
+        self.assertIn(f"metabolights/MTBLS-SYN/unit-syn/raw/data/AlignResult-{TS}.rtcorrection.tsv", preview["targets"])
         self.assertEqual(f"_library_copies/o/{self.object_id}/library-copy.dbs", preview["library_copy"]["object"])
         self.assertEqual(f"metabolights/MTBLS-SYN/unit-syn/output/{DBS}", preview["library_copy"]["link"])
         self.assertEqual(["sharing", "raw_deletion"], preview["hold"]["blocks"])

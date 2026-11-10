@@ -10,6 +10,7 @@ from msdial_app.lipidome_merge import (
     describe_export,
     merge_pos_neg,
     read_adduct_rules,
+    rt_axis_note,
     should_keep,
 )
 
@@ -276,6 +277,128 @@ class MergeTests(unittest.TestCase):
         self.assertEqual(1, result["kept_rows"])
         self.assertEqual(3, result["dropped_rows"])
         self.assertEqual(3, sum(result["dropped_reasons"].values()))
+
+
+AXIS_NOTE = ("RT axis: aligned RTs are on the RT axis of reference file {} (automatic alignment RT correction); "
+             "per-file peak lists and RT-match evidence are on each file's measured RT axis")
+
+
+def _with_note(text: str, note: str) -> str:
+    """The export as the Console writes it after an automatic alignment RT correction (MsdialWorkbench#884)."""
+    return note + text
+
+
+class RetentionTimeAxisNoteTests(unittest.TestCase):
+    """The note in the first cell of an RT-corrected export's first line moves nothing, and the merge keeps it true."""
+
+    def _pair(self, directory: Path, positive_note: str = "", negative_note: str = "") -> tuple[Path, Path, Path]:
+        positive = directory / "pos.txt"
+        positive.write_text(_with_note(_export([("A_Pos", "SPF"), ("B_Pos", "GF")],
+                                               [_row("PC 34:1", "[M+H]+", "PC")]), positive_note), encoding="utf-8")
+        negative = directory / "neg.txt"
+        negative.write_text(_with_note(_export([("A_Neg", "SPF"), ("B_Neg", "GF")],
+                                               [_row("PE 34:1", "[M-H]-", "PE")]), negative_note), encoding="utf-8")
+        rules = directory / "rules.txt"
+        rules.write_text(RULES, encoding="utf-8")
+        return positive, negative, rules
+
+    def test_an_export_with_a_note_reads_as_one_without(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            plain, _negative, _rules = self._pair(Path(temporary))
+            before = describe_export(plain)  # read before the noted export takes its name
+            noted, _negative, _rules = self._pair(Path(temporary), positive_note=AXIS_NOTE.format("QC_03"))
+            after = describe_export(noted)
+
+        for key in ("first_sample_column", "columns", "sample_names", "sample_classes", "file_types", "rows"):
+            with self.subTest(key=key):
+                self.assertEqual(before[key], after[key])
+        self.assertEqual(AXIS_NOTE.format("QC_03"), rt_axis_note(after))
+        self.assertEqual("", rt_axis_note(before))
+
+    def _runs(self, directory: Path, positive_note: str = "", negative_note: str = "") -> dict[str, Path]:
+        """The alignment exports the two runs wrote, each in its run folder; the merge inputs stay without a note."""
+        sources = {}
+        for label, note in (("positive", positive_note), ("negative", negative_note)):
+            folder = directory / f"{label}_run"
+            folder.mkdir()
+            sources[label] = folder / "AlignResult-202611101200_Height.txt"
+            sources[label].write_text(_with_note(_export([("A_Pos", "SPF"), ("B_Pos", "GF")],
+                                                         [_row("PC 34:1", "[M+H]+", "PC")]), note), encoding="utf-8")
+        return sources
+
+    def test_the_merged_table_names_the_axis_of_each_polarity_from_the_runs_exports(self) -> None:
+        # Console normalize writes the matrices the merge reads, and they carry no note: the runs' exports do.
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            positive, negative, rules = self._pair(directory)
+            sources = self._runs(directory, negative_note=AXIS_NOTE.format("QC_Neg_03"))
+            (sources["negative"].parent / "automatic_alignment_rt_correction_summary.tsv").write_text(
+                "File name\tAnalytical order\tModel source\nQC_Neg_03\t3\tReference\nA_Neg\t1\tPiecewise\n",
+                encoding="utf-8")
+            for name in ("merged.txt", "merged.csv"):
+                with self.subTest(output=name):
+                    report = merge_pos_neg(positive, negative, rules, directory / name, rt_axis_sources=sources)
+                    first = (directory / name).read_text(encoding="utf-8").splitlines()[0]
+                    delimiter = "," if name.endswith(".csv") else "\t"
+                    note = first.split(delimiter)[0]
+                    self.assertTrue(note.startswith("Positive rows: its run's alignment export carries no RT axis note"),
+                                    note)
+                    self.assertIn(" | Negative rows: RT axis: aligned RTs are on the RT axis of reference file QC_Neg_03",
+                                  note)
+                    self.assertEqual(HEADER_WIDTH - 1, first.split(delimiter).index("Class"), "nothing moved")
+                    self.assertEqual(note, report["rt_axis"]["header_note"])
+                    self.assertEqual(("", AXIS_NOTE.format("QC_Neg_03")),
+                                     (report["rt_axis"]["notes"]["positive"], report["rt_axis"]["notes"]["negative"]))
+                    # The correction audit is found beside the run's export, not beside the normalized matrix.
+                    axes = report["polarity_reconciliation"]["rt_axes"]
+                    self.assertEqual(("QC_Neg_03", 3), (axes["negative"]["reference_file"],
+                                                        axes["negative"]["analytical_order"]))
+                    self.assertEqual({}, axes["positive"])
+
+    def test_without_the_runs_exports_a_merge_reads_the_axis_from_its_own_inputs(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            positive, negative, rules = self._pair(directory, positive_note=AXIS_NOTE.format("QC_Pos_02"))
+            report = merge_pos_neg(positive, negative, rules, directory / "merged.txt")
+            first = (directory / "merged.txt").read_text(encoding="utf-8").splitlines()[0]
+
+        self.assertTrue(first.startswith("Positive rows: RT axis: aligned RTs are on the RT axis of reference file "
+                                         "QC_Pos_02"), first)
+        self.assertIn(" | Negative rows: its run's alignment export carries no RT axis note\t", first)
+        self.assertEqual({"positive": str(positive), "negative": str(negative)}, report["rt_axis"]["sources"])
+
+    def test_a_merge_without_notes_writes_the_same_bytes_whatever_it_reads_the_axis_from(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            positive, negative, rules = self._pair(directory)
+            merge_pos_neg(positive, negative, rules, directory / "plain.txt")
+            merge_pos_neg(positive, negative, rules, directory / "sourced.txt", rt_axis_sources=self._runs(directory))
+            report = merge_pos_neg(positive, negative, rules, directory / "missing.txt",
+                                   rt_axis_sources={"positive": directory / "gone.txt", "negative": None})
+            plain, sourced, missing = ((directory / name).read_bytes() for name in ("plain.txt", "sourced.txt", "missing.txt"))
+
+        self.assertTrue(plain.startswith(b"\t"))
+        self.assertEqual(plain, sourced)
+        self.assertEqual(plain, missing, "an unread run export writes no note and refuses nothing")
+        # But it is not taken for an export without a note: the report and a warning say the axis is not known.
+        self.assertEqual({"positive": None, "negative": None}, report["rt_axis"]["notes"])
+        self.assertIn("gone.txt could not be read", report["rt_axis"]["unread"]["positive"])
+        self.assertEqual("no alignment export of its run was named", report["rt_axis"]["unread"]["negative"])
+        self.assertEqual(2, sum("is not known" in item for item in report["warnings"]))
+        self.assertIn("no alignment export of the negative run is known",
+                      report["polarity_reconciliation"]["rt_axes"]["reference_sentence"])
+
+    def test_a_polarity_whose_run_export_was_not_read_is_named_unknown_beside_a_note(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            positive, negative, rules = self._pair(directory)
+            sources = self._runs(directory, positive_note=AXIS_NOTE.format("QC_Pos_02"))
+            sources["negative"] = directory / "gone.txt"
+            merge_pos_neg(positive, negative, rules, directory / "merged.txt", rt_axis_sources=sources)
+            first = (directory / "merged.txt").read_text(encoding="utf-8").splitlines()[0].split("\t")[0]
+
+        self.assertTrue(first.endswith(" | Negative rows: its RT axis is not known (its run's alignment export was "
+                                       "not read)"), first)
 
 
 class ExportGeometryTests(unittest.TestCase):
