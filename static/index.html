@@ -359,7 +359,7 @@
                 <button id="browseAutomaticRtAnchorLibrary" type="button" class="secondary">Browse</button>
                 <button id="loadAutomaticRtAnchorLibrary" type="button" class="secondary" title="Discard unsaved editor changes and reread the file currently shown in this path.">Reload file</button>
               </div>
-              <span class="muted">Read as strictly as the Console reads it: the header line first, seven tab-separated columns, a decimal point, and True, False, T or F. In Hybrid a False row is an exclusion.</span>
+              <span class="muted">Read as strictly as the Console reads it: the header line first, seven tab-separated columns, a decimal point, and True, False, T or F. UTF-8, or Excel's "Unicode Text" (UTF-16 with a byte order mark). In Hybrid a False row is an exclusion. The path must be ASCII: the LC-MS Console reads the method file as ASCII. A library left here with the mode unset or Automatic is refused: choose UserOnly or Hybrid, or clear it.</span>
             </label>
             <div id="automaticRtAnchorEditor" class="nested-panel" hidden>
               <div class="section-head compact-head">
@@ -372,13 +372,13 @@
                   <tbody id="automaticRtAnchorRows"></tbody>
                 </table>
               </div>
-              <p class="muted">Saving writes a new timestamped ASCII file under Output root; the original file is not changed.</p>
+              <p class="muted">Saving writes a new timestamped UTF-8 file under Output root; the original file is not changed.</p>
             </div>
             <div class="button-row">
               <button id="runAutomaticRtPreview" type="button">Preview anchors (no alignment)</button>
             </div>
             <pre id="automaticRtPreviewLog" class="rt-correction-log" hidden></pre>
-            <p class="muted">The preview runs the Console on every file with this method and stops once the anchors are chosen: nothing is aligned, nothing is written beside the raw data, and its audit goes to a folder of its own under Output root. Review it in the RT correction audit viewer (Validate &amp; run), accept or reject each anchor, and approve: the approved anchors are written as a new anchor library under Output root, and the production run then uses it in UserOnly mode.</p>
+            <p class="muted">The preview runs the Console on every file with this method and stops once the anchors are chosen: nothing is aligned, nothing is written beside the raw data, and its audit goes to a folder of its own under Output root. Review it in the RT correction audit viewer (Validate &amp; run), accept or reject each anchor, and approve: the approved anchors are written as a new anchor library under Output root, and the production run then uses it in UserOnly mode. UserOnly counts the distinct anchors detected in the preview's reference file; when they are fewer than the minimum, the mode is left unset until you choose Hybrid. Flagged anchors (rejected in every other file, used only in the reference, missing or a duplicate there) are shown before you approve: they can move the production run's reference file, which is chosen again, not pinned.</p>
           </div>
           <p class="muted">After a preview, the RT correction audit viewer in Validate &amp; run shows every anchor for approval. After a run, it shows the chosen reference, accepted and rejected anchors, and file-specific shift curves.</p>
         </div>
@@ -386,7 +386,7 @@
       <div id="rtCorrectionLauncher" class="panel" hidden>
         <details id="legacyRtCorrection">
           <summary><strong>Legacy (not recommended): user-defined point-by-point RT correction</strong></summary>
-          <p class="muted">Kept so that existing worksets and templates that use it still load and run unchanged; it gets no new features. For new analyses, use automatic RT correction above, with named anchors (UserOnly or Hybrid) and the anchor preview when you want to choose the anchors yourself.</p>
+          <p class="muted">Kept for existing worksets and templates that use it; it gets no new features. A template's "Execute RT correction: True" is read with its anchor library and peak-selection file (relative paths against the template's folder); this page runs it only when both are set, and says so otherwise. It cannot be combined with automatic RT correction. For new analyses, use automatic RT correction above, with named anchors (UserOnly or Hybrid) and the anchor preview when you want to choose the anchors yourself.</p>
           <div class="section-head compact-head">
             <div>
               <h2>LC-MS retention time correction</h2>

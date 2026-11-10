@@ -277,8 +277,49 @@ class AutomaticRtReviewTests(unittest.TestCase):
         with self.anchors.open("a", encoding="utf-8") as handle:
             handle.write("1\tSample-1\t4\t400\t5\t\t\t0.4\t1\tFalse\tMadOutlier\n")
         result = read_automatic_rt_review(self.root)
-        self.assertTrue(any(item.startswith("1 anchor record(s) other than Missing or Ambiguous have unavailable RT")
+        self.assertTrue(any(item.startswith("1 anchor record(s) other than Missing, Ambiguous, Duplicate or a failed "
+                                            "run's Detected have unavailable RT")
                             for item in result["warnings"]))
+
+    def test_duplicate_and_same_original_rt_are_counted_once_not_rejected(self):
+        # CONF-49, CONF-51: the Console counts these once by design; they are no model rejection.
+        with self.anchors.open("a", encoding="utf-8") as handle:
+            handle.write("1\tSample-1\t4\t400\t5\t\t\t0.4\t1\tFalse\tDuplicate\n")
+            handle.write("1\tSample-1\t5\t500\t6\t6.01\t-0.01\t0.4\t1\tFalse\tSameOriginalRt\n")
+        result = read_automatic_rt_review(self.root)
+        self.assertEqual({"duplicate"}, {item["category"] for item in result["anchors"] if item["status"] in {"Duplicate", "SameOriginalRt"}})
+        self.assertNotIn("Duplicate", result["rejected_status_counts"])
+        self.assertNotIn("SameOriginalRt", result["rejected_status_counts"])
+        self.assertFalse(any("unavailable RT" in item for item in result["warnings"]), result["warnings"])
+        self.assertTrue(any("counted once by design" in item for item in result["notes"]))
+
+    def test_a_failed_runs_detected_records_are_not_rejections(self):
+        # CONF-49, CONF-51: the partial audit of a failed run has no reference file and Detected records.
+        self.summary.write_text(
+            SUMMARY.splitlines()[0] + "\n0\tSample-0\tSample\t1\t0\t0\t0\tUncorrected\t\t\t\tNot corrected: too few anchors\n"
+            "1\tSample-1\tSample\t2\t0\t0\t0\tUncorrected\t\t\t\tNot corrected: too few anchors\n",
+            encoding="utf-8",
+        )
+        self.anchors.write_text(
+            ANCHORS.splitlines()[0] + "\n0\tSample-0\t1\t100\t\t2.0\t\t\t1\tFalse\tDetected\n", encoding="utf-8"
+        )
+        result = read_automatic_rt_review(self.root)
+        self.assertEqual(["not_judged"], [item["category"] for item in result["anchors"]])
+        self.assertFalse(any("Rejected anchors" in item for item in result["warnings"]))
+        self.assertTrue(any("never judged" in item for item in result["notes"]))
+
+    def test_a_quoted_anchor_name_is_read_as_the_console_wrote_it(self):
+        # CONF-8, CONF-12: the Console writes cells unquoted, so a quote belongs to the name, and an unbalanced
+        # one swallows no row.
+        self.anchors.write_text(
+            ANCHORS.splitlines()[0] + "\tAnchor source\tAnchor name\n"
+            '0\tQC-1\t1\t100\t2\t2\t0\t0.8\t1\tTrue\tReference\tUser\t"PC 34:1, d7"\n'
+            '0\tQC-1\t2\t200\t4\t4\t0\t0.8\t1\tTrue\tReference\tUser\t"half quoted\n'
+            "1\tSample-1\t1\t100\t2\t2.1\t-0.1\t0.8\t1\tTrue\tUsed\tUser\tok\n",
+            encoding="utf-8",
+        )
+        result = read_automatic_rt_review(self.root)
+        self.assertEqual(['"PC 34:1, d7"', '"half quoted', "ok"], [item["anchor_name"] for item in result["anchors"]])
 
     # A smoothing value the Console discarded stops the smoothed preview.
 

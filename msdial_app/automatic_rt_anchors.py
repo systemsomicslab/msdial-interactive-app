@@ -21,8 +21,11 @@ The decisions the author took on 2026-11-07 are implemented as follows:
 - D1: an accepted automatic anchor becomes a True row at the reference file's observed RT and m/z, with
   the automatic correction's match RT tolerance, the MS1 tolerance it matched peaks with (MS1 tolerance
   for alignment), and a minimum height of 0;
-- D2: the production run defaults to UserOnly with the approved library; with fewer True rows than the
-  minimum anchor count UserOnly is refused, and the person has to choose Hybrid explicitly;
+- D2: the production run defaults to UserOnly with the approved library; with fewer anchors than the
+  minimum anchor count UserOnly is refused, and the person has to choose Hybrid explicitly. The anchors
+  are counted as the Console counts them (decision 4, 2026-11-10): the distinct anchors detected in the
+  preview's reference file. An accepted anchor the preview showed as missing or as a duplicate there, or
+  one within two MS1 scans of an anchor already counted, does not count;
 - D3: a rejected user anchor stays in the library as a False row and is never deleted; an accepted one
   keeps its own row as it was;
 - a rejected automatic anchor is written as a False row too, at the same values an accepted one would
@@ -38,6 +41,7 @@ import json
 import math
 import re
 import struct
+import threading
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -58,6 +62,20 @@ APPROVAL_SUFFIX = ".approval.json"
 APPROVED_LIBRARY_STEM = "automatic_rt_anchors_approved"
 APPROVAL_SCHEMA = "msdial-interactive/automatic-rt-anchor-approval/1"
 PREVIEW_SCHEMA = "msdial-interactive/automatic-rt-preview/1"
+# The preview job's end, written into the preview record by the backend that ran it: "completed",
+# "failed" or "cancelled". An approval needs "completed" when the record says.
+PREVIEW_JOB_STATUS = "job_status"
+# AutomaticAlignmentRetentionTimeCorrection.CoElutionScans: two peak tops within this many MS1 scan steps
+# of each other in the reference file are one anchor. The Console counts scan indices, each RT taken to
+# its nearest scan; in minutes that is up to CoElutionScans + 0.5 MS1 cycles apart.
+CO_ELUTION_SCANS = 2
+# A reference-file status of an anchor that found no single peak there: it carries no RT, so the Console
+# counts it nowhere.
+NOT_IN_REFERENCE_STATUSES = frozenset({"Missing", "MissingInReference", "Ambiguous"})
+# A user anchor whose reference-file peak lies within CoElutionScans scans of an earlier row's: it is the
+# same anchor, reported as Duplicate in every file and counted once.
+DUPLICATE_STATUS = "Duplicate"
+_APPROVAL_LOCK = threading.Lock()
 
 # What double.TryParse(text, NumberStyles.Float, CultureInfo.InvariantCulture) accepts once the text is
 # trimmed: a sign, digits with a decimal point, an exponent. No thousands separator, no decimal comma.
@@ -158,8 +176,44 @@ def parse_anchor_library(lines: Iterable[str]) -> list[dict[str, Any]]:
     return rows
 
 
+def decode_as_dotnet(data: bytes) -> str:
+    """Text as File.ReadAllLines(path, Encoding.UTF8) decodes it: a BOM names the encoding, else UTF-8.
+
+    That overload opens a StreamReader that detects a byte order mark: UTF-32 (little or big endian),
+    UTF-16 (little or big endian) and UTF-8. Excel's "Unicode Text (*.txt)" is tab-separated UTF-16LE with a
+    BOM, which the Console reads. Without a BOM the bytes are UTF-8, an invalid sequence read as U+FFFD.
+    """
+    for bom, codec in (
+        (b"\xff\xfe\x00\x00", "utf-32-le"),
+        (b"\x00\x00\xfe\xff", "utf-32-be"),
+        (b"\xff\xfe", "utf-16-le"),
+        (b"\xfe\xff", "utf-16-be"),
+        (b"\xef\xbb\xbf", "utf-8"),
+    ):
+        if data.startswith(bom):
+            return data[len(bom):].decode(codec, errors="replace")
+    return data.decode("utf-8", errors="replace")
+
+
+def method_file_readable_path(path: str | Path) -> bool:
+    """Whether the LC-MS Console reads this path back from a method file exactly as it was written.
+
+    ConfigParser.ReadForLcmsParameter reads method.txt as ASCII: every byte above 0x7F comes back as '?',
+    and on .NET Framework Path.GetFullPath then refuses the '?'. Printable ASCII is read back as written.
+    """
+    return all(" " <= character <= "~" for character in str(path))
+
+
+def unreadable_path_problem(path: str | Path, what: str) -> str:
+    return (
+        f"{what} {path} is not printable ASCII. The LC-MS MS-DIAL Console reads the method file as ASCII, "
+        "so every other character comes back as '?' and the path is not found. Move it to a folder whose "
+        "path is ASCII (a Japanese folder name, for one, romanized)."
+    )
+
+
 def read_anchor_library(path: str | Path) -> list[dict[str, Any]]:
-    """A library file's rows (parse_anchor_library), read as File.ReadAllLines reads it: UTF-8, any line break."""
+    """A library file's rows (parse_anchor_library), read as File.ReadAllLines reads it (decode_as_dotnet)."""
     if not str(path or "").strip():
         raise AnchorLibraryError(
             "Automatic RT correction anchor library file path is required when the anchor mode is UserOnly or Hybrid."
@@ -167,7 +221,7 @@ def read_anchor_library(path: str | Path) -> list[dict[str, Any]]:
     resource = Path(path).expanduser()
     if not resource.is_file():
         raise FileNotFoundError(f"The automatic RT correction anchor library was not found: {resource}")
-    text = resource.read_bytes().decode("utf-8-sig", errors="replace")
+    text = decode_as_dotnet(resource.read_bytes())
     lines = _LINE_BREAK.split(text)
     if lines and lines[-1] == "":
         lines.pop()
@@ -237,18 +291,18 @@ def _cell_number(value: Any, what: str, index: int) -> str:
 
 
 def anchor_library_text(rows: list[dict[str, Any]]) -> str:
-    """The library as the Console reads it: the header, then one seven-column ASCII row per entry."""
+    """The library as the Console reads it: the header, then one seven-column row per entry.
+
+    Written as UTF-8 without a BOM (write_anchor_library), which the Console's File.ReadAllLines reads: a
+    name is kept as the Console keeps it (Parse takes cells[0].Trim(), whatever it holds), so a library the
+    Console and the preview read, a non-ASCII or an empty name included, can be approved. Only a tab or a
+    line break, which no row the Console reads can hold, is refused.
+    """
     lines = [LIBRARY_HEADER]
     for index, row in enumerate(rows, start=1):
         name = str(row.get("name", "")).strip()
-        if not name:
-            raise AnchorLibraryError(f"Anchor row {index} requires a name.")
         if any(character in name for character in "\t\r\n"):
             raise AnchorLibraryError(f"Anchor row {index}: a name cannot hold a tab or a line break.")
-        if not name.isascii():
-            raise AnchorLibraryError(
-                f"Anchor row {index}: the name {name!r} is not ASCII; the anchor library is written as ASCII."
-            )
         include = row.get("include")
         if not isinstance(include, bool):
             include = str(include).strip().casefold() in {"true", "t"}
@@ -268,29 +322,60 @@ def anchor_library_text(rows: list[dict[str, Any]]) -> str:
     return "\n".join(lines) + "\n"
 
 
-def write_anchor_library(path: str | Path, rows: list[dict[str, Any]]) -> Path:
-    """Write a library and read it back with the strict reader, so what is written is what the Console reads."""
-    target = Path(path)
+def _checked_library_text(rows: list[dict[str, Any]]) -> str:
     text = anchor_library_text(rows)
     reread = parse_anchor_library(_LINE_BREAK.split(text)[:-1])
     if len(reread) != len(rows):
         raise AnchorLibraryError("The anchor library did not read back as written.")
+    return text
+
+
+def write_anchor_library(path: str | Path, rows: list[dict[str, Any]]) -> Path:
+    """Write a library and read it back with the strict reader, so what is written is what the Console reads."""
+    target = Path(path)
+    text = _checked_library_text(rows)
     target.parent.mkdir(parents=True, exist_ok=True)
-    with target.open("w", encoding="ascii", newline="") as handle:
+    with target.open("w", encoding="utf-8", newline="") as handle:
         handle.write(text)
     return target
 
 
-def timestamped_library_path(directory: str | Path, stem: str, now: dt.datetime | None = None) -> Path:
+def _library_candidates(directory: str | Path, stem: str, now: dt.datetime | None = None) -> Iterable[Path]:
     folder = Path(directory).expanduser().resolve()
     stamp = (now or dt.datetime.now()).strftime("%Y%m%d-%H%M%S")
     clean = re.sub(r"[^A-Za-z0-9_.-]+", "_", stem).strip("._") or APPROVED_LIBRARY_STEM
-    path = folder / f"{clean}_{stamp}.txt"
+    yield folder / f"{clean}_{stamp}.txt"
     suffix = 2
-    while path.exists():
-        path = folder / f"{clean}_{stamp}_{suffix}.txt"
+    while True:
+        yield folder / f"{clean}_{stamp}_{suffix}.txt"
         suffix += 1
-    return path
+
+
+def timestamped_library_path(directory: str | Path, stem: str, now: dt.datetime | None = None) -> Path:
+    """The first timestamped name not yet taken; create_timestamped_library claims one atomically."""
+    return next(path for path in _library_candidates(directory, stem, now) if not path.exists())
+
+
+def create_timestamped_library(
+    directory: str | Path, stem: str, rows: list[dict[str, Any]], now: dt.datetime | None = None
+) -> tuple[Path, str]:
+    """Write a library under a timestamped name no other writer holds; its path and the text's SHA-256.
+
+    Each name is created exclusively, so two writers in the same second (two browser tabs, the page and an
+    agent) never write one file: the second takes the next suffix. The SHA-256 is of the text written, not
+    of the file read back, so it can never describe another writer's library.
+    """
+    text = _checked_library_text(rows)
+    data = text.encode("utf-8")
+    Path(directory).expanduser().resolve().mkdir(parents=True, exist_ok=True)
+    for path in _library_candidates(directory, stem, now):
+        try:
+            with path.open("xb") as handle:
+                handle.write(data)
+        except FileExistsError:
+            continue
+        return path, hashlib.sha256(data).hexdigest()
+    raise AssertionError("unreachable")
 
 
 def approval_record_path(library_path: str | Path) -> Path:
@@ -348,6 +433,89 @@ def read_preview_record(directory: str | Path) -> dict[str, Any]:
     return record
 
 
+def mark_preview_job(directory: str | Path, status: str, exit_code: Any = None, error: str = "") -> None:
+    """Record how the preview job ended in its preview record, so an approval named by directory sees it.
+
+    The record is written before the Console starts; a failed or cancelled preview leaves a partial audit
+    beside it that says Run = Preview, as a completed one does. Best effort: a record that cannot be
+    rewritten leaves the approval's own checks on the audit (no reference file, "Not corrected" notes).
+    """
+    path = Path(directory) / PREVIEW_RECORD
+    try:
+        record = json.loads(path.read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError):
+        return
+    if not isinstance(record, dict) or record.get("schema") != PREVIEW_SCHEMA:
+        return
+    record[PREVIEW_JOB_STATUS] = str(status)
+    record["job_exit_code"] = exit_code
+    record["job_error"] = str(error or "")
+    record["job_finished_at"] = dt.datetime.now().astimezone().isoformat()
+    try:
+        path.write_text(json.dumps(record, ensure_ascii=False, indent=2), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def distinct_reference_anchors(
+    anchors: list[dict[str, Any]], keys_in_library_order: Iterable[str], scan_interval: float | None = None
+) -> dict[str, Any]:
+    """The accepted anchors the Console counts in the preview's reference file, in the approved library's order.
+
+    As SelectUserReference and DistinctUserAnchorsDetected count them: a row with no peak in the reference
+    file (Missing, MissingInReference, Ambiguous) counts for nothing; a row the preview showed as Duplicate
+    there took an earlier row's peak; and a row whose reference RT lies within CoElutionScans MS1 scans of a
+    row already counted is that row's anchor (in UserOnly an automatic anchor and its isotope, two adducts of
+    one standard). The scans are judged from the MS1 cycle the audit records at each anchor, or the reference
+    file's estimated scan interval: a peak within CoElutionScans + 0.5 cycles of a counted one shares its
+    nearest scan window. ``anchors`` are anchor_review entries; ``keys_in_library_order`` the accepted keys.
+    """
+    by_key = {item["key"]: item for item in anchors}
+    counted: list[dict[str, Any]] = []
+    not_counted: list[dict[str, str]] = []
+    for key in keys_in_library_order:
+        item = by_key.get(key)
+        if item is None:
+            continue
+        status = str(item.get("reference_status") or "")
+        label = _anchor_label(item)
+        rt = item.get("reference_rt") if status not in NOT_IN_REFERENCE_STATUSES else None
+        if status == DUPLICATE_STATUS:
+            not_counted.append({"key": key, "reason": f"{label} was a Duplicate in the preview's reference file: "
+                                "its peak was another row's, so the Console counts it once with that row."})
+            continue
+        if rt is None or not math.isfinite(float(rt)):
+            not_counted.append({"key": key, "reason": f"{label} was not detected in the preview's reference file "
+                                f"({status or 'no reference RT'}), so the Console counts it nowhere."})
+            continue
+        cycle = item.get("reference_cycle") or scan_interval
+        same = next(
+            (
+                other for other in counted
+                if _same_scan(float(rt), float(other["rt"]), max(filter(None, (cycle, other["cycle"], scan_interval)), default=None))
+            ),
+            None,
+        )
+        if same is not None:
+            not_counted.append({"key": key, "reason": f"{label} lies within {CO_ELUTION_SCANS} MS1 scans of "
+                                f"{same['label']} in the preview's reference file (RT {float(rt):.4f} and "
+                                f"{float(same['rt']):.4f} min); the Console counts them as one anchor."})
+            continue
+        counted.append({"key": key, "rt": float(rt), "cycle": cycle, "label": label})
+    return {"count": len(counted), "counted": [item["key"] for item in counted], "not_counted": not_counted}
+
+
+def _same_scan(rt: float, other: float, cycle: float | None) -> bool:
+    if not cycle or not math.isfinite(cycle) or cycle <= 0:
+        return abs(rt - other) <= 1e-9
+    return abs(rt - other) <= (CO_ELUTION_SCANS + 0.5) * cycle + 1e-9
+
+
+def _anchor_label(item: dict[str, Any]) -> str:
+    name = str(item.get("name") or "").strip()
+    return f"{item['key']}" + (f" ({name})" if name else "")
+
+
 def _matches(left: float | None, right: float | None) -> bool:
     if left is None or right is None:
         return False
@@ -365,6 +533,46 @@ def _audit_checksums(directory: Path) -> dict[str, str]:
 def automatic_anchor_name(anchor: dict[str, Any]) -> str:
     """A True or False row's name for an automatic anchor, which the Console leaves unnamed."""
     return f"auto{anchor['anchor_id']}_mz{anchor['mz']:.4f}_rt{anchor['reference_rt']:.3f}"
+
+
+def preview_failure(record: dict[str, Any], review: dict[str, Any]) -> str:
+    """Why a preview's audit cannot be approved, or "" when it can.
+
+    A preview that failed or was cancelled leaves a partial audit marked Run = Preview, as a completed one
+    does (LcmsProcess writes AutomaticRtCorrectionFailedException.PartialAudit with the preview's run). It
+    chose no reference file and no anchors, so approving it would write a library and an approval record
+    that claim a review of anchors nobody was shown. The preview's method-key evidence must also show a
+    preview that ran with its settings: a setting the Console listed as unusable or unrecognised was not the
+    one the anchors were chosen under.
+    """
+    rerun = " Run the preview again and approve the anchors of one that completed."
+    status = str(record.get(PREVIEW_JOB_STATUS) or "").strip()
+    if status and status != "completed":
+        error = str(record.get("job_error") or "").strip()
+        return (
+            f"The anchor preview {record.get('job_id') or ''} ended {status}"
+            + (f" ({error})" if error else "")
+            + "; its audit is a partial one." + rerun
+        )
+    not_corrected = [
+        str(item.get("note") or "").strip()
+        for item in review.get("files") or []
+        if str(item.get("note") or "").strip().startswith("Not corrected:")
+    ]
+    if review.get("reference") is None or not_corrected:
+        reason = not_corrected[0] if not_corrected else "no summary row has Model source Reference"
+        return (
+            "The preview's audit is the partial audit of a preview that failed before it chose its reference "
+            f"file and anchors ({reason})." + rerun
+        )
+    method_audit = review.get("method_audit") or {}
+    if method_audit.get("status") != "preview_only":
+        return (
+            "The preview's method-key evidence does not show a preview that ran with its settings "
+            f"({method_audit.get('reason') or method_audit.get('status') or 'no method-key record'}); the "
+            "anchors were not chosen under the settings the method file names." + rerun
+        )
+    return ""
 
 
 def approve_anchors(
@@ -396,6 +604,17 @@ def approve_anchors(
         raise ValueError(
             f"The audit in {directory} is not a preview's (its Run column says "
             f"{anchor_review.get('run') or 'nothing'}); anchors are approved from a preview."
+        )
+    failure = preview_failure(record, review)
+    if failure:
+        raise ValueError(failure)
+    root_text = str(output_root or record.get("output_root") or "").strip()
+    if root_text and not method_file_readable_path(Path(root_text).expanduser().resolve()):
+        raise ValueError(
+            unreadable_path_problem(
+                Path(root_text).expanduser().resolve(),
+                "The output root, where the approved anchor library would be written,",
+            )
         )
     anchors = anchor_review.get("anchors") or []
     keys = [item["key"] for item in anchors]
@@ -511,12 +730,36 @@ def approve_anchors(
     true_rows = sum(1 for row in rows if row["include"])
     user_only_issues = anchor_library_issues(_numbered(rows), "UserOnly", minimum)
     hybrid_issues = anchor_library_issues(_numbered(rows), "Hybrid", minimum)
+    # Decision 4 (2026-11-10): the UserOnly gate counts what the Console counts, the distinct anchors
+    # detected in the preview's reference file, not the True rows.
+    distinct = distinct_reference_anchors(
+        anchors,
+        [row["review_key"] for row in rows if row["include"] and row.get("review_key")],
+        (review.get("reference") or {}).get("estimated_scan_interval"),
+    )
+    if not user_only_issues and distinct["count"] < minimum:
+        user_only_issues = [
+            f"Of the {true_rows} True row(s), {distinct['count']} are distinct anchors detected in the preview's "
+            f"reference file, and UserOnly needs at least the minimum anchor count, {minimum}: the Console would "
+            "refuse the run after picking peaks in every file. "
+            + " ".join(item["reason"] for item in distinct["not_counted"])
+        ]
+    flagged = [
+        {"key": item["key"], "flags": list(item.get("flags") or [])}
+        for item in anchors
+        if item.get("flags") and decision.get(item["key"])
+    ]
     result: dict[str, Any] = {
         "written": False,
         "preview_directory": str(directory),
-        "preview_job_id": preview_job_id or str(record.get("job_id") or ""),
+        # The preview record's job, never the caller's word for it.
+        "preview_job_id": str(record.get("job_id") or "") or preview_job_id,
         "preview_anchor_mode": preview_mode,
         "preview_reference_file": preview_reference_file,
+        "distinct_reference_anchors": distinct["count"],
+        "distinct_reference_anchor_keys": distinct["counted"],
+        "not_counted_in_reference": distinct["not_counted"],
+        "accepted_flagged_anchors": flagged,
         "rows": [
             {key: row[key] for key in ("name", "rt", "rt_tolerance", "mz", "mz_tolerance", "minimum_height", "include", "origin")}
             for row in rows
@@ -540,11 +783,21 @@ def approve_anchors(
         },
     }
     if user_only_issues:
-        result["message"] = (
-            f"{true_rows} True row(s) are fewer than the minimum anchor count, {minimum}, so UserOnly is "
-            "refused. Choose Hybrid explicitly (the True rows are anchors and automatic anchors fill the RT "
-            "bins they leave empty; the False rows keep rejected candidates out), or accept more anchors."
+        counted = (
+            f"{true_rows} True row(s) are fewer than the minimum anchor count, {minimum}"
+            if true_rows < minimum
+            else f"{distinct['count']} of the {true_rows} True row(s) are distinct anchors detected in the "
+            f"preview's reference file, fewer than the minimum anchor count, {minimum}"
         )
+        result["message"] = (
+            f"{counted}, so UserOnly is refused. Choose Hybrid explicitly (the True rows are anchors and "
+            "automatic anchors fill the RT bins they leave empty; the False rows keep rejected candidates "
+            "out), or accept more anchors."
+        )
+    if flagged:
+        result["warnings"] = [
+            f"Accepted {item['key']}: " + " Also ".join(flag["message"] for flag in item["flags"]) for item in flagged
+        ]
     if hybrid_issues and user_only_issues:
         raise ValueError("The approved library would have no usable rows: " + " ".join(hybrid_issues))
     if not write:
@@ -553,13 +806,12 @@ def approve_anchors(
     person = str(confirmed_by or "").strip()
     if not person:
         raise ValueError("confirmed_by must name the person who approved these anchors.")
-    root = Path(output_root or record.get("output_root") or "").expanduser()
-    if not str(output_root or record.get("output_root") or "").strip():
+    if not root_text:
         raise ValueError("The production output root is unknown; pass output_root.")
+    root = Path(root_text).expanduser()
     approved_at = (now or dt.datetime.now().astimezone()).isoformat()
-    library = timestamped_library_path(root, APPROVED_LIBRARY_STEM, now)
-    write_anchor_library(library, rows)
-    library_sha256 = file_sha256(library)
+    with _APPROVAL_LOCK:
+        library, library_sha256 = create_timestamped_library(root, APPROVED_LIBRARY_STEM, rows, now)
     approval = {
         "schema": APPROVAL_SCHEMA,
         "approved_by": person,
@@ -588,12 +840,19 @@ def approve_anchors(
             "library_false_rows": sum(1 for row in rows if row["origin"] == "library_false_row"),
         },
         "minimum_anchors": minimum,
+        # What the UserOnly gate counted (decision 4); workflow validation checks a later minimum against it.
+        "distinct_reference_anchors": distinct["count"],
+        "distinct_reference_anchor_keys": distinct["counted"],
+        "not_counted_in_reference": distinct["not_counted"],
+        "accepted_flagged_anchors": flagged,
         "production_anchor_mode": result["production_anchor_mode"],
         "user_only_allowed": result["user_only_allowed"],
         "tolerances": result["tolerances"],
     }
     record_path = approval_record_path(library)
-    record_path.write_text(json.dumps(approval, ensure_ascii=False, indent=2), encoding="utf-8")
+    # The library's name is this request's alone (create_timestamped_library), and so is the record's.
+    with record_path.open("x", encoding="utf-8") as handle:
+        handle.write(json.dumps(approval, ensure_ascii=False, indent=2))
     result.update(
         {
             "written": True,

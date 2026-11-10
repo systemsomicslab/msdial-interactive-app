@@ -567,6 +567,13 @@ when the person asks, and is recorded as a deviation from the contract.
 - `possible_double_counts`: one lipid kept in both polarities or under two adducts,
   reported and never removed;
 - `polarity_reconciliation`:
+  - `rt_axes`: each polarity's automatic RT correction reference file (and its analytical
+    order), and `offset_min`, the median negative minus positive RT over the lipid names
+    each polarity annotates once. Each polarity's RTs are on its own reference file's axis,
+    and the pairs are matched within the tolerance on those two axes. An offset above half
+    the tolerance is a warning: read it out, since pairs can be missed or mispaired. The
+    rule itself is unchanged; whether to correct for the offset is an open question for
+    the author;
   - `counts` per class;
   - every `matched` pair: the positive name, alignment ID and RT, the negative ID and RT,
     and ΔRT;

@@ -69,14 +69,19 @@ Use these branches:
    writes its audit TSV files. Its anchors are automatic unless the user
    wants to choose them: then run the anchor preview
    (`msdial_start_automatic_rt_anchor_preview`, after confirmation), show
-   every anchor from `msdial_automatic_rt_anchor_review`, and let the user
-   accept or reject each one. The approval is the user's, never yours: pass
-   their decisions unchanged to `msdial_approve_automatic_rt_anchors`, first
-   with `confirmed=false` to show the rows, then with `confirmed=true` and
-   `confirmed_by` naming them. The production run then uses anchor mode
-   `UserOnly` with the approved library; when the approval reports
-   `user_only_allowed: false`, ask whether to run `Hybrid` instead and never
-   choose it for them.
+   every anchor from `msdial_automatic_rt_anchor_review`, read each anchor's
+   `flags` to the user (an anchor every other file rejected, or only the
+   reference used, can move the production run's reference file), and let the
+   user accept or reject each one. The approval is the user's, never yours:
+   pass their decisions unchanged to `msdial_approve_automatic_rt_anchors`,
+   first with `confirmed=false` to show the rows, then with `confirmed=true` and
+   `confirmed_by` naming them, naming the preview by its own job or directory.
+   The production run then uses anchor mode `UserOnly` with the approved
+   library, passed explicitly (a library without UserOnly or Hybrid is
+   refused); when the approval reports `user_only_allowed: false` (fewer
+   distinct anchors in the preview's reference file than the minimum), ask
+   whether to run `Hybrid` instead and never choose it for them. Never pass
+   `automatic_rt_correction_preview_only` as an answer: it is refused.
 5. Select official, existing, tiered lipid/MSP, or no annotation libraries.
 6. For LC-MS, decide whether to generate QA and collect internal-standard definitions when available. QA without internal standards still evaluates distributions and sample topology, but must not claim internal-standard stability.
 7. Decide whether to generate Materials and Methods and supplementary tables.

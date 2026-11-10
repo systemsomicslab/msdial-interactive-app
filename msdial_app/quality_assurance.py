@@ -198,6 +198,9 @@ def build_lcms_qa_report(
     )
     summary.update(_pca_qc_metrics(pca))
     summary = with_qc_minimum(summary)
+    internal_standard_summaries = _summarize_internal_standards(standards, standard_matches)
+    rt_axis = automatic_rt_axis(target.parent)
+    rt_axis_warnings = _mark_rt_axis(internal_standard_summaries, rt_axis)
     return {
         "status": "ok",
         "file": str(target),
@@ -206,9 +209,11 @@ def build_lcms_qa_report(
         "samples": sample_summaries,
         "intensity_distributions": _histograms(type_reservoirs),
         "pca": pca,
-        "internal_standards": _summarize_internal_standards(standards, standard_matches),
+        "internal_standards": internal_standard_summaries,
+        # Which axis the per-injection RTs (the internal standards' RT error included) are on (CONF-16/59).
+        "rt_axis": rt_axis,
         "reference_matching": matching.record(),
-        "warnings": _warnings(sample_summaries, pca) + matching.warnings(),
+        "warnings": _warnings(sample_summaries, pca) + matching.warnings() + rt_axis_warnings,
         "method": {
             "reference_match": (
                 "a feature counts as reference matched in an injection where MS-DIAL accepted an annotation of "
@@ -829,6 +834,78 @@ def _normalize_standard(item: dict[str, Any], index: int) -> dict[str, Any] | No
         "mz_tolerance": max(_number(item.get("mz_tolerance"), 0.01), 1e-9),
         "rt_tolerance": max(_number(item.get("rt_tolerance"), 0.5), 1e-9),
     }
+
+
+# A file's model source in the automatic RT correction's summary audit, and what it makes of the RT the QA
+# matrix carries for that injection.
+RT_MODEL_NOTES = {
+    "Reference": "the reference file: its measured RT",
+    "DetectedAnchors": "corrected onto the reference file's axis from its own anchors",
+    "InterpolatedBlank": "a Blank whose model was interpolated from neighbouring injections",
+    "NearestBlank": "a Blank whose model was copied from the nearest injection",
+    "Uncorrected": "not corrected: its measured RT, on its own axis",
+}
+
+
+def automatic_rt_axis(run_directory: str | Path) -> dict[str, Any]:
+    """Which RT axis a run's aligned per-injection RTs are on, from its automatic RT correction audit.
+
+    With the correction performed (automatic_rt_evidence.automatic_rt_correction_proof), every aligned RT of a
+    corrected file is on the reference file's axis, so an internal standard's RT error is the residual left
+    after the correction, not the instrument's drift; an Uncorrected file keeps its measured RT, and a Blank
+    carries a model interpolated or copied from its neighbours. {"corrected": False} otherwise.
+    """
+    from .automatic_rt_evidence import SUMMARY, _rows, automatic_rt_correction_proof
+
+    root = Path(run_directory)
+    try:
+        proof = automatic_rt_correction_proof(root)
+    except (OSError, ValueError):
+        return {"corrected": False}
+    if not proof.get("performed"):
+        return {"corrected": False}
+    try:
+        rows = _rows(root / SUMMARY)
+    except OSError:
+        rows = []
+    sources = {
+        str(row.get("File name") or "").strip(): str(row.get("Model source") or "").strip()
+        for row in rows
+        if str(row.get("File name") or "").strip()
+    }
+    return {
+        "corrected": True,
+        "reference_file": str(proof.get("reference_file_name") or ""),
+        "reference_file_id": str(proof.get("reference_file_id") or ""),
+        "model_sources": sources,
+        "label": f"RT error on {proof.get('reference_file_name') or 'the reference file'}'s corrected axis (min)",
+    }
+
+
+def _mark_rt_axis(standards: list[dict[str, Any]], rt_axis: dict[str, Any]) -> list[str]:
+    """Attach each internal-standard injection's RT model source, and say what the RT error then means."""
+    if not rt_axis.get("corrected"):
+        return []
+    sources = rt_axis.get("model_sources") or {}
+    marked: dict[str, int] = {}
+    for standard in standards:
+        for value in standard.get("values") or []:
+            source = sources.get(str(value.get("file") or ""), "")
+            value["rt_model_source"] = source
+            value["rt_axis_note"] = RT_MODEL_NOTES.get(source, "not in the RT correction audit")
+            if source in {"Uncorrected", "InterpolatedBlank", "NearestBlank"}:
+                marked[source] = marked.get(source, 0) + 1
+    warning = (
+        f"Per-injection RTs, the internal standards' RT error included, are on the reference file "
+        f"{rt_axis.get('reference_file') or ''}'s corrected axis after automatic alignment RT correction: the RT "
+        "error is the residual left after the correction, not the instrument's RT drift, which the anchor "
+        "offsets (QA figure 07) show."
+    )
+    if marked:
+        warning += " Injections off that axis are marked: " + ", ".join(
+            f"{source} ({count})" for source, count in sorted(marked.items())
+        ) + "; an Uncorrected injection's RT error is its measured deviation and stands out against the rest."
+    return [warning]
 
 
 def _summarize_internal_standards(

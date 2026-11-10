@@ -4,6 +4,94 @@ Notable changes to MS-DIAL Interactive. The package version is kept in
 `pyproject.toml` and `msdial_app/__init__.py`; the Agent API version is separate.
 Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
 
+## [0.5.65] - Unreleased
+
+Follow-ups to 0.5.64's anchor preview and approval, from a multi-agent review of the automatic alignment RT
+correction (finding IDs in parentheses) and the author's decisions of 2026-11-10.
+
+### Changed
+- **The UserOnly gate counts what the Console counts (decision 4; CONF-1, CONF-13, CONF-14, CONF-40).**
+  - Why: approval allowed UserOnly by counting True rows, while the Console counts the distinct anchors
+    detected in the reference file. On demo data1 neg, six approved rows were five anchors, because two
+    automatic anchors (m/z 337.0210 and 335.0045) lay one MS1 scan apart; with a minimum of six the
+    production run would have peak-picked every file and then been refused.
+  - Now `approve_anchors` counts the accepted anchors detected in the preview's reference file, in the
+    approved library's order. An anchor the preview showed as Missing, MissingInReference, Ambiguous or
+    Duplicate there does not count, nor does one within two MS1 scans (2.5 MS1 cycles from the audit's
+    `MS1 cycle at anchor`) of an anchor already counted. The result and the approval record carry
+    `distinct_reference_anchors`, its keys and `not_counted_in_reference`; workflow validation refuses
+    UserOnly with an approved library whose count is below the current minimum.
+- **The preview flags what can move the production run's reference file (decision 4).** The reference stays
+  automatic and is not pinned to the preview's. Each anchor of a preview carries `flags`, shown in the
+  review's anchor table ("Before you approve"), its warnings, `msdial_automatic_rt_anchor_review` and the
+  approval's `accepted_flagged_anchors`: an automatic anchor rejected by the outlier test in every other
+  file it was matched in, or used only in the reference file; an anchor missing or Duplicate in the
+  reference; one within two MS1 scans of another. On demo data1 neg the noise anchor at m/z 212.0746,
+  4.961 min was used only in C1 and rejected in every other file; approved, it moved the reference to E1.
+- **A library set without UserOnly or Hybrid is refused (CONF-4, CONF-9, PLAU-5).** It was a warning, and
+  the run went ahead in Automatic, dropping the person's decisions. After an approval that refuses UserOnly,
+  the page leaves the anchor mode unset until the person clicks "Use Hybrid with this library".
+- **The approved library is written as UTF-8 and read with its byte order mark (CONF-7, CONF-28, CONF-36,
+  CONF-47, CONF-48).** A non-ASCII or empty name, which the Console keeps, no longer refuses an approval
+  after a whole preview, and a UTF-16 or UTF-32 library with a BOM (Excel's "Unicode Text") reads as the
+  Console's `File.ReadAllLines` reads it. An ASCII library's bytes are unchanged.
+- **Methods text from the counts (CONF-11).** Named anchors are said to be used only when a corrected file
+  used one, the False rows only when they excluded something (new `excluded_candidate_count`), and a named
+  anchor is "searched for in each file" rather than "detected on every file".
+- **Analytical orders are whole and distinct on every entry path (CONF-61, CONF-62).** `validate_workflow`
+  refuses an analytical or batch order that is not a whole number from 0 to 2147483647 (the Console read
+  2.5, a blank or a word as the row position) and two files of one batch with one order, 0 included; orders
+  that restart per batch are a warning when the automatic correction is on. An analysis CSV keeps such a
+  value as written, with a warning, instead of truncating it. The sample_table check counts 0 too.
+- The web page keeps the analytical orders already given when a file is added or removed (CONF-21); added
+  files follow the last order. An emptied order field is blank, not 0.
+
+### Fixed
+- **Approval integrity.** A job id and a preview directory that name two different previews are refused,
+  in the approval and the review, instead of the job overriding the directory; the page sends the job of the
+  review on screen, or none (CONF-6, CONF-10). A failed or cancelled preview's partial audit is refused: the
+  preview record now records how its job ended, and an audit with no reference file or with "Not corrected:"
+  notes is refused (CONF-26, CONF-41, CONF-45, CONF-50). The preview's method-key evidence must show
+  `preview_only` (PLAU-4). The approval records the job its preview record names. Two approvals in one second
+  claim two library names exclusively, and the SHA-256 is of the text written (CONF-42).
+- **The preview switch is not an answer.** `automatic_rt_correction_preview_only` in a guided plan's answers
+  is refused with a pointer to the preview tool, instead of being dropped while a production run went ahead;
+  the preview endpoint takes it as its own (empirical finding).
+- **The Console's refusal reaches the job error.** A job that fails now says why, from the Console's log
+  ("Automatic alignment RT correction failed: ... reference file ID 2 ... fewer than 5 user anchors"), not
+  only "exited with code 4294967295", which is also shown as -1 (empirical finding).
+- The dry-run approval keeps "UserOnly is refused ... Choose Hybrid explicitly" in its message, and the agent
+  preview's refusal names the plan's blockers (an unusable library among them) (empirical findings).
+- **Paths the Console cannot read back are refused before a preview (CONF-29, CONF-33, CONF-37, CONF-46).**
+  The LC-MS Console reads `method.txt` as ASCII, so a non-ASCII anchor library path, or a non-ASCII output
+  root for a preview or an approval, is refused at validation with the reason.
+- **Audit TSVs are read without quote handling (CONF-8, CONF-12)**, as the Console writes them: a quoted
+  anchor name matches its library row, and an unbalanced quote swallows no row.
+- **Duplicate, SameOriginalRt and a failed run's Detected records are not model rejections (CONF-49,
+  CONF-51).** They are notes, outside "Rejected anchors require review" and the missing-RT warning.
+- **Legacy RT correction in a template is read (CONF-3, CONF-34, CONF-35, CONF-38).** A template's
+  "Execute RT correction", its library and peak-selection paths (against the template's folder) and its other
+  legacy lines reach the state, so the existence and mutual-exclusion checks apply; 0.5.64's "load and run
+  unchanged" was wrong, since the writer replaced them with False. A template's correction switches are the
+  defaults the answers override. Template lines are read as the Console reads them (':' or '=', one pair of
+  quotes, the last non-blank value), True/False lines strictly; the RT switches in answers accept
+  true/false/t/f/yes/no/on/off/1/0 and refuse anything else.
+- **Worksets do not carry the reference file ID (CONF-5)**: it is a row of one batch's file list.
+- **Table S1 lists what the method file wrote (CONF-39, CONF-43).** The anchor library and RT weight are
+  marked "not used" when the mode or selection does not read them, and the workbook carries the #845
+  evidence the CSV rows carry, with the approved-reference check.
+- **QA RT error is labelled with its axis (CONF-16, CONF-59).** With the correction performed, the internal
+  standards' RT error is on the reference file's corrected axis, a residual, not drift; the report says so,
+  the chart is labelled, and Uncorrected and interpolated-Blank injections are named.
+- An exclusions TSV is counted only when the run's summary says Hybrid and it is not older than the run's
+  method-key record (CONF-44).
+- The reference-check text no longer says the preview's reference is always chosen again (CONF-22): only when
+  every True row was written from the preview and that file detects as many anchors as any other.
+- The review reads the summary's optional `Analysis batch` column and shows it.
+- The lipidome merge records each polarity's RT correction reference file and the positive/negative RT axis
+  offset, and warns when it exceeds half the reconciliation tolerance (CONF-54, rule unchanged).
+- README presents the anchor modes, preview and approval, and titles the point-by-point path legacy (CONF-52).
+
 ## [0.5.64] - Unreleased
 
 ### Added

@@ -458,7 +458,8 @@ class MaterialsMethodsTests(unittest.TestCase):
         approval = {"library_sha256": "abc", "rows": {"automatic_accepted": 4, "automatic_rejected": 1}}
         for mode, expected, absent in (
             ("UserOnly", "approved.txt (SHA-256 abc) alone", "learned distributed anchor features and applied"),
-            ("Hybrid", "filled the retention-time bins they left empty", "alone:"),
+            # The audit's anchors are all automatic, so no named anchor was used (CONF-11).
+            ("Hybrid", "but no corrected file used one", "filled the retention-time bins they left empty"),
             ("Automatic", "learned distributed anchor features", "anchor library approved.txt"),
         ):
             with self.subTest(mode=mode), tempfile.TemporaryDirectory() as temporary:

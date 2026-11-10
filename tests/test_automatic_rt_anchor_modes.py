@@ -152,6 +152,26 @@ class TheLibraryIsReadAsStrictlyAsTheConsoleReadsIt(unittest.TestCase):
         tiny = parse_anchor_library(_library("a\t1\t1e-50\t100\t0.01\t0\tTrue").splitlines())
         self.assertIn("RT tolerance", anchor_library_issues(tiny, "UserOnly", 1)[0])
 
+    def test_a_utf16_or_utf32_library_with_a_bom_reads_as_the_console_reads_it(self) -> None:
+        # CONF-36, CONF-47: Excel's "Unicode Text" is UTF-16LE with a BOM; File.ReadAllLines reads every BOM.
+        text = _library("β-Alanine-d4\t1\t0.1\t100\t0.01\t0\tTrue", "b\t2\t0.1\t200\t0.01\t0\tFalse").replace("\n", "\r\n")
+        with tempfile.TemporaryDirectory() as temporary:
+            for codec, bom in (("utf-16-le", b"\xff\xfe"), ("utf-16-be", b"\xfe\xff"),
+                               ("utf-32-le", b"\xff\xfe\x00\x00"), ("utf-32-be", b"\x00\x00\xfe\xff")):
+                with self.subTest(codec=codec):
+                    path = Path(temporary) / f"{codec}.txt"
+                    path.write_bytes(bom + text.encode(codec))
+                    self.assertEqual(["β-Alanine-d4", "b"], [row["name"] for row in read_anchor_library(path)])
+
+    def test_a_name_the_console_reads_can_be_written(self) -> None:
+        # CONF-7, CONF-28, CONF-48: a non-ASCII or empty name, which the Console's Parse keeps, is written as UTF-8.
+        rows = [{"name": name, "rt": 1.0, "rt_tolerance": 0.1, "mz": 100.0, "mz_tolerance": 0.01,
+                 "minimum_height": 0, "include": True} for name in ("β-Alanine-d4", "", "Cer d18:1/17:0 (β)")]
+        with tempfile.TemporaryDirectory() as temporary:
+            path = write_anchor_library(Path(temporary) / "a.txt", rows)
+            self.assertFalse(path.read_bytes().startswith(b"\xef\xbb\xbf"), "no BOM")
+            self.assertEqual([row["name"] for row in rows], [row["name"] for row in read_anchor_library(path)])
+
     def test_what_is_written_reads_back_and_is_ascii(self) -> None:
         rows = [
             {"name": "IS-1", "rt": 2.5, "rt_tolerance": 0.2, "mz": 200.123456789, "mz_tolerance": 0.01,
@@ -167,7 +187,7 @@ class TheLibraryIsReadAsStrictlyAsTheConsoleReadsIt(unittest.TestCase):
             self.assertEqual([200.123456789, 254.12], [row["mz"] for row in reread])
             self.assertEqual([True, False], [row["include"] for row in reread])
             self.assertIn("\tFalse\n", data.decode("ascii"))
-        for bad in ({"name": ""}, {"name": "caf\u00e9"}, {"name": "a\tb"}, {"rt": float("nan")}):
+        for bad in ({"name": "a\tb"}, {"name": "a\nb"}, {"rt": float("nan")}):
             with self.subTest(bad=bad), self.assertRaises(AnchorLibraryError):
                 anchor_library_text([{**rows[0], **bad}])
 
@@ -328,8 +348,47 @@ class TheSettingsAreValidated(unittest.TestCase):
         self.assertTrue(short and "UserOnly needs at least the minimum anchor count, 3" in short[0], short)
         self.assertEqual([], self._issues(**{MODE: "UserOnly", LIBRARY: two, "automatic_rt_correction_minimum_anchors": 2}))
         self.assertEqual([], self._issues(**{MODE: "Hybrid", LIBRARY: two}))
-        warned = self._issues("warning", **{MODE: "Automatic", LIBRARY: two})
-        self.assertTrue(warned and "reads no library" in warned[0])
+
+    def test_a_library_without_userOnly_or_hybrid_is_refused(self) -> None:
+        # CONF-4, CONF-9, PLAU-5: a library set with the mode unset or Automatic is an error, never a quiet
+        # Automatic run, and nothing chooses Hybrid or UserOnly for the person.
+        two = self._library("a\t1\t0.1\t100\t0.01\t0\tTrue", "b\t2\t0.1\t200\t0.01\t0\tTrue")
+        for mode in ({}, {MODE: "Automatic"}, {MODE: ""}):
+            with self.subTest(mode=mode):
+                refused = self._issues(**{LIBRARY: two, **mode})
+                self.assertTrue(refused and "reads no library" in refused[0] and "Choose UserOnly" in refused[0], refused)
+        self.assertEqual([], self._issues(**{MODE: "Automatic"}))
+
+    def test_a_library_path_the_console_cannot_read_back_is_refused_before_a_preview(self) -> None:
+        # CONF-29, CONF-33, CONF-37, CONF-46: method.txt is read as ASCII by the LC-MS Console.
+        folder = self.root / "解析"
+        folder.mkdir()
+        library = folder / "anchors.txt"
+        library.write_text(_library("a\t1\t0.1\t100\t0.01\t0\tTrue"), encoding="ascii")
+        refused = self._issues(**{MODE: "Hybrid", LIBRARY: str(library)})
+        self.assertTrue(refused and "not printable ASCII" in refused[0], refused)
+        workflow = {**self.BASE, "output_root": str(folder), "files": []}
+        with self.assertRaises(ValueError) as caught:
+            prepare_automatic_rt_preview(workflow, self.root / "preview")
+        self.assertIn("not printable ASCII", str(caught.exception))
+
+    def test_userOnly_counts_the_approved_previews_distinct_anchors(self) -> None:
+        # Decision 4: an approved library records the distinct anchors its preview's reference detected, and
+        # UserOnly with a minimum above that count is refused before the Console starts.
+        library = Path(self._library(
+            "a\t1\t0.1\t100\t0.01\t0\tTrue", "b\t1.003\t0.1\t101\t0.01\t0\tTrue", "c\t3\t0.1\t300\t0.01\t0\tTrue"
+        ))
+        record = {
+            "schema": "msdial-interactive/automatic-rt-anchor-approval/1",
+            "library_sha256": hashlib.sha256(library.read_bytes()).hexdigest(),
+            "distinct_reference_anchors": 2,
+            "not_counted_in_reference": [{"key": "User-2", "reason": "User-2 lies within 2 MS1 scans of User-1."}],
+        }
+        Path(str(library) + ".approval.json").write_text(json.dumps(record), encoding="utf-8")
+        refused = self._issues(**{MODE: "UserOnly", LIBRARY: str(library)})
+        self.assertTrue(refused and "2 are distinct anchors" in refused[0] and "User-2 lies" in refused[0], refused)
+        self.assertEqual([], self._issues(**{MODE: "UserOnly", LIBRARY: str(library), "automatic_rt_correction_minimum_anchors": 2}))
+        self.assertEqual([], self._issues(**{MODE: "Hybrid", LIBRARY: str(library)}))
 
     def test_a_console_without_845_is_refused_only_when_a_setting_is_used(self) -> None:
         console = self.root / "MSDIALCUI.exe"
@@ -713,9 +772,11 @@ class TheMethodsTextWordsEachMode(unittest.TestCase):
         self.assertIn("alone", user_only)
         self.assertIn("approved.txt (SHA-256 abc)", user_only)
         self.assertNotIn("preview", user_only)
-        hybrid = _automatic_rt_anchor_sentence({**self.EVIDENCE, "anchor_mode": "Hybrid"}, {})
+        hybrid = _automatic_rt_anchor_sentence(
+            {**self.EVIDENCE, "anchor_mode": "Hybrid", "exclusion_count": 1, "excluded_candidate_count": 1}, {}
+        )
         self.assertIn("filled the retention-time bins", hybrid)
-        self.assertIn("False rows", hybrid)
+        self.assertIn("False row(s) kept 1 automatic candidate(s)", hybrid)
 
     def test_an_approval_is_said_only_for_the_library_that_ran(self) -> None:
         approval = {"library_sha256": "ABC", "rows": {"automatic_accepted": 5, "automatic_rejected": 1}}
@@ -921,6 +982,571 @@ class TheRunIsComparedWithThePreviewsReferenceFile(unittest.TestCase):
         self.assertEqual("differs", summary["automatic_rt_reference_check"]["status"])
         self.assertIn(check["warning"], summary["warnings"])
         self.assertNotIn("automatic_rt_reference_check", summarize_job({"id": "k", "status": "completed"}))
+
+
+def _set_reference_rt(root: Path, file_id: int, anchor_id: int, rt: str) -> None:
+    """Move one anchor's reference RT in a fixture audit (both its reference and original RT there)."""
+    anchors = root / "automatic_alignment_rt_correction_anchors.tsv"
+    stamp = anchors.stat().st_mtime
+    lines = anchors.read_text(encoding="utf-8").splitlines()
+    for index, line in enumerate(lines[1:], start=1):
+        cells = line.split("\t")
+        if cells[2] == str(anchor_id):
+            cells[4] = rt
+            if cells[0] == str(file_id):
+                cells[5] = rt
+            lines[index] = "\t".join(cells)
+    anchors.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    os.utime(anchors, (stamp, stamp))
+
+
+def _set_record(root: Path, **changes) -> None:
+    path = root / "automatic-rt-preview.json"
+    record = json.loads(path.read_text(encoding="utf-8"))
+    record.update(changes)
+    path.write_text(json.dumps(record), encoding="utf-8")
+
+
+ACCEPT_ALL = (["User-1", "Automatic-2", "Automatic-3", "User-4"], [])
+
+
+class TheUserOnlyGateCountsAsTheConsoleCounts(unittest.TestCase):
+    """Decision 4 (2026-11-10): distinct anchors detected in the preview's reference file, not True rows.
+
+    CONF-1, CONF-13, CONF-14, CONF-40, and the empirical pair of automatic anchors one MS1 scan apart.
+    """
+
+    def setUp(self) -> None:
+        self.directory = tempfile.TemporaryDirectory()
+        self.base = Path(self.directory.name)
+        self.preview = self.base / "preview"
+        _write_preview(self.preview, HYBRID_LIBRARY)
+
+    def tearDown(self) -> None:
+        self.directory.cleanup()
+
+    def test_an_anchor_missing_in_the_reference_counts_nothing(self) -> None:
+        _set_record(self.preview, minimum_anchors=4)
+        result = approve_anchors(self.preview, *ACCEPT_ALL)
+        # Four True rows pass the Console's static Check; User-4 was MissingInReference, so three anchors count.
+        self.assertEqual(4, result["true_rows"])
+        self.assertEqual(3, result["distinct_reference_anchors"])
+        self.assertFalse(result["user_only_allowed"])
+        self.assertEqual("", result["production_anchor_mode"])
+        self.assertIn("3 of the 4 True row(s) are distinct anchors", result["message"])
+        self.assertIn("UserOnly is refused", result["message"])
+        self.assertTrue(any(item["key"] == "User-4" and "not detected" in item["reason"] for item in result["not_counted_in_reference"]))
+        _set_record(self.preview, minimum_anchors=3)
+        self.assertTrue(approve_anchors(self.preview, *ACCEPT_ALL)["user_only_allowed"])
+
+    def test_two_anchors_within_two_ms1_scans_count_once(self) -> None:
+        # Automatic-3 moved to 2.53 min, 1.5 MS1 cycles (0.02 min) from Automatic-2 at 2.5 min.
+        _set_reference_rt(self.preview, 1, 3, "2.53")
+        result = approve_anchors(self.preview, *ACCEPT_ALL)
+        self.assertEqual(2, result["distinct_reference_anchors"])
+        self.assertFalse(result["user_only_allowed"])
+        reason = next(item["reason"] for item in result["not_counted_in_reference"] if item["key"] == "Automatic-3")
+        self.assertIn("within 2 MS1 scans of Automatic-2", reason)
+        review = read_automatic_rt_review(self.preview)
+        flagged = next(item for item in review["anchor_review"]["anchors"] if item["key"] == "Automatic-3")
+        self.assertIn("same_scan_as", [flag["code"] for flag in flagged["flags"]])
+
+    def test_a_duplicate_in_the_reference_counts_once(self) -> None:
+        anchors = self.preview / "automatic_alignment_rt_correction_anchors.tsv"
+        stamp = anchors.stat().st_mtime
+        lines = anchors.read_text(encoding="utf-8").splitlines()
+        lines = [line.replace("\tReference\t", "\tDuplicate\t") if line.startswith("1\tF1\t1\t") else line for line in lines]
+        anchors.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        os.utime(anchors, (stamp, stamp))
+        result = approve_anchors(self.preview, *ACCEPT_ALL)
+        self.assertEqual(2, result["distinct_reference_anchors"])
+        self.assertIn("Duplicate", next(item["reason"] for item in result["not_counted_in_reference"] if item["key"] == "User-1"))
+
+    def test_the_approval_records_the_count_and_validation_reads_it(self) -> None:
+        _set_record(self.preview, minimum_anchors=3)
+        written = approve_anchors(self.preview, *ACCEPT_ALL, "A. Person", write=True)
+        approval = json.loads(Path(written["approval_record"]).read_text(encoding="utf-8"))
+        self.assertEqual(3, approval["distinct_reference_anchors"])
+        self.assertEqual(["User-1", "Automatic-2", "Automatic-3"], approval["distinct_reference_anchor_keys"])
+        state = {**TheSettingsAreValidated.BASE, MODE: "UserOnly", LIBRARY: written["library_path"],
+                 "automatic_rt_correction_minimum_anchors": 4}
+        errors = [item["message"] for item in validate_workflow(state) if item["level"] == "error"]
+        self.assertTrue(any("3 are distinct anchors detected in its preview's reference file" in item for item in errors), errors)
+
+
+class ThePreviewFlagsWhatCanMoveTheReference(unittest.TestCase):
+    """Decision 4: the reasons a production run can choose another reference, shown before the approval."""
+
+    def setUp(self) -> None:
+        self.directory = tempfile.TemporaryDirectory()
+        self.preview = Path(self.directory.name) / "preview"
+        _write_preview(self.preview, HYBRID_LIBRARY)
+
+    def tearDown(self) -> None:
+        self.directory.cleanup()
+
+    def test_each_reason_is_flagged_and_warned(self) -> None:
+        review = read_automatic_rt_review(self.preview)
+        by_key = {item["key"]: item for item in review["anchor_review"]["anchors"]}
+        # Automatic-3: LocalOutlier in the only other file and used only in the reference (the noise anchor of
+        # demo data1 neg, m/z 212.0746 at 4.961 min, in miniature).
+        self.assertEqual(
+            {"rejected_in_every_other_file", "used_only_in_reference"}, {flag["code"] for flag in by_key["Automatic-3"]["flags"]}
+        )
+        self.assertEqual(["missing_in_reference"], [flag["code"] for flag in by_key["User-4"]["flags"]])
+        self.assertEqual([], by_key["Automatic-2"]["flags"])
+        self.assertEqual([], by_key["User-1"]["flags"], "a user anchor's own outlier flag is said apart")
+        self.assertTrue(any(item.startswith("Anchor Automatic-3:") and "used only in the reference" in item for item in review["warnings"]))
+        result = approve_anchors(self.preview, ["User-1", "Automatic-2", "Automatic-3"], ["User-4"])
+        self.assertEqual(["Automatic-3"], [item["key"] for item in result["accepted_flagged_anchors"]])
+        self.assertTrue(result["warnings"] and "Accepted Automatic-3" in result["warnings"][0])
+
+    def test_a_run_audit_is_not_flagged(self) -> None:
+        _write_preview(self.preview, HYBRID_LIBRARY, run="Run")
+        review = read_automatic_rt_review(self.preview)
+        self.assertFalse(any(item.startswith("Anchor Automatic-3:") for item in review["warnings"]))
+
+
+class OnlyACompletedPreviewIsApproved(unittest.TestCase):
+    """CONF-26, CONF-41, CONF-45, CONF-50 and PLAU-4."""
+
+    def setUp(self) -> None:
+        self.directory = tempfile.TemporaryDirectory()
+        self.base = Path(self.directory.name)
+        self.preview = self.base / "preview"
+        _write_preview(self.preview, HYBRID_LIBRARY)
+
+    def tearDown(self) -> None:
+        self.directory.cleanup()
+
+    def _partial_audit(self) -> None:
+        summary = self.preview / "automatic_alignment_rt_correction_summary.tsv"
+        stamp = summary.stat().st_mtime
+        text = summary.read_text(encoding="utf-8").replace("\tReference\t", "\tUncorrected\t").replace(
+            "\tDetectedAnchors\t", "\tUncorrected\t"
+        )
+        lines = text.splitlines()
+        lines[1:] = [
+            "\t".join(cells[:11] + ["Not corrected: found no non-Blank file with 3 user anchors"] + cells[12:])
+            for cells in (line.split("\t") for line in lines[1:])
+        ]
+        summary.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        os.utime(summary, (stamp, stamp))
+
+    def test_a_failed_previews_partial_audit_is_refused(self) -> None:
+        self._partial_audit()
+        with self.assertRaises(ValueError) as caught:
+            approve_anchors(self.preview, *ACCEPT_ALL, "A. Person", write=True)
+        self.assertIn("partial audit of a preview that failed", str(caught.exception))
+        self.assertIn("Not corrected: found no non-Blank file", str(caught.exception))
+        self.assertFalse((self.base / "output").exists(), "nothing is written")
+
+    def test_a_job_that_did_not_complete_is_refused_by_its_record(self) -> None:
+        from msdial_app.automatic_rt_anchors import mark_preview_job
+
+        mark_preview_job(self.preview, "failed", 4294967295, "cancelled")
+        with self.assertRaises(ValueError) as caught:
+            approve_anchors(self.preview, *ACCEPT_ALL)
+        self.assertIn("ended failed (cancelled)", str(caught.exception))
+        mark_preview_job(self.preview, "completed", 0)
+        self.assertTrue(approve_anchors(self.preview, *ACCEPT_ALL)["hybrid_allowed"])
+
+    def test_the_previews_method_key_evidence_is_consulted(self) -> None:
+        keys = self.preview / "method.keys.json"
+        record = json.loads(keys.read_text(encoding="utf-8"))
+        record["method_file_sha256"] = "0" * 64
+        stamp = keys.stat().st_mtime
+        keys.write_text(json.dumps(record), encoding="utf-8")
+        os.utime(keys, (stamp, stamp))
+        with self.assertRaises(ValueError) as caught:
+            approve_anchors(self.preview, *ACCEPT_ALL)
+        self.assertIn("method-key evidence", str(caught.exception))
+        self.assertIn("method_key_record_not_from_this_method_file", str(caught.exception))
+
+    def test_an_output_root_the_console_cannot_read_back_is_refused(self) -> None:
+        with self.assertRaises(ValueError) as caught:
+            approve_anchors(self.preview, *ACCEPT_ALL, output_root=self.base / "\u89e3\u6790")
+        self.assertIn("not printable ASCII", str(caught.exception))
+
+
+class TheApprovalIsOfThePreviewOnScreen(unittest.TestCase):
+    """CONF-6, CONF-10: a job id and a directory that disagree are refused; CONF-42: no shared file."""
+
+    def setUp(self) -> None:
+        self.directory = tempfile.TemporaryDirectory()
+        self.base = Path(self.directory.name)
+        self.first = self.base / "first"
+        self.second = self.base / "second"
+        _write_preview(self.first, HYBRID_LIBRARY)
+        _write_preview(self.second, HYBRID_LIBRARY)
+        _set_record(self.first, job_id="job-first")
+        _set_record(self.second, job_id="job-second")
+        self.body = {"accepted": ["User-1", "Automatic-2"], "rejected": ["Automatic-3", "User-4"], "confirmed_by": "A. Person"}
+
+    def tearDown(self) -> None:
+        self.directory.cleanup()
+
+    def _jobs(self, status: str = "completed") -> dict:
+        return {
+            "job-first": {"kind": "automatic_rt_preview", "status": "completed", "preparation": {"run_directory": str(self.first)}},
+            "job-second": {"kind": "automatic_rt_preview", "status": status, "preparation": {"run_directory": str(self.second)}},
+        }
+
+    def test_a_job_and_another_previews_directory_are_refused(self) -> None:
+        with patch.dict(server.JOBS, self._jobs()):
+            with self.assertRaises(ValueError) as caught:
+                server._approve_automatic_rt_anchors_request({**self.body, "job_id": "job-second", "preview_directory": str(self.first)})
+            self.assertIn("names two different runs", str(caught.exception))
+            shown = server._approve_automatic_rt_anchors_request({**self.body, "job_id": "job-first", "preview_directory": str(self.first)})
+            self.assertEqual(str(self.first.resolve()), shown["preview_directory"])
+            self.assertEqual("job-first", shown["preview_job_id"])
+
+    def test_a_directory_whose_job_has_not_completed_is_refused(self) -> None:
+        with patch.dict(server.JOBS, self._jobs("failed")):
+            with self.assertRaises(ValueError) as caught:
+                server._approve_automatic_rt_anchors_request({**self.body, "preview_directory": str(self.second)})
+            self.assertIn("has not completed (failed)", str(caught.exception))
+
+    def test_the_caller_cannot_rename_the_previews_job(self) -> None:
+        shown = server._approve_automatic_rt_anchors_request({**self.body, "preview_directory": str(self.first)})
+        self.assertEqual("job-first", shown["preview_job_id"])
+
+    def test_the_dry_run_keeps_the_userOnly_refusal(self) -> None:
+        shown = server._approve_automatic_rt_anchors_request({**self.body, "preview_directory": str(self.first)})
+        self.assertTrue(shown["confirmation_required"])
+        self.assertIn("UserOnly is refused", shown["message"])
+        self.assertIn("Choose Hybrid explicitly", shown["message"])
+        self.assertIn("Nothing was written", shown["message"])
+
+    def test_two_approvals_in_one_second_write_two_libraries(self) -> None:
+        import datetime as dt
+
+        now = dt.datetime(2026, 11, 10, 12, 0, 0)
+        output = self.base / "output"
+        one = approve_anchors(self.first, ["User-1", "Automatic-2"], ["Automatic-3", "User-4"], "A", write=True,
+                              output_root=output, now=now)
+        two = approve_anchors(self.first, ["User-1", "Automatic-2", "Automatic-3"], ["User-4"], "B", write=True,
+                              output_root=output, now=now)
+        self.assertNotEqual(one["library_path"], two["library_path"])
+        for result in (one, two):
+            self.assertTrue(approval_for_library(result["library_path"])["matches_library"])
+            self.assertEqual(result["approval"]["accepted"], json.loads(Path(result["approval_record"]).read_text(encoding="utf-8"))["accepted"])
+
+
+class TheConsolesRefusalReachesTheJobError(unittest.TestCase):
+    """Empirical: the Console's reason, not "exited with code 4294967295"."""
+
+    LOG = [
+        "5493 / 5493",
+        "Automatic alignment RT correction failed: Automatic alignment RT correction reference file ID 2 is missing, "
+        "Blank, or has fewer than 5 user anchors detected.",
+        "What was read before it failed, each user anchor's detection in each file included, is in "
+        "automatic_alignment_rt_correction_summary.tsv and automatic_alignment_rt_correction_anchors.tsv.",
+        "Lipid RT check: no review list was written: the check did not run, or failed and withdrew what it had written.",
+    ]
+
+    def test_the_reason_is_carried(self) -> None:
+        message = server._diagnose_console_failure(self.LOG, "MS-DIAL Console exited with code 4294967295.")
+        self.assertIn("exited with code 4294967295 (-1).", message)
+        self.assertIn("reference file ID 2 is missing, Blank, or has fewer than 5 user anchors detected", message)
+        library = ["Method file 'method.txt': 17 parameter(s) were left blank; their defaults apply.",
+                   "Automatic RT correction anchor library could not be used: Anchor library line 2 has 6 column(s)."]
+        self.assertIn("line 2 has 6 column(s)", server._diagnose_console_failure(library, "MS-DIAL Console exited with code 1."))
+        refused = ["'Automatic RT correction preview only: yes' is neither True nor False; the run is refused rather than run in full."]
+        self.assertIn("neither True nor False", server.console_refusal_reason(refused))
+        self.assertEqual("MS-DIAL Console exited with code 1.", server._diagnose_console_failure(["1 / 2"], "MS-DIAL Console exited with code 1."))
+
+
+class TheAnswersSayWhatTheyMean(unittest.TestCase):
+    """Empirical (preview switch), CONF-38 (switch spellings), CONF-34 and CONF-3 (templates)."""
+
+    def setUp(self) -> None:
+        self.directory = tempfile.TemporaryDirectory()
+        self.root = Path(self.directory.name)
+        self.data = self.root / "data"
+        self.data.mkdir()
+        for name in ("qc_01.mzML", "sample_01.mzML"):
+            (self.data / name).write_text("x", encoding="ascii")
+        self.console = self.root / "MSDIALCUI.exe"
+        self.console.write_bytes(MARKERS_845)
+
+    def tearDown(self) -> None:
+        self.directory.cleanup()
+
+    def _answers(self, **extra) -> dict:
+        return {
+            "project_type": "lcms", "ion_mode": "Positive", "target_omics": "Metabolomics",
+            "parameter_strategy": "default", "library_strategy": "none", "class_assignment_confirmed": True,
+            "generate_materials_methods": False, "run_qa": False, "console_path": str(self.console),
+            "output_root": str(self.root / "output"), "execute_rt_correction": False, **extra,
+        }
+
+    def test_the_preview_switch_is_refused_as_an_answer(self) -> None:
+        plan = build_guided_plan(str(self.data), self._answers(execute_automatic_rt_correction=True,
+                                                               automatic_rt_correction_preview_only=True))
+        self.assertFalse(plan["ready_to_prepare"])
+        self.assertTrue(any("msdial_start_automatic_rt_anchor_preview" in item for item in plan["blockers"]))
+        plan = build_guided_plan(str(self.data), self._answers(execute_automatic_rt_correction=True,
+                                                               automatic_rt_correction_preview_only=False))
+        self.assertTrue(plan["ready_to_prepare"], plan["blockers"])
+
+    def test_an_unrecognised_switch_spelling_is_refused(self) -> None:
+        from msdial_app.workflow import automatic_rt_correction_value
+
+        for key in ("execute_automatic_rt_correction", "automatic_rt_correction_interpolate_blanks_by_analytical_order"):
+            with self.subTest(key=key):
+                plan = build_guided_plan(str(self.data), self._answers(**{"execute_automatic_rt_correction": True, key: "maybe"}))
+                self.assertTrue(any(item.startswith(f"{key} is 'maybe'") for item in plan["blockers"]), plan["blockers"])
+        plan = build_guided_plan(str(self.data), self._answers(execute_automatic_rt_correction="T"))
+        self.assertTrue(plan["workflow"]["execute_automatic_rt_correction"])
+        key = "automatic_rt_correction_interpolate_blanks_by_analytical_order"
+        self.assertIs(True, automatic_rt_correction_value(key, "T"))
+        self.assertIs(False, automatic_rt_correction_value(key, "F"))
+        self.assertEqual("maybe", automatic_rt_correction_value(key, "maybe"))
+
+    def _template(self, *lines: str) -> Path:
+        template = self.root / "template" / "method.txt"
+        template.parent.mkdir(exist_ok=True)
+        template.write_text(TEMPLATE.read_text(encoding="utf-8-sig") + "\n" + "\n".join(lines) + "\n", encoding="utf-8")
+        return template
+
+    def test_a_template_enabling_the_correction_keeps_it_unless_answered(self) -> None:
+        template = self._template("Execute automatic RT correction for alignment: True")
+        plan = build_guided_plan(str(self.data), self._answers(template_path=str(template)))
+        self.assertTrue(plan["workflow"]["execute_automatic_rt_correction"], plan["blockers"])
+        plan = build_guided_plan(str(self.data), self._answers(template_path=str(template), execute_automatic_rt_correction=False))
+        self.assertFalse(plan["workflow"]["execute_automatic_rt_correction"])
+
+    def test_a_templates_legacy_correction_is_read_and_checked(self) -> None:
+        (self.root / "template").mkdir()
+        (self.root / "template" / "anchors.txt").write_text("x", encoding="ascii")
+        template = self._template(
+            "Execute RT correction: True", "Compounds library file path for RT correction: anchors.txt",
+            "RT correction peak selection file path = sel.tsv",
+        )
+        loaded = load_parameter_template(template)["workflow"]
+        self.assertTrue(loaded["execute_rt_correction"])
+        self.assertEqual(str((self.root / "template" / "anchors.txt").resolve()), loaded["rt_correction_anchor_path"])
+        # '=' as the separator, as the Console reads it.
+        self.assertEqual(str((self.root / "template" / "sel.tsv").resolve()), loaded["rt_correction_selection_path"])
+        files = [{"file_name": "a", "file_path": str(self.data / "qc_01.mzML"), "analytical_order": 1, "batch_order": 1}]
+        errors = [item["message"] for item in validate_workflow({**loaded, "files": files}) if item["level"] == "error"]
+        self.assertTrue(any("peak selection file not found" in item for item in errors), errors)
+        both = self._template(
+            "Execute RT correction: True", "Compounds library file path for RT correction: anchors.txt",
+            "Execute automatic RT correction for alignment: True",
+        )
+        errors = [
+            item["message"] for item in validate_workflow({**load_parameter_template(both)["workflow"], "files": files})
+            if item["level"] == "error"
+        ]
+        self.assertTrue(any("cannot be enabled together" in item for item in errors), errors)
+
+    def test_a_template_value_the_console_would_ignore_is_refused(self) -> None:
+        template = self._template("Execute automatic RT correction for alignment: yes")
+        with self.assertRaises(ValueError) as caught:
+            load_parameter_template(template)
+        self.assertIn("neither True nor False", str(caught.exception))
+
+    def test_template_lines_are_read_as_the_console_reads_them(self) -> None:
+        from msdial_app.workflow import parse_method
+
+        method = self.root / "m.txt"
+        method.write_text(
+            "  # comment: no\nAutomatic RT correction anchor mode = UserOnly\n"
+            "Automatic RT correction match RT tolerance: \"0.3\"\nMinimum peak height: 500\nMinimum peak height:\n",
+            encoding="utf-8",
+        )
+        values = parse_method(method)
+        self.assertEqual("UserOnly", values["automatic rt correction anchor mode"])
+        self.assertEqual("0.3", values["automatic rt correction match rt tolerance"])
+        self.assertEqual("500", values["minimum peak height"], "a blank later line leaves the value")
+        self.assertNotIn("# comment", values)
+
+    def test_the_reference_file_id_is_not_carried_to_the_next_batch(self) -> None:
+        # CONF-5: a row of one batch's file list.
+        self.assertIn("automatic_rt_correction_reference_file_id", DATASET_SCOPED_ANSWERS)
+
+
+class AnalyticalOrdersAreWholeAndDistinct(unittest.TestCase):
+    """CONF-61, CONF-62 (and the web page's half, CONF-21, in tests/test_automatic_rt_viewer.cjs)."""
+
+    def _files(self, *orders, batches=None) -> list[dict]:
+        return [
+            {"file_name": f"F{index}", "file_type": "Sample", "analytical_order": order,
+             "batch_order": (batches or [1] * len(orders))[index]}
+            for index, order in enumerate(orders)
+        ]
+
+    def test_an_order_the_console_would_replace_is_refused(self) -> None:
+        from msdial_app.workflow import analytical_order_issues
+
+        for bad in (2.5, "", "abc", -1, 2**31, True, None):
+            with self.subTest(bad=bad):
+                issues = analytical_order_issues(self._files(1, bad))
+                self.assertTrue(any(item["level"] == "error" and "not a whole number" in item["message"] for item in issues), issues)
+        self.assertEqual([], analytical_order_issues(self._files(1, 2.0, "3", 0)))
+
+    def test_ties_are_refused_zeros_included_and_restarts_warned(self) -> None:
+        from msdial_app.workflow import analytical_order_issues
+
+        tied = analytical_order_issues(self._files(0, 0, 1))
+        self.assertTrue(any("Analytical order 0 is given to 2 files of batch 1" in item["message"] for item in tied), tied)
+        restart = analytical_order_issues(self._files(1, 2, 1, 2, batches=[1, 1, 2, 2]), automatic_rt_correction=True)
+        self.assertEqual(["warning"], [item["level"] for item in restart])
+        self.assertIn("restart in batch 2", restart[0]["message"])
+        self.assertEqual([], analytical_order_issues(self._files(1, 2, 1, 2, batches=[1, 1, 2, 2])))
+
+    def test_validation_and_the_csv_reader_refuse_them(self) -> None:
+        from msdial_app.workflow import read_analysis_csv
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for name in ("a.mzML", "b.mzML"):
+                (root / name).write_text("x", encoding="ascii")
+            csv_path = root / "files.csv"
+            csv_path.write_text(f"file_path,analytical_order\n{root / 'a.mzML'},1\n{root / 'b.mzML'},2.5\n", encoding="utf-8")
+            read = read_analysis_csv(csv_path)
+            self.assertEqual([1, 2.5], [item["analytical_order"] for item in read["files"]])
+            self.assertTrue(any("'2.5' is not a whole number" in item for item in read["warnings"]))
+            errors = [item["message"] for item in validate_workflow({"project_type": "lcms", "files": read["files"]})
+                      if item["level"] == "error"]
+            self.assertTrue(any("is 2.5, not a whole number" in item for item in errors), errors)
+
+
+class TheReportsSayWhatRan(unittest.TestCase):
+    """CONF-11, CONF-39, CONF-43, CONF-44, CONF-16/59 and CONF-54."""
+
+    def test_methods_text_follows_the_counts(self) -> None:
+        evidence = {"anchor_library": "approved.txt", "anchor_library_sha256": "abc"}
+        none_used = _automatic_rt_anchor_sentence(
+            {**evidence, "anchor_mode": "Hybrid", "selected_user_anchor_count": 0, "selected_automatic_anchor_count": 4,
+             "exclusion_count": 2, "excluded_candidate_count": 1}, {})
+        self.assertIn("no corrected file used one", none_used)
+        self.assertIn("4 distributed anchor feature(s)", none_used)
+        self.assertIn("2 False row(s) kept 1 automatic candidate(s)", none_used)
+        self.assertNotIn("detected on every file", none_used)
+        no_exclusion = _automatic_rt_anchor_sentence(
+            {**evidence, "anchor_mode": "Hybrid", "selected_user_anchor_count": 3, "selected_automatic_anchor_count": 1,
+             "exclusion_count": 0}, {})
+        self.assertIn("used 3 named anchor(s)", no_exclusion)
+        self.assertNotIn("False row", no_exclusion)
+        user_only = _automatic_rt_anchor_sentence({**evidence, "anchor_mode": "UserOnly", "selected_user_anchor_count": 5}, {})
+        self.assertIn("used 5 named anchor(s)", user_only)
+        self.assertIn("searched for in each file", user_only)
+
+    def test_table_s1_lists_only_what_the_method_file_wrote(self) -> None:
+        from msdial_app.supplementary_excel import _guided_sheet
+
+        workflow = {"execute_automatic_rt_correction": True, LIBRARY: "lib.txt", WEIGHT: 0.4,
+                    "automatic_rt_correction_evidence": {"requested": True, "anchor_mode": "Hybrid",
+                                                         "selected_user_anchor_count": 2, "exclusion_count": 1}}
+        joined = " | ".join(str(value) for row in _guided_sheet(workflow)["rows"] for value in row["values"])
+        self.assertIn("not used: anchor mode Automatic (not set) reads no library", joined)
+        self.assertIn("not used: only Weighted peak selection reads it", joined)
+        for label in ("Anchor mode the Console ran", "Named (user) anchors used by corrected files",
+                      "Exclusions applied (the library's False rows, Hybrid)"):
+            self.assertIn(label, joined)
+        workflow.update({MODE: "user_only", SELECTION: "weighted"})
+        joined = " | ".join(str(value) for row in _guided_sheet(workflow)["rows"] for value in row["values"])
+        self.assertNotIn("not used", joined)
+
+    def test_a_stale_exclusions_file_is_not_counted(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "run"
+            _write_preview(root, HYBRID_LIBRARY, run="Run")
+            self.assertEqual(1, automatic_rt_correction_proof(root)["exclusion_count"])
+            keys = root / "method.keys.json"
+            exclusions = root / "automatic_alignment_rt_correction_exclusions.tsv"
+            older = keys.stat().st_mtime - 10
+            os.utime(exclusions, (older, older))
+            self.assertEqual(0, automatic_rt_correction_proof(root)["exclusion_count"])
+            self.assertEqual([], read_automatic_rt_review(root)["exclusions"])
+
+    def test_the_qa_rt_error_is_said_to_be_on_the_reference_axis(self) -> None:
+        from msdial_app.quality_assurance import _mark_rt_axis, automatic_rt_axis
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "run"
+            _write_preview(root, HYBRID_LIBRARY, run="Run")
+            summary = root / "automatic_alignment_rt_correction_summary.tsv"
+            stamp = summary.stat().st_mtime
+            summary.write_text(summary.read_text(encoding="utf-8") + summary.read_text(encoding="utf-8").splitlines()[1]
+                               .replace("0\tF0\t", "2\tF2\t").replace("DetectedAnchors", "Uncorrected") + "\n", encoding="utf-8")
+            os.utime(summary, (stamp, stamp))
+            axis = automatic_rt_axis(root)
+            self.assertTrue(axis["corrected"])
+            self.assertEqual("RT error on F1's corrected axis (min)", axis["label"])
+            standards = [{"values": [{"file": "F0"}, {"file": "F1"}, {"file": "F2"}]}]
+            warnings = _mark_rt_axis(standards, axis)
+            self.assertEqual(["DetectedAnchors", "Reference", "Uncorrected"], [item["rt_model_source"] for item in standards[0]["values"]])
+            self.assertIn("residual left after the correction", warnings[0])
+            self.assertIn("Uncorrected (1)", warnings[0])
+            self.assertEqual({"corrected": False}, automatic_rt_axis(Path(temporary) / "none"))
+
+    def test_the_polarity_axis_offset_is_recorded(self) -> None:
+        from msdial_app.lipidome_merge import _default_columns, polarity_rt_axes
+
+        columns = _default_columns()
+        width = max(columns.values()) + 1
+
+        def row(name: str, rt: float) -> list[str]:
+            cells = [""] * width
+            cells[columns["metabolite_name"]] = name
+            cells[columns["rt"]] = str(rt)
+            return cells
+
+        with tempfile.TemporaryDirectory() as temporary:
+            positive = Path(temporary) / "pos" / "export.txt"
+            negative = Path(temporary) / "neg" / "export.txt"
+            for path, reference, order in ((positive, "QC_early", 3), (negative, "QC_late", 97)):
+                path.parent.mkdir()
+                (path.parent / "automatic_alignment_rt_correction_summary.tsv").write_text(
+                    "File ID\tFile name\tAnalytical order\tModel source\n0\tS\t1\tDetectedAnchors\n"
+                    f"1\t{reference}\t{order}\tReference\n", encoding="utf-8")
+            axes = polarity_rt_axes(
+                positive, negative,
+                [row("PC 34:1", 5.0), row("PE 36:2", 6.0), row("TG 52:2", 9.0)],
+                [row("PC 34:1", 5.17), row("PE 36:2", 6.18), row("PG 34:1", 4.0)],
+            )
+        self.assertEqual(2, axes["pairs"])
+        self.assertAlmostEqual(0.175, axes["offset_min"], places=6)
+        self.assertEqual(("QC_early", 3), (axes["positive"]["reference_file"], axes["positive"]["analytical_order"]))
+        self.assertIn("QC_late's axis (analytical order 97)", axes["reference_sentence"])
+
+
+class TheReferenceCheckSaysWhy(unittest.TestCase):
+    """CONF-53 and CONF-22: each explanation, and no promise that the preview's reference comes back."""
+
+    def _check(self, selection: str) -> dict:
+        from msdial_app.automatic_rt_review import approved_reference_check
+
+        return approved_reference_check(
+            {"file_id": "4", "name": "E1"},
+            {"run": "Run", "anchor_library_sha256": "abc", "reference_selection_column": True, "reference_selection": selection},
+            {"library_sha256": "ABC", "preview_reference_file": {"file_id": "2", "name": "C1"}},
+        )
+
+    def test_each_selection_has_its_reason(self) -> None:
+        self.assertIn("the reference file ID was set in the method", self._check("Requested")["warning"])
+        self.assertIn("no eligible file had an approved anchor detected", self._check("Automatic (coverage and centrality)")["warning"])
+        generic = self._check("Automatic (most user anchors, closest to library RT)")["warning"]
+        self.assertIn("chosen again only when every True row was written from the preview", generic)
+        self.assertIn("hand-written True row keeps its own library RT", generic)
+
+    def test_the_analysis_batch_is_read_when_present(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary) / "preview"
+            _write_preview(root, HYBRID_LIBRARY)
+            summary = root / "automatic_alignment_rt_correction_summary.tsv"
+            stamp = summary.stat().st_mtime
+            lines = summary.read_text(encoding="utf-8").splitlines()
+            lines = [lines[0] + "\tAnalysis batch"] + [line + f"\t{index}" for index, line in enumerate(lines[1:], start=1)]
+            summary.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            os.utime(summary, (stamp, stamp))
+            self.assertEqual(["1", "2"], [item["analysis_batch"] for item in read_automatic_rt_review(root)["files"]])
+            _write_preview(root, HYBRID_LIBRARY)
+            self.assertEqual(["", ""], [item["analysis_batch"] for item in read_automatic_rt_review(root)["files"]])
 
 
 if __name__ == "__main__":

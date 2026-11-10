@@ -4338,6 +4338,9 @@ def msdial_start_automatic_rt_anchor_preview(
     missing. It starts the Console, so confirmed=false (the default) only returns the plan, and a campaign
     approval must cover boundary 4 to stand in for confirmed=true. Wait for the job with
     msdial_interactive_wait_for_completion, then read the anchors with msdial_automatic_rt_anchor_review.
+    This tool is the only way to preview: automatic_rt_correction_preview_only is not an answer, and a guided
+    plan or run given it is refused rather than run in full. The production output root must be an ASCII
+    path, because the approved library is written there and the LC-MS Console reads method files as ASCII.
     """
     return _request_json(
         "POST",
@@ -4374,6 +4377,13 @@ def msdial_automatic_rt_anchor_review(
     m/z, peak height, detection note, status and outlier flag; a Hybrid preview also returns the library's
     False rows as the exclusions it applied. Show every anchor to the person: the decision to accept or
     reject each one is theirs, never the agent's. detail=true adds the per-file audit rows.
+
+    Each anchor also carries flags, shown to the person before they decide (the author's decision 4): an
+    automatic anchor rejected by the outlier test in every other file it was matched in, or used only in the
+    reference file (likely noise or a baseline; approved, it can move the production run's reference file to
+    another file); an anchor missing in the reference file or a Duplicate there; and an anchor within two MS1
+    scans of another in the reference file, which the Console counts as one. The same sentences are among the
+    warnings. The production reference is never pinned to the preview's.
     """
     review = _request_json(
         "POST",
@@ -4424,9 +4434,21 @@ def msdial_approve_automatic_rt_anchors(
     output root with a timestamped name, and an approval record beside it (who, when, the preview job,
     the preview audit's SHA-256, the library's SHA-256). The production run then defaults to anchor mode
     UserOnly with this library: pass automatic_rt_correction_anchor_mode="UserOnly" and
-    automatic_rt_correction_anchor_library_path=<library_path> in the answers. When the True rows are
-    fewer than the minimum anchor count, user_only_allowed is false and production_anchor_mode is empty:
-    ask the person whether to run Hybrid instead; never choose it for them.
+    automatic_rt_correction_anchor_library_path=<library_path> in the answers. A library passed without
+    an anchor mode, or with Automatic, is refused by the plan: the person chooses UserOnly or Hybrid.
+
+    UserOnly is counted as the Console counts it: the distinct anchors the preview detected in its reference
+    file (distinct_reference_anchors). An accepted anchor the preview showed as missing or a Duplicate there,
+    or one within two MS1 scans of an anchor already counted, does not count (not_counted_in_reference says
+    why). When that count is below the minimum anchor count, user_only_allowed is false, production_anchor_mode
+    is empty and message says "UserOnly is refused ... Choose Hybrid explicitly": ask the person whether to run
+    Hybrid instead; never choose it for them. accepted_flagged_anchors lists the accepted anchors the review
+    flagged.
+
+    Refused: a job_id and a preview_directory that name two different previews (name the one reviewed); a
+    preview that did not complete (failed or cancelled; its directory holds a partial audit with no reference
+    file or "Not corrected" notes); a preview whose method-key evidence does not show it ran with its settings;
+    and a non-ASCII output root.
     """
     return _request_json(
         "POST",

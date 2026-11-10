@@ -31,6 +31,9 @@ DATASET_SCOPED_ANSWERS: dict[str, str] = {
     "repository_metadata_path": "names this accession's metadata",
     "rt_correction_anchor_path": "names this batch's retention-time anchors",
     "rt_correction_selection_path": "names this batch's retention-time anchors",
+    "automatic_rt_correction_reference_file_id": (
+        "is a row of this batch's file list; the same row of the next batch is another file"
+    ),
     "automatic_rt_correction_anchor_library_path": (
         "names the anchors one person approved from this batch's preview; the next batch is previewed again"
     ),

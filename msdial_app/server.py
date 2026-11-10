@@ -6,6 +6,7 @@ import datetime as dt
 import json
 import mimetypes
 import os
+import re
 import socket
 import sys
 import threading
@@ -25,11 +26,11 @@ from . import __version__
 from .agent_bridge import create_datamining_handoff, summarize_job, summarize_jobs
 from .automatic_rt_review import extract_anchor_eic, read_automatic_rt_review
 from .automatic_rt_anchors import (
-    anchor_library_text,
     approve_anchors as approve_automatic_rt_anchors,
+    create_timestamped_library,
+    mark_preview_job as mark_automatic_rt_preview_job,
     read_anchor_library,
-    timestamped_library_path,
-    write_anchor_library,
+    read_preview_record as read_automatic_rt_preview_record,
 )
 from .agent_workflow import (
     build_guided_plan,
@@ -107,6 +108,7 @@ from .run_finalisation import _sharing_context, finalise_console_run, record_con
 from .campaign_authorization import CampaignAuthorizationError, authorize, unit_identity
 from .process_liveness import process_created_at
 from .workflow import (
+    AUTOMATIC_RT_CORRECTION_PREVIEW_ONLY,
     CONSOLE_WATCHDOG_PREFIX,
     console_version,
     console_capabilities,
@@ -1276,7 +1278,44 @@ def _diagnose_console_failure(logs: list[str], fallback: str) -> str:
             "Use Add original files, Add original folder, or Add path so MS-DIAL reads "
             "the WIFF from its original directory."
         )
-    return fallback
+    reason = console_refusal_reason(logs)
+    if not reason:
+        return fallback
+    if not fallback:
+        return reason
+    return f"{_signed_exit_code(fallback)} The Console said: {reason}"
+
+
+# Lines the MS-DIAL Console prints when it refuses or abandons a run, most specific first. A Console that
+# exits -1 reports only its exit code (4294967295 as an unsigned status), and the reason is in its log.
+_CONSOLE_REFUSAL_PATTERNS = (
+    re.compile(r"^Automatic (?:alignment )?RT correction .*(?:failed|could not|cannot|refused)", re.IGNORECASE),
+    re.compile(r"\bthe run is refused\b|\bis refused\b|\brefused rather than\b", re.IGNORECASE),
+    re.compile(r"^(?:Error|Unhandled exception|System\.[A-Za-z.]*Exception)\b", re.IGNORECASE),
+)
+
+
+def console_refusal_reason(logs: list[str]) -> str:
+    """The last line of a Console log that states why the Console refused or stopped, or ""."""
+    lines = [
+        str(line).strip() for line in logs
+        if str(line).strip() and not str(line).startswith(CONSOLE_WATCHDOG_PREFIX)
+        and not str(line).lstrip().startswith("Method file ")
+    ]
+    for pattern in _CONSOLE_REFUSAL_PATTERNS:
+        found = next((line for line in reversed(lines) if pattern.search(line)), "")
+        if found:
+            return found[:1200]
+    return ""
+
+
+def _signed_exit_code(message: str) -> str:
+    """'exited with code 4294967295.' as 'exited with code 4294967295 (-1).', the Console's own -1."""
+    match = re.search(r"exited with code (\d+)\.", message)
+    if not match or int(match.group(1)) < 2**31:
+        return message
+    signed = int(match.group(1)) - 2**32
+    return message.replace(match.group(0), f"exited with code {match.group(1)} ({signed}).")
 
 
 def _write_guided_answers(preparation: dict, plan: dict) -> str:
@@ -1618,7 +1657,9 @@ class Handler(BaseHTTPRequestHandler):
                     if job and job.get("status") != "completed":
                         raise ValueError("The selected job has not completed.")
                     if job:
-                        directory = (job.get("preparation") or {}).get("run_directory", "")
+                        job_directory = (job.get("preparation") or {}).get("run_directory", "")
+                        _refuse_other_directory(job_id, job_directory, directory)
+                        directory = job_directory
                 if not directory:
                     raise ValueError("Select a run or enter its output directory to review RT correction.")
                 self._json(read_automatic_rt_review(directory))
@@ -1637,25 +1678,35 @@ class Handler(BaseHTTPRequestHandler):
                 if not output_root:
                     raise ValueError("Set Output root before saving the edited anchor library.")
                 source = str(body.get("source_path") or "").strip()
-                target = timestamped_library_path(
-                    output_root, Path(source).stem if source else "automatic_rt_anchors"
-                )
                 rows = list(body.get("rows") or [])
-                anchor_library_text(rows)
-                write_anchor_library(target, rows)
+                # Claimed exclusively, so two saves in one second never write one file.
+                target, _ = create_timestamped_library(
+                    output_root, Path(source).stem if source else "automatic_rt_anchors", rows
+                )
                 self._json({"path": str(target), "rows": read_anchor_library(target)})
             elif parsed.path == "/api/automatic-rt/preview":
                 self._json(_start_automatic_rt_preview(body.get("workflow", body)))
             elif parsed.path == "/api/agent/automatic-rt/preview":
+                # This endpoint writes the preview switch itself (prepare_automatic_rt_preview); an answer that
+                # asks for a preview is what it does, and is not passed on to the plan, which refuses it.
+                preview_answers = dict(body.get("answers") or {})
+                preview_answers.pop(AUTOMATIC_RT_CORRECTION_PREVIEW_ONLY, None)
                 plan = build_guided_plan(
                     body.get("input_path", ""),
-                    body.get("answers", {}),
+                    preview_answers,
                     body.get("workset_id", ""),
                 )
                 workflow = plan.get("workflow")
                 missing = []
                 if not workflow or not plan.get("ready_to_prepare"):
-                    missing.append("a complete guided plan (its method is the one previewed)")
+                    pending = [str(item) for item in plan.get("blockers") or []] + [
+                        f"answer {item.get('id')}" for item in plan.get("remaining_questions") or []
+                        if item.get("required", True)
+                    ]
+                    missing.append(
+                        "a complete guided plan (its method is the one previewed)"
+                        + (": " + "; ".join(item.rstrip(".") for item in pending) if pending else "")
+                    )
                 elif str(workflow.get("project_type") or "lcms").lower() != "lcms":
                     missing.append("an LC-MS project")
                 elif not workflow.get("execute_automatic_rt_correction"):
@@ -3952,6 +4003,14 @@ def _run_automatic_rt_preview_job(job_id: str, preparation: dict[str, Any]) -> N
             JOBS[job_id]["updated_at"] = dt.datetime.now().astimezone().isoformat()
             _persist_jobs_locked()
     finally:
+        with JOBS_LOCK:
+            ended = dict(JOBS.get(job_id) or {})
+        mark_automatic_rt_preview_job(
+            preparation["run_directory"],
+            str(ended.get("status") or "failed"),
+            ended.get("exit_code"),
+            str(ended.get("error") or ended.get("stop_reason") or ""),
+        )
         _cleanup_temporary_input_folder(preparation.get("temporary_input_folder"), log)
 
 
@@ -3986,9 +4045,32 @@ def _approve_automatic_rt_anchors_request(body: dict[str, Any]) -> dict[str, Any
                 raise ValueError(f"Job {job_id} is a {job.get('kind')} job, not an anchor preview.")
             if job.get("status") != "completed":
                 raise ValueError(f"The anchor preview {job_id} has not completed ({job.get('status')}).")
-            directory = str((job.get("preparation") or {}).get("run_directory") or directory)
+            job_directory = str((job.get("preparation") or {}).get("run_directory") or "")
+            # The person's decisions are about the preview they reviewed: a directory that names another
+            # preview than the job is refused, never resolved in the job's favour (CONF-6, CONF-10).
+            _refuse_other_directory(job_id, job_directory, directory)
+            directory = job_directory or directory
     if not directory:
         raise ValueError("Name the anchor preview: its job_id, or its preview_directory.")
+    # Named by directory, the preview's own record says which job it was; while this backend holds that job,
+    # it must have completed (a failed or cancelled preview leaves a partial audit marked Run = Preview).
+    try:
+        recorded_job = str(read_automatic_rt_preview_record(directory).get("job_id") or "").strip()
+    except (OSError, ValueError):
+        recorded_job = ""
+    if recorded_job and job_id and recorded_job != job_id:
+        raise ValueError(
+            f"The preview directory {directory} is the preview of job {recorded_job}, not of job {job_id}. "
+            "Approve the anchors of the preview you reviewed: name it by its own job or directory alone."
+        )
+    if recorded_job and not job_id:
+        with JOBS_LOCK:
+            recorded = JOBS.get(recorded_job)
+        if recorded is not None and recorded.get("status") != "completed":
+            raise ValueError(
+                f"The anchor preview {recorded_job} in {directory} has not completed ({recorded.get('status')}); "
+                "its audit is a partial one. Run the preview again."
+            )
     confirmed = body.get("confirmed") is True
     result = approve_automatic_rt_anchors(
         directory,
@@ -3997,15 +4079,33 @@ def _approve_automatic_rt_anchors_request(body: dict[str, Any]) -> dict[str, Any
         str(body.get("confirmed_by") or ""),
         write=confirmed,
         output_root=str(body.get("output_root") or "").strip() or None,
-        preview_job_id=job_id,
+        preview_job_id=recorded_job or job_id,
     )
     if not confirmed:
         result["confirmation_required"] = True
+        # The refusal of UserOnly stays in front: the person has to be asked whether to run Hybrid.
+        refusal = str(result.get("message") or "").strip()
         result["message"] = (
-            "Nothing was written. Show these rows to the person who reviewed the anchors; when they approve "
+            (refusal + " " if refusal else "")
+            + "Nothing was written. Show these rows to the person who reviewed the anchors; when they approve "
             "them, call again with confirmed=true and confirmed_by naming them."
         )
     return result
+
+
+def _refuse_other_directory(job_id: str, job_directory: str, directory: str) -> None:
+    """Refuse a request whose job and directory name two different runs (CONF-6, CONF-10)."""
+    if not directory or not job_directory:
+        return
+
+    def key(value: str) -> str:
+        return os.path.normcase(str(Path(value).expanduser().resolve()))
+
+    if key(directory) != key(job_directory):
+        raise ValueError(
+            f"Job {job_id} ran in {job_directory}, not in {directory}. The request names two different runs; "
+            "name the one on screen by its own job or directory alone."
+        )
 
 
 def _run_rt_correction_job(job_id: str, preparation: dict[str, Any]) -> None:

@@ -20,6 +20,7 @@ from .automatic_rt_evidence import (
     SUMMARY,
     automatic_rt_correction_proof,
     discarded_method_keys,
+    exclusions_current,
     has_local_support_columns,
     proof_reason_phrase,
     read_method_key_record,
@@ -41,6 +42,20 @@ BLANK_ANCHOR_STATUSES = {"BlankInterpolateByOrder", "BlankNotCorrected"}
 # MissingInReference (MsdialWorkbench#845) is a user anchor the reference file did not show: it has no
 # reference RT, so it never reached a model either.
 UNMATCHED_ANCHOR_STATUSES = {"Missing", "Ambiguous", "MissingInReference"}
+# Records the Console counts once by design, not rejections. Duplicate (MsdialWorkbench#845): a True row
+# whose reference-file peak lies within CoElutionScans MS1 scans of an earlier row's (two adducts of one
+# standard, one row entered twice) is that row's anchor in every file. SameOriginalRt: an anchor that took
+# the same peak in a file as another anchor did, so that file's map has one point there.
+DUPLICATE_ANCHOR_STATUSES = {"Duplicate", "SameOriginalRt"}
+# Detected (MsdialWorkbench#845) is a user anchor found in a file of a run that failed before any model
+# was fitted: the partial audit of AutomaticRtCorrectionFailedException, every file Uncorrected and no
+# reference file. It was never judged, so it is no rejection either.
+NOT_JUDGED_ANCHOR_STATUSES = {"Detected"}
+# The file's analysis batch, which a Console that keeps Blank interpolation within a batch appends to the
+# summary audit. Read when present; "" otherwise.
+ANALYSIS_BATCH_COLUMN = "Analysis batch"
+# Anchor statuses that are a test's rejection of the anchor in a file (MadOutlier, LocalOutlier,
+# NonMonotonic, InsufficientAnchors and any status this viewer does not know): the "rejected" category.
 # MsdialWorkbench#876: how the Console chose the reference file, in every summary row, and each file's
 # library RT deviation (the median over its detected user anchors of |observed RT - library RT| / RT
 # tolerance). A Console with #876 chooses, in UserOnly and Hybrid with an automatic reference, the file
@@ -167,7 +182,9 @@ def _table(path: Path, required: set[str]) -> list[dict[str, str]]:
     if path.stat().st_size > MAX_AUDIT_BYTES:
         raise ValueError(f"RT correction audit {path.name} exceeds the review limit.")
     with path.open(encoding="utf-8-sig", newline="") as handle:
-        reader = csv.DictReader(handle, delimiter="\t")
+        # The Console writes these cells unquoted (Cell() only replaces tabs and line breaks), so a quote
+        # is part of the cell, as it is of the anchor name in the library it came from.
+        reader = csv.DictReader(handle, delimiter="\t", quoting=csv.QUOTE_NONE)
         missing = required - set(reader.fieldnames or [])
         if missing:
             raise ValueError(f"{path.name} is missing columns: {', '.join(sorted(missing))}")
@@ -231,11 +248,13 @@ def read_automatic_rt_review(directory: str | Path) -> dict:
             # MsdialWorkbench#876; "" or None in an audit written before it.
             "reference_selection": str(row.get(REFERENCE_SELECTION_COLUMN) or "").strip(),
             "library_rt_deviation": _number(row, LIBRARY_RT_DEVIATION_COLUMN),
+            "analysis_batch": str(row.get(ANALYSIS_BATCH_COLUMN) or "").strip(),
         })
 
     anchors = []
     anchors_by_file = {file_id: [] for file_id in file_ids}
     blank_files = {item["file_id"] for item in files if item["type"].strip().casefold() == "blank"}
+    failed_run = not any(item["model_source"] == "Reference" for item in files)
     for row in anchor_rows:
         file_id = row["File ID"].strip()
         if file_id not in file_ids:
@@ -253,6 +272,10 @@ def read_automatic_rt_review(directory: str | Path) -> dict:
             category = "blank"
         elif status in UNMATCHED_ANCHOR_STATUSES:
             category = "unmatched"
+        elif status in DUPLICATE_ANCHOR_STATUSES:
+            category = "duplicate"
+        elif status in NOT_JUDGED_ANCHOR_STATUSES and failed_run:
+            category = "not_judged"
         else:
             category = "rejected"
         anchor = {
@@ -304,7 +327,7 @@ def read_automatic_rt_review(directory: str | Path) -> dict:
     reference = next((item for item in files if item["model_source"] == "Reference"), None)
     by_category = {
         category: Counter(item["status"] for item in anchors if item["category"] == category)
-        for category in ("rejected", "unmatched", "blank")
+        for category in ("rejected", "unmatched", "blank", "duplicate", "not_judged")
     }
     rejected = by_category["rejected"]
     warnings, notes = [], []
@@ -320,13 +343,27 @@ def read_automatic_rt_review(directory: str | Path) -> dict:
             + ", ".join(f"{key} ({value})" for key, value in sorted(by_category["unmatched"].items()))
             + ". They never reached a model; they have no sample RT and remain in the table as N/A."
         )
+    if by_category["duplicate"]:
+        notes.append(
+            f"{sum(by_category['duplicate'].values())} anchor record(s) took a peak another anchor took and are "
+            "counted once by design, not rejected: "
+            + ", ".join(f"{key} ({value})" for key, value in sorted(by_category["duplicate"].items()))
+            + ". Duplicate is a True row whose reference-file peak lies within two MS1 scans of an earlier "
+            "row's (two adducts of one standard, for one); SameOriginalRt an anchor that matched the same peak "
+            "in a file as another anchor."
+        )
+    if by_category["not_judged"]:
+        notes.append(
+            f"{sum(by_category['not_judged'].values())} anchor record(s) are Detected: the run failed before any "
+            "model was fitted, so these anchors were found but never judged. This is a failed run's partial audit."
+        )
     if by_category["blank"]:
         notes.append(
             f"{sum(by_category['blank'].values())} anchor record(s) are in Blank files, not used by design: "
             + ", ".join(f"{key} ({value})" for key, value in sorted(by_category["blank"].items()))
             + ". A Blank's model comes from neighbouring injections, or it keeps its original RT; its own anchors never fit it."
         )
-    exclusions = _exclusions(root / EXCLUSIONS)
+    exclusions = _exclusions(root / EXCLUSIONS) if exclusions_current(root, summary_rows) else []
     anchor_review = _anchor_review(files, anchors, summary_rows, exclusions, reference)
     reference_check = approved_reference_check(reference, anchor_review, run_anchor_approval(root))
     if reference_check:
@@ -340,6 +377,14 @@ def read_automatic_rt_review(directory: str | Path) -> dict:
             "alignment. Accept or reject each anchor; the approved anchors become the production run's "
             "anchor library. Nothing was aligned, so this audit is not evidence of a correction."
         )
+        # Decision 4 (2026-11-10): what could make a production run with the approved anchors choose another
+        # reference file, or count fewer anchors than the rows, said before the person approves.
+        for item in anchor_review["anchors"]:
+            if item["flags"]:
+                warnings.append(
+                    f"Anchor {item['key']}" + (f" ({item['name']})" if item["name"] else "") + ": "
+                    + " Also ".join(flag["message"] for flag in item["flags"])
+                )
     for exclusion in exclusions:
         if exclusion["excluded_candidates"] == 0:
             notes.append(
@@ -354,9 +399,14 @@ def read_automatic_rt_review(directory: str | Path) -> dict:
         )
     missing_rt = [item for item in anchors if not item["rt_available"]]
     # A record that matched no peak has no sample RT by construction; any other is unexpected.
-    unexplained_missing_rt = [item for item in missing_rt if item["status"] not in UNMATCHED_ANCHOR_STATUSES]
+    # A Duplicate counts once, with the row whose peak it took, and a failed run's Detected record was never
+    # placed on the reference axis: neither is an unexplained gap.
+    unexplained_missing_rt = [
+        item for item in missing_rt
+        if item["status"] not in UNMATCHED_ANCHOR_STATUSES and item["category"] not in {"duplicate", "not_judged"}
+    ]
     if unexplained_missing_rt:
-        warnings.append(f"{len(unexplained_missing_rt)} anchor record(s) other than Missing or Ambiguous have unavailable RT values. They remain in the table as N/A and are excluded from numeric plots; no RT values are imputed.")
+        warnings.append(f"{len(unexplained_missing_rt)} anchor record(s) other than Missing, Ambiguous, Duplicate or a failed run's Detected have unavailable RT values. They remain in the table as N/A and are excluded from numeric plots; no RT values are imputed.")
     invalid_used_files = sorted({item["file_id"] for item in missing_rt if item["used"]})
     if invalid_used_files:
         warnings.append("Anchors marked Used have unavailable RT values in File ID(s) " + ", ".join(invalid_used_files) + ". Their correction models cannot be reconstructed safely.")
@@ -491,6 +541,15 @@ def _anchor_review(
                 "files_detected": 0,
                 "files_used": 0,
                 "non_blank_files": 0,
+                # Over the non-Blank files other than the reference: matched to a peak, rejected by a test,
+                # used by the file's map.
+                "other_files": 0,
+                "other_files_matched": 0,
+                "other_files_rejected": 0,
+                "other_files_used": 0,
+                "other_rejections": {},
+                "used_in_reference": False,
+                "reference_cycle": None,
             }
         if anchor["reference_rt"] is not None and entry["reference_rt"] is None:
             entry["reference_rt"] = anchor["reference_rt"]
@@ -500,6 +559,8 @@ def _anchor_review(
             entry["quality_score"] = anchor["quality_score"]
             entry["detection"] = anchor["detection"]
             entry["reference_status"] = anchor["status"]
+            entry["used_in_reference"] = anchor["used"]
+            entry["reference_cycle"] = anchor["ms1_cycle_time"]
         entry["outlier_flagged"] = entry["outlier_flagged"] or anchor["outlier_flagged"]
         if anchor["file_id"] not in blank:
             entry["non_blank_files"] += 1
@@ -507,6 +568,13 @@ def _anchor_review(
                 entry["files_detected"] += 1
             if anchor["used"]:
                 entry["files_used"] += 1
+            if anchor["file_id"] != reference_id:
+                entry["other_files"] += 1
+                entry["other_files_matched"] += anchor["original_rt"] is not None
+                entry["other_files_used"] += anchor["used"]
+                if anchor["category"] == "rejected":
+                    entry["other_files_rejected"] += 1
+                    entry["other_rejections"][anchor["status"]] = entry["other_rejections"].get(anchor["status"], 0) + 1
     ordered = sorted(
         by_key.values(),
         key=lambda item: (
@@ -515,6 +583,9 @@ def _anchor_review(
             item["key"],
         ),
     )
+    scan_interval = (reference or {}).get("estimated_scan_interval")
+    for item in ordered:
+        item["flags"] = _anchor_flags(item, ordered, scan_interval) if reference_id is not None else []
     return {
         "run": str(first.get("Run") or "").strip(),
         # An audit before #845 has no Anchor mode column; its correction was automatic.
@@ -532,6 +603,83 @@ def _anchor_review(
         "automatic_anchor_count": sum(1 for item in ordered if item["source"] == "Automatic"),
         "exclusion_count": len(exclusions),
     }
+
+
+def _anchor_flags(item: dict, ordered: list[dict], scan_interval: float | None) -> list[dict]:
+    """Why an anchor, once approved, could make the production run differ from what the preview showed.
+
+    Decision 4 (2026-11-10): the reference stays automatic, so the reasons it could move are shown before the
+    approval rather than the preview's reference being pinned. An approved anchor is a named anchor in the
+    production run, matched again in every file, and the reference is the file with the most named anchors
+    detected. An automatic anchor that every other file's test rejected, or that only the reference used, is
+    likely noise or a baseline that the reference happened to show; one missing in the reference, a
+    Duplicate there, or within two MS1 scans of another anchor, is counted once or not at all.
+    """
+    from .automatic_rt_anchors import CO_ELUTION_SCANS, DUPLICATE_STATUS, NOT_IN_REFERENCE_STATUSES, _same_scan
+
+    flags: list[dict] = []
+    status = item["reference_status"]
+    if item["source"] == "Automatic" and item["other_files"]:
+        if item["other_files_matched"] and item["other_files_rejected"] == item["other_files_matched"]:
+            tests = ", ".join(f"{key} in {value}" for key, value in sorted(item["other_rejections"].items()))
+            flags.append({
+                "code": "rejected_in_every_other_file",
+                "message": (
+                    f"rejected by the outlier test in every other file it was matched in ({tests} of "
+                    f"{item['other_files']} non-reference files): it agrees only with the reference file, so it "
+                    "may be noise, a baseline or another compound there."
+                ),
+            })
+        if item["used_in_reference"] and not item["other_files_used"]:
+            flags.append({
+                "code": "used_only_in_reference",
+                "message": (
+                    "used only in the reference file. Approved, it is a named anchor that the production run "
+                    "matches again in every file; the file with the most named anchors detected becomes the "
+                    "reference, so where this anchor is found in other files but not in this one the run is "
+                    "mapped onto another file than the one reviewed."
+                ),
+            })
+    if status in NOT_IN_REFERENCE_STATUSES:
+        flags.append({
+            "code": "missing_in_reference",
+            "message": (
+                f"not detected in the reference file ({status}): the Console counts it nowhere there, and it does "
+                "not count toward UserOnly's minimum anchor count."
+            ),
+        })
+    elif status == DUPLICATE_STATUS:
+        flags.append({
+            "code": "duplicate_in_reference",
+            "message": (
+                f"Duplicate in the reference file: its peak lies within {CO_ELUTION_SCANS} MS1 scans of another "
+                "anchor's, so the Console counts the two as one anchor."
+            ),
+        })
+    elif item["reference_rt"] is not None:
+        for other in ordered:
+            if other is item:
+                break
+            if (
+                other["reference_rt"] is None
+                or other["reference_status"] in NOT_IN_REFERENCE_STATUSES
+                or other["reference_status"] == DUPLICATE_STATUS
+            ):
+                continue
+            cycle = max(filter(None, (item["reference_cycle"], other["reference_cycle"], scan_interval)), default=None)
+            if _same_scan(item["reference_rt"], other["reference_rt"], cycle):
+                flags.append({
+                    "code": "same_scan_as",
+                    "other_key": other["key"],
+                    "message": (
+                        f"within {CO_ELUTION_SCANS} MS1 scans of {other['key']} in the reference file (RT "
+                        f"{item['reference_rt']:.4f} and {other['reference_rt']:.4f} min): approved as named anchors, "
+                        "the Console counts the two as one (one of them becomes a Duplicate), so they count once "
+                        "toward UserOnly's minimum anchor count."
+                    ),
+                })
+                break
+    return flags
 
 
 def run_anchor_approval(directory: str | Path) -> dict | None:
@@ -582,10 +730,15 @@ def approved_reference_check(reference: dict | None, anchor_review: dict, approv
     """Whether a run that read an approved anchor library mapped onto the preview's reference file.
 
     An approved automatic anchor is a True row at the RT it had in the preview's reference file, so that is
-    the axis the person reviewed. A Console with MsdialWorkbench#876 chooses that file again (the most user
-    anchors detected, then the closest to the library's RTs); one before it chose by the closeness of each
-    file's anchor RTs to their median over the batch, and can map the run onto another file. A difference is
-    a warning, never a refusal: the run is internally consistent, on another file's axis.
+    the axis the person reviewed. A Console with MsdialWorkbench#876 chooses the file with the most user
+    anchors detected, then the one closest to the library's RTs. That brings back the preview's reference only
+    when every True row was written from the preview (each at the preview reference's RT) and that file
+    detects as many anchors as any other: a hand-written row keeps its own library RT, which another file can
+    lie closer to, and an approved anchor that is noise can be found in another file and not in the preview's
+    reference (automatic_rt_review._anchor_flags shows both before the approval). A Console before #876 chose
+    by the closeness of each file's anchor RTs to their median over the batch. The reference is not pinned
+    (decision 4, 2026-11-10); a difference is a warning, never a refusal: the run is internally consistent,
+    on another file's axis.
 
     None when it does not apply: no approval, a preview's audit, or a run whose audit names another anchor
     library than the approved one. Otherwise status is "matches", "differs" or "unknown" (the preview's
@@ -643,7 +796,11 @@ def approved_reference_check(reference: dict | None, anchor_review: dict, approv
         else:
             reason = (
                 "; a file with more approved anchors detected wins before the closest to the library's RTs, so "
-                "compare 'User anchors detected' and 'Library RT deviation (RT tolerances)' in the summary audit."
+                "compare 'User anchors detected' and 'Library RT deviation (RT tolerances)' in the summary audit. "
+                "The preview's reference is chosen again only when every True row was written from the preview "
+                "and that file detects as many anchors as any other: a hand-written True row keeps its own "
+                "library RT, and an approved anchor the preview flagged (rejected in every other file, used only "
+                "in the reference, missing or a duplicate there) can be detected in more files elsewhere."
             )
         text += f" The Console chose it by '{selection or 'an unrecorded rule'}'{reason}"
     else:
