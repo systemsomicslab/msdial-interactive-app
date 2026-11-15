@@ -637,6 +637,56 @@ class FromTheRunToTheLipidome(_Batch):
                   for line in (self.batch.analysis / "inputs" / "lab-lipidomics-record.jsonl").read_text().splitlines()]
         self.assertEqual(["contract_written", "normalized", "normalized", "merged"], events)
 
+    def test_the_merged_lipidome_names_the_rt_axis_the_runs_exports_carry(self) -> None:
+        # Since MsdialWorkbench#884 an automatically RT-corrected run's Height export says which axis its RTs are on;
+        # Console normalize's matrices, which the merge reads, do not. The merge takes it from the run's export.
+        positive = self.normalize("Positive", accept_searched=["Cer 18:1;O2/15:0(d7)"])
+        negative = self.normalize("Negative")
+        self.assertNotEqual(positive["run_height_export"], positive["outputs"]["height_copy"])
+        note = ("RT axis: aligned RTs are on the RT axis of reference file QC_Neg (automatic alignment RT correction); "
+                "per-file peak lists and RT-match evidence are on each file's measured RT axis")
+        run_export = Path(negative["run_height_export"])
+        run_export.write_text(note + run_export.read_text(encoding="utf-8"), encoding="utf-8")
+        # The run's export is bound to the normalize record: changed since, the merge is refused.
+        with self.assertRaisesRegex(LabContractError, "has changed since normalize .was the polarity run again"):
+            merge_lipidome(self.contract)
+        negative = self.normalize("Negative")
+
+        written = merge_lipidome(self.contract, write=True)
+        first = (self.batch.analysis / "quant" / "lipidome" / "lipid_metabolome.csv").read_text(encoding="utf-8")
+        first = first.splitlines()[0].split(",")[0]
+
+        self.assertEqual(f"Positive rows: its run's alignment export carries no RT axis note | Negative rows: {note}", first)
+        self.assertEqual({"positive": positive["run_height_export"], "negative": negative["run_height_export"]},
+                         written["rt_axis"]["sources"])
+        self.assertEqual({}, written["rt_axis"]["unread"])
+        # A correction audit that appears beside the run's export after normalize is a change too.
+        (run_export.parent / "automatic_alignment_rt_correction_summary.tsv").write_text("File name\n", encoding="utf-8")
+        with self.assertRaisesRegex(LabContractError, "RT correction audit beside it has changed since normalize"):
+            merge_lipidome(self.contract)
+
+    def test_a_normalize_recorded_before_the_run_export_was_kept_leaves_its_rt_axis_unknown(self) -> None:
+        self.normalize("Positive", accept_searched=["Cer 18:1;O2/15:0(d7)"])
+        negative = self.normalize("Negative")
+        note = "RT axis: aligned RTs are on the RT axis of reference file QC_Neg (automatic alignment RT correction)"
+        run_export = Path(negative["run_height_export"])
+        run_export.write_text(note + run_export.read_text(encoding="utf-8"), encoding="utf-8")
+        negative = self.normalize("Negative")
+        record_path = self.batch.analysis / "quant" / "normalize_pos.local.json"
+        record = json.loads(record_path.read_text(encoding="utf-8"))
+        for key in ("run_height_export", "run_height_export_sha256", "run_rt_correction_summary_sha256"):
+            record.pop(key)
+        record_path.write_text(json.dumps(record), encoding="utf-8")
+
+        written = merge_lipidome(self.contract, write=True)
+        first = (self.batch.analysis / "quant" / "lipidome" / "lipid_metabolome.csv").read_text(encoding="utf-8")
+
+        self.assertTrue(first.startswith("Positive rows: its RT axis is not known (its run's alignment export was not "
+                                         f"read) | Negative rows: {note},"), first.splitlines()[0])
+        self.assertEqual(["positive"], list(written["rt_axis"]["unread"]))
+        self.assertTrue(any("Which RT axis the positive rows are on is not known" in item for item in written["warnings"]),
+                        written["warnings"])
+
     def test_the_merge_refuses_a_polarity_not_normalized_or_changed_since(self) -> None:
         self.normalize("Positive", accept_searched=["Cer 18:1;O2/15:0(d7)"])
         with self.assertRaises(LabContractError) as raised:
