@@ -4,6 +4,70 @@ Notable changes to MS-DIAL Interactive. The package version is kept in
 `pyproject.toml` and `msdial_app/__init__.py`; the Agent API version is separate.
 Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
 
+## [0.5.67] - Unreleased
+
+From the triage of the 162 attribute failures of campaign stage3b-poola-20261106 and the author's decisions of
+2026-11-15: a coverage gate before MS-DIAL, and the attribution routes R1, R3, R4 and R6 fixed where the files exist.
+Each rule is whole-token, polarity-scoped and one to one. R5, R7 to R9 and Catalog changes are not in this version.
+
+### Added
+- **The attribution coverage gate (`attribution_coverage`, `repository_analysis_rows`).**
+  - Why: ST002512's negative unit `9d1e8e566ba00ff0be25` declared 110 sample rows. The leading-identifier fallback
+    admitted 5 blank injections, the unit ran on them, and it was marked done: 5% of its samples.
+  - Now the lease's attribute stage counts the unit's analytical sample rows of its own polarity and how many of them
+    attribution gave an input, as the analysis CSV pairs them. A row whose names state only another polarity, or a
+    joined cell all of whose names are another unit's, is not counted; nor is a blank row. A row whose input the lease
+    excluded for what it holds (undecodable mzML, not CID/HCD) counts as admitted. An unattributed input of a
+    unit-scoped archive (2026-10-07) counts as an admitted file, a blank never.
+  - The lease fails at the attribute stage with `AttributionCoverageError` when fewer than
+    `ATTRIBUTION_COVERAGE_MINIMUM` (0.5) of those rows were admitted (`attribution_coverage_below_minimum`), or when
+    none of the unit's biological sample rows was, only blanks, QCs or standards
+    (`attribution_admitted_only_blanks_qc_or_standards`). The failed manifest is `download_failed` with
+    `download_failure.stage: attribute`, `reason_code` and the record less its per-input list
+    (`download_failure.attribution_coverage`, which the download job carries verbatim), and the whole record as
+    `attribution_coverage` beside it. It is a failure, not an exclusion, and is not marked unretryable.
+  - Every lease that passes writes `manifest.attribution_coverage`: rule, minimum, status, reason, the unit's polarity
+    and chromatography, `sample_rows`, `rows_of_another_unit`, `blank_rows`, `declared_rows`, `admitted_rows`,
+    `ratio`, `sample_rows_declared`, `sample_rows_admitted`, `unattributed_inputs(_counted)`, `admitted_by` (the rule
+    that admitted each input, counted), `inputs` (each input with its row, type and rule), `rows_without_input` (first
+    100, with the count) and `joined_raw_files` (rows split, rows of another unit, cells refused). The attribute stage
+    carries its status, reason, counts and ratio.
+  - A unit with no sample rows, or none of its polarity that is not a blank, is recorded `not_evaluated` and not judged.
+- **Two pairing rules, inferences on record like the others (`input_name_pairings`, the lineage row's
+  `name_pairing`, the attribute stage's counts).**
+  - R4 `polarity_marked_member_stem`: a trailing `+` or `-` on a member's stem, after an optional run-order `_r<n>`, is
+    a polarity (`polarity_marker`; `name_polarities` now reads it). ST003328's `DS1-93-001` takes
+    `negative/DS1-93-001-.raw` in a negative unit. The declared stem must be one row's; members of another polarity are
+    dropped first; what is left must be one file in one folder (or its encodings beside it). One marked name in two
+    folders (ST003184 and ST003185's `negative global lipids/` and `negative fatty acids/`) or two marked runs of one
+    sample (ST003792's AG-88-5) pairs nothing, on record.
+  - R6 `sample_id_member_stem`: a row none of whose names anything carries is paired with the members whose stem is
+    its `sample_id`, whole and without case (ST002823's `12-5-2020Ctrl1- Fecal`; ST004757's rows that name only
+    `.RAW`). Only where the id is one row's, the stem is no row's file stem, the members are one sample once another
+    polarity's are dropped, and neither the id nor the member states another polarity, a pos/neg token glued to a
+    number included (`b1_pos1`). The pairing carries the row's `sample_id`.
+
+### Changed
+- **R1: a joined raw_file cell is split and read for the unit (`sample_raw_file_reading`, `unit_raw_file_names`).**
+  Workbench's RAW_FILE_NAME may list every polarity's, chromatography's and encoding's file in one cell (ST002260
+  `pRPLC_1; nRPLC_1`, ST003720 `NEG_D1.mzML POS_D1.mzML`, ST002826's four names). The cell is split on `;`, and on
+  whitespace only where every word ends in a file suffix, so `Pos _QC1.wiff` and `Ctrl1- Fecal.wiff` stay whole; `-` is
+  a placeholder. A name stating another polarity or chromatography by a token of its own (compounds such as `RPPOS`
+  and `pRPLC` included) is dropped. What is left must be one sample's (one stem, in any encoding; the one encoding rule
+  chooses among them). Otherwise the row gets no name and the gate lists the cell (`joined_raw_file_names_several_
+  samples`): ST002044's `D_10.mzML D_10NEG.mzML D10_POS.mzML D10_NEG.mzML` states no chromatography and is refused,
+  never guessed. Every reader that matches files by a row's name reads it this way: the sample names, the pairing rules,
+  the encoding groups, the lineage, the CID/HCD check, the split parts' refusals and the analysis CSV. A member a joined
+  cell names only for another unit is never a unit-scoped archive's unattributed input
+  (`named_by_a_joined_raw_file_for_another_unit`). This lifts 0.5.60's "ST004751's rows name two files in one field".
+- **R3: another polarity's claimant is dropped before one to one and uniqueness.** In the prefixed, leading-identifier
+  and deposited-conversion rules, a member whose path states a polarity other than the unit's ion mode is refused on
+  record (`polarity_token_contradicts_ion_mode`) and no longer makes the name not one to one, so ST003616's
+  `Project2_Neg_P-Batch-1-Preterm-1.mzML` pairs in a negative unit beside its POS twin. In a unit of no stated polarity
+  both are still candidates and neither pairs. A member's polarity refusal is recorded once per name.
+- **R2 is 0.5.60's `converted_member_stem`**, unchanged except that it counts rows, not names, per stem (a joined cell
+  naming `X.raw` and `X.mzML` is one row) and drops another polarity's mzML first (R3).
+
 ## [0.5.65] - Unreleased
 
 Follow-ups to 0.5.64's anchor preview and approval, from a multi-agent review of the automatic alignment RT
