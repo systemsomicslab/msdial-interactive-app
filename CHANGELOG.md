@@ -4,6 +4,151 @@ Notable changes to MS-DIAL Interactive. The package version is kept in
 `pyproject.toml` and `msdial_app/__init__.py`; the Agent API version is separate.
 Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
 
+## [0.5.67] - Unreleased
+
+From the triage of the 162 attribute failures of campaign stage3b-poola-20261106 and the author's decisions of
+2026-11-15: a coverage gate before MS-DIAL, and the attribution routes R1, R3, R4 and R6 fixed where the files exist.
+Each rule is whole-token, polarity-scoped and one to one. R5, R7 to R9 and Catalog changes are not in this version. A
+three-lens review of the first cut found paths that attributed a file to the wrong sample or chromatography, and gate
+paths that passed short admissions; both are closed here.
+
+### Added
+- **The attribution coverage gate (`attribution_coverage`, `repository_analysis_rows`).**
+  - Why: ST002512's negative unit `9d1e8e566ba00ff0be25` declared 110 sample rows. The leading-identifier fallback
+    admitted 5 blank injections, the unit ran on them, and it was marked done: 5% of its samples.
+  - What is counted: the unit's analytical sample rows of its own polarity, and how many of them attribution gave an
+    input, as the analysis CSV pairs them.
+    - Another unit's row, listed with why (`rows_of_another_unit_listed`): a row whose names state only the other
+      polarity by a token of their own; a joined cell all of whose names are another unit's; a row whose one name
+      states another chromatography where the unit's rows state two (ST002330's `HILIC-RN1-neg.mzXML` beside
+      `C18-RN1-neg.mzXML`). A row's own attribute of its mode counts where its names state none: `Mode`,
+      `Chromatography ion mode`, `Scan polarity`, `Ionization mode`, `Column type` and the like, an ISA
+      `Parameter Value[...]` unwrapped (ST004606's rows state nothing by name and say `HILIC POS` or `RP NEG`; ST002796's
+      say `C18 Negative`); `both`, `alternating`, `switching` or `mixed` states no polarity
+      (`row_attribute_states_another_polarity`, `row_attribute_states_another_chromatography`). A row's chromatography
+      attribute outweighs a name that states only RP, which may be a sample's code: a HILIC unit whose every row says
+      `Column type` HILIC passes with files `RP_1.raw`, `C8_1.raw` or `P1_C18_1.raw`. Two chromatographies are read
+      by the kind of statement that states both, names' two for rows read by name and attributes' two for rows read
+      by attribute, so other rows' HILIC attributes never read a name's RP. A name's HILIC is read before any
+      attribute. A sample id's polarity
+      counts only where the names and attributes state none, a glued run number (`b1_neg1`) only for a row that names
+      no file of its own.
+    - A blank row is no analytical row. Blanks and QCs are read by whole tokens as well (`Bk_1`, `BK1`, `Blk_01`,
+      `QC01`, `IQC_…`, `Pool_3`, `NIST`, `SRM1950`), since ST002512's admitted `Neg_bk_1.raw` was typed Sample.
+    - A row whose input the lease excluded for what it holds counts as admitted; `analysed_ratio` says how many ran.
+    - An unattributed input of a unit-scoped archive (2026-10-07) counts as an admitted file, a blank or QC never.
+  - The lease fails at the attribute stage with `AttributionCoverageError` when:
+    - fewer than `ATTRIBUTION_COVERAGE_MINIMUM` (0.5) of those rows were admitted
+      (`attribution_coverage_below_minimum`);
+    - none of the unit's biological sample rows was, only blanks, QCs or standards
+      (`attribution_admitted_only_blanks_qc_or_standards`);
+    - fewer than the minimum of its biological sample rows were, however many QC rows were
+      (`attribution_sample_coverage_below_minimum`);
+    - none of its rows is a biological sample's of its own polarity, some are another unit's, it admitted inputs, and
+      either a row of another unit is a biological sample's (whether or not its file was admitted) or it admitted an
+      input no row of its own declares (another unit's row's file, or an unattributed member that is no blank or QC),
+      whatever blank, QC or standard rows it also lists: a Catalog mis-assignment
+      (`attribution_no_rows_of_the_unit_polarity`). A positive unit whose rows were `S1_neg.raw`…`S5_neg.raw` beside
+      `Blank1.raw` and `Blank2.raw`, the negative files absent, would otherwise run on its two blanks. Only a stray
+      blank or QC row of another unit whose file was not admitted refuses nothing: a QC-only or pooled-only unit beside
+      one such row runs on its own files, as before;
+    - it admitted the file of a row that is another unit's, however many of its own samples it admitted
+      (`attribution_admitted_another_units_inputs`). The gate counted only the unit's own rows, so one positive sample
+      row passed a unit carrying ten negative files at 0.5; on stage3b, ST002798's HILIC and reversed-phase units each
+      carried the other chromatography's files and ran. An input counts as another unit's by its own evidence: its
+      row's own attribute says so, or its own name (or, its name silent, its folders below the data root) states
+      another polarity or chromatography. A row read as another unit's only by a token its file does not carry (a
+      sample id's `HIV_neg_1` beside `H3.raw`) counts the row, never the file. `inputs_of_another_units_rows` counts
+      them, a floor: the message says it covers only rows and inputs whose own names or attributes say so. A file's
+      own pos/neg token is still its polarity (`ER_neg_1.raw` refuses a positive unit; `Neg_Ctrl_1.raw` does in a
+      listing that names files by polarity), open for the author since the raw-header preflight runs after the gate;
+    - it admitted only blanks and no row is an analytical sample's, whether or not any row is another unit's
+      (`attribution_admitted_only_blanks_qc_or_standards`; until this version recorded `not_evaluated`);
+    - the rows could not be built to be counted (`attribution_coverage_not_computed`).
+    `ATTRIBUTION_COVERAGE_REFUSALS` lists the codes.
+  - The failed manifest is `download_failed` with `download_failure.stage: attribute`, `reason_code`,
+    `retryable: false` (the same handoff and code repeat the same attribution), no disposition (a failure, not an
+    exclusion), and the record less its per-input list (`download_failure.attribution_coverage`, which the download
+    job carries verbatim); the whole record is `attribution_coverage` beside it.
+  - Every lease that passes writes `manifest.attribution_coverage`: rule, minimum, status, reason, the unit's polarity
+    and chromatography, `sample_rows`, `rows_of_another_unit(_listed)`, `inputs_of_another_units_rows`, `blank_rows`,
+    `declared_rows`, `admitted_rows`, `ratio`, `row_ratio`, `analysed_ratio`, `sample_rows_declared`,
+    `sample_rows_admitted`, `sample_ratio`, `unattributed_inputs(_counted)`, `admitted_by` (the rule that admitted
+    each input, counted), `inputs` (each input with its row, type and rule), `rows_without_input` (first 100, with
+    the count), `joined_raw_files` (rows split, rows of another unit, cells refused and whether each was read whole)
+    and `warnings`. The attribute stage carries its status, reason, counts and ratios.
+  - Where rows alone are below the minimum and unattributed inputs make up the gap, the unit passes with the warning
+    `attribution_rows_below_minimum_unattributed_inputs_counted`, in the manifest's warnings too. Whether that should
+    refuse is open for the author (it would refuse the 2026-10-07 ST001264 case).
+  - A unit with no sample rows, or whose own rows are blanks only and which admitted no input but its own rows' files
+    and something other than blanks (an unpaired input), is recorded `not_evaluated` and not judged.
+  - Still uncaught, open for the author (stage3b's done units that ran another Catalog unit's files and pass): where
+    neither the names, the folders nor the rows' attributes state the chromatography (ST002283's `_Lip_` and ST002747's
+    `Lipids/` beside `_Hilic_`, ST004544, ST003128), and the opposite-polarity part of a Catalog unit that declares one
+    polarity. Both need a check across Catalog units (two units of different chromatography admitting the same file
+    set) or a ruling on header-first polarity against the Catalog's, which this per-unit gate cannot make.
+- **Two pairing rules, inferences on record like the others (`input_name_pairings`, the lineage row's
+  `name_pairing`, the attribute stage's counts), in a unit of one stated polarity only.**
+  - R4 `polarity_marked_member_stem`: a trailing `+` or `-` on a member's stem (`polarity_marker`). ST003328's
+    `DS1-93-001` takes `negative/DS1-93-001-.raw` in a negative unit. A run-order `_r<n>` before the marker
+    (`run_order_split`) is stripped only where the stem with it kept is no row's, and the pairing records it
+    (`run_suffix`), so rows `S1` and `S1_r1` each keep their file. The declared stem must be one row's; members whose
+    marker or folders state the other polarity, or whose folders state another chromatography, are dropped first;
+    what is left must be one file in one folder (or its encodings beside it). One marked name in two folders
+    (ST003184 and ST003185) or two marked runs of one sample (ST003792's AG-88-5) pairs nothing, on record.
+  - R6 `sample_id_member_stem`: a row none of whose names anything carries is paired with the members whose stem is
+    its `sample_id`, whole and without case, only where the row names no file of its own (ST004757's `.RAW`) or its
+    file's stem is the tail of the id (ST002823's `12-5-2020Ctrl1- Fecal` naming `Ctrl1- Fecal.wiff`). Never a typo's
+    correction (ST002452's `384_SPC-GM`). The id must be one row's, the members one file in one folder once another
+    polarity's and another chromatography's folders are dropped, and neither the id nor the member may state another
+    polarity, a glued `b1_pos1` included. The pairing carries the `sample_id`, and declares the row's file name only
+    where its stem is that row's alone, else the id: ST002823's dated rows share `Ctrl1- Fecal.wiff`, and the one
+    encoding rule keys such a pairing by the id, so two rows are never one sample.
+
+### Changed
+- **R1: a joined raw_file cell is split and read for the unit (`sample_raw_file_reading`, `unit_raw_file_names`).**
+  Workbench's RAW_FILE_NAME may list every polarity's, chromatography's and encoding's file in one cell (ST002260
+  `pRPLC_1; nRPLC_1`, ST003720 `NEG_D1.mzML POS_D1.mzML`, ST002826's four names).
+  - The cell is split on `;`, and on whitespace only where every word ends in a file suffix, so `Pos _QC1.wiff` and
+    `Ctrl1- Fecal.wiff` stay whole; `-` is a placeholder. Folders are kept for the reading.
+  - A name stating another polarity is dropped (a token of its own, a trailing marker, compounds such as `RPPOS` and
+    `pRPLC`; a pos/neg token beside a control, ctrl, blank or QC token only where the rows name files by polarity, as
+    PR #58 decided). A name stating another chromatography is dropped only where the cell's names state two.
+  - Two names that differ only by a glued polarity keep the unit's (ST003767's `C11-LHPOS.mzXML C11-LHneg.mzXML`,
+    ST004204's `CS_1.P.raw CS_1.N.raw`).
+  - What is left must be one sample's (one stem, in any encoding; the one encoding rule chooses among them).
+    Otherwise the cell is read whole, as before 0.5.67, which only the inferred rules with their own uniqueness and
+    polarity checks can pair: where its names are several samples (`joined_raw_file_names_several_samples`:
+    ST002044's `D_10.mzML D_10NEG.mzML D10_POS.mzML D10_NEG.mzML`, ST004173's `SAnc_1.raw SAnc_p1.raw`), or where a
+    kept name states no polarity beside names that state one (`joined_raw_file_name_states_no_polarity`:
+    `S1_pos.raw; S1.raw` in a negative unit). A kept name whose basename another name shares
+    (`HILIC/S1_pos.raw; RP/S1_pos.raw`) gives no name (`joined_raw_file_names_share_a_basename`).
+  - Every reader that matches files by a row's name reads it this way: the sample names, the pairing rules, the
+    encoding groups, the lineage, the CID/HCD check, the split parts' refusals and the analysis CSV. A member a joined
+    cell names only for another unit is never a unit-scoped archive's unattributed input
+    (`named_by_a_joined_raw_file_for_another_unit`). This lifts 0.5.60's "ST004751's rows name two files in one field".
+- **R3: another polarity's claimant is dropped before one to one and uniqueness.** In the prefixed, leading-identifier
+  and deposited-conversion rules, a member whose path states a polarity other than the unit's ion mode is refused on
+  record (`polarity_token_contradicts_ion_mode`) and no longer makes the name not one to one, so ST003616's
+  `Project2_Neg_P-Batch-1-Preterm-1.mzML` pairs in a negative unit beside its POS twin. Where such a drop leaves
+  claimants, they must be one file per encoding: `RP_neg/x_S1.raw` beside `HILIC_neg/x_S1.raw`, or `neg/x.mzML`
+  beside `neg_old/x.mzML`, are two runs and pair neither. In a unit of no stated polarity both are still candidates
+  and neither pairs. A member's polarity refusal is recorded once per name.
+- **A claimant in another chromatography's folder is dropped in every inferred rule
+  (`chromatography_folder_contradicts_unit`).** Folders (never names) that state HILIC, RP, RPLC, C18 or C8 against
+  the unit's chromatography (its handoff's `technical_settings` or its separation) exclude the member: ST002044's
+  HILIC unit no longer takes `rp/esipos/NHF_80.mzML`, nor ST002330's RP unit `metabolomics-mzxml-hilic/…`.
+- **A column glued to a polarity states the chromatography (`name_chromatographies`, `folder_chromatographies`).**
+  `C18neg`, `C18pos` and a token ending in one (`…xHILICneg`, `…xRPneg`) were read as nothing, so ST002796's
+  C18 and HILIC units, and ST003964's, each ran the other's files. `hilic`, `rplc` and `c18` are read after any
+  prefix; `rp` and `c8` only alone or after a digit or an `x` (`Sharpneg` states nothing).
+- **A trailing `+` or `-` is not a polarity to `name_polarities`.** Only the marker rule, a joined cell's reading,
+  and a unit-scoped archive whose listing marks twins (`listing_marks_polarity`: some stem with both; the other twin
+  is left out as `polarity_marker_contradicts_ion_mode`) read one. `Tcell_CD8+.raw` and ST004304's typo
+  `QC-D5-C-.mzML` are read as they were before.
+- **R2 is 0.5.60's `converted_member_stem`**, unchanged except that it counts rows, not names, per stem (a joined cell
+  naming `X.raw` and `X.mzML` is one row) and drops another polarity's mzML first (R3).
+
 ## [0.5.66] - Unreleased
 
 ### Changed
