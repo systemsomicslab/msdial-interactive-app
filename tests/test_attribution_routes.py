@@ -413,6 +413,11 @@ class TheMarkerRuleKeepsRunSuffixesAndChromatography(_Pairings):
         self.assertEqual({"S1_r1+.raw": ("S1_r1", MARKED_MEMBER_STEM_PAIRING)}, found["paired"])
         self.assertNotIn("run_suffix", found["items"]["S1_r1+.raw"])
 
+    def test_a_run_suffix_is_never_stripped_where_its_row_took_its_file_by_name(self) -> None:
+        """Row S1_r1 already has S1_r1.raw; S1_r1+.raw must not fall to row S1 as S1 plus a run suffix."""
+        found = self.pairings(["S1_r1.raw", "S1_r1+.raw"], [("a", "S1.raw"), ("b", "S1_r1.raw")], ion_mode="Positive")
+        self.assertEqual({}, found["paired"])
+
     def test_a_stripped_run_suffix_is_recorded(self) -> None:
         found = self.pairings(["P2_r5+.raw", "P25+.raw"], [("p2", "P2")], ion_mode="Positive")
         self.assertEqual({"P2_r5+.raw": ("P2", MARKED_MEMBER_STEM_PAIRING)}, found["paired"])

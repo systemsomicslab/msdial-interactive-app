@@ -238,5 +238,76 @@ class TheGatesDenominator(_Workspace):
         self.assertEqual((0, 2), (coverage["rows_of_another_unit"], coverage["declared_rows"]))
 
 
+class NoBlankOrQcRowExcusesAnotherUnitsRows(_Workspace):
+    """The independent check of 0.5.67: one blank or QC row beside rows of another polarity let a positive unit run on
+    their files. With no biological sample row of its own polarity, rows of another unit and inputs admitted, the unit
+    is refused, whatever blank, QC or standard rows it also lists."""
+
+    NEGATIVE_ROWS = [("S1", "S1_neg.raw"), ("S2", "S2_neg.raw"), ("S3", "S3_neg.raw")]
+    NEGATIVE_FILES = ["S1_neg.raw", "S2_neg.raw", "S3_neg.raw"]
+
+    def refused(self, members: list[str], rows: list[tuple[str, str]], scope: dict | None = None) -> dict:
+        project, payloads = _st001264(members, rows)
+        if scope:
+            project.download_scope = dict(scope)
+        with self.assertRaises(AttributionCoverageError) as raised:
+            self.lease(project, payloads)
+        self.assertIn(ATTRIBUTION_NO_ROWS_OF_THE_UNIT_POLARITY, str(raised.exception))
+        return raised.exception.coverage
+
+    def test_a_blank_row_beside_another_polaritys_rows_is_refused(self) -> None:
+        coverage = self.refused([*self.NEGATIVE_FILES, "Blank1.raw"], [*self.NEGATIVE_ROWS, ("Blank1", "Blank1.raw")])
+        self.assertEqual(("refused", ATTRIBUTION_NO_ROWS_OF_THE_UNIT_POLARITY, 3, 1, 0, 0),
+                         (coverage["status"], coverage["reason"], coverage["rows_of_another_unit"],
+                          coverage["blank_rows"], coverage["declared_rows"], coverage["sample_rows_declared"]))
+
+    def test_a_qc_row_beside_another_polaritys_rows_is_refused(self) -> None:
+        coverage = self.refused([*self.NEGATIVE_FILES, "QC1.raw"], [*self.NEGATIVE_ROWS, ("QC1", "QC1.raw")])
+        self.assertEqual(("refused", ATTRIBUTION_NO_ROWS_OF_THE_UNIT_POLARITY, 3, 0, 1, 0),
+                         (coverage["status"], coverage["reason"], coverage["rows_of_another_unit"],
+                          coverage["blank_rows"], coverage["declared_rows"], coverage["sample_rows_declared"]))
+
+    def test_a_unit_scoped_archive_with_a_blank_row_is_refused(self) -> None:
+        coverage = self.refused(["S1_neg.raw", "S2_neg.raw", "Blank1.raw", "Blank2.raw"],
+                                [("S1", "S1_neg.raw"), ("S2", "S2_neg.raw"), ("Blank1", "Blank1.raw")],
+                                scope=UNIT_SCOPED)
+        self.assertEqual(("refused", 2, 1, 0), (coverage["status"], coverage["rows_of_another_unit"],
+                                                coverage["blank_rows"], coverage["sample_rows_declared"]))
+
+    def test_own_polarity_sample_rows_beside_a_blank_and_another_polaritys_row_pass(self) -> None:
+        """The negative control: the unit's own samples are there, so the other polarity's row is merely not counted."""
+        project, payloads = _st001264(["S1_pos.raw", "S2_pos.raw", "S3_neg.raw", "Blank1.raw"],
+                                      [("S1", "S1_pos.raw"), ("S2", "S2_pos.raw"), ("S3", "S3_neg.raw"),
+                                       ("Blank1", "Blank1.raw")])
+        coverage = self.lease(project, payloads)["attribution_coverage"]
+        self.assertEqual(("passed", 1, 1, 2, 2, 2), (coverage["status"], coverage["rows_of_another_unit"],
+                                                     coverage["blank_rows"], coverage["declared_rows"],
+                                                     coverage["admitted_rows"], coverage["sample_rows_declared"]))
+
+    def test_with_no_input_admitted_the_unit_keeps_its_own_outcome(self) -> None:
+        project, payloads = _st001264(["S1.raw"], [("S1", "S1.raw")])
+        manifest = self.lease(project, payloads)
+        manifest["project"]["sample_metadata"] = [{"sample_id": "S1", "raw_file": "S1_neg.raw"},
+                                                  {"sample_id": "Blank1", "raw_file": "Blank1.raw"}]
+        self.assertEqual(ATTRIBUTION_NO_ROWS_OF_THE_UNIT_POLARITY, attribution_coverage(manifest)["reason"])
+        with patch("msdial_app.repository_analysis_rows.build_repository_analysis_rows",
+                   return_value={"rows": [], "failures": []}):
+            coverage = attribution_coverage(manifest)
+        self.assertEqual(("not_evaluated", "no_analytical_rows_of_the_unit_polarity"),
+                         (coverage["status"], coverage["reason"]))
+
+    def test_qc_and_blank_inputs_of_a_unit_scoped_archive_are_never_counted(self) -> None:
+        """Four sample rows, one admitted; a QC and a blank member taken unattributed must not lift it to the minimum."""
+        project, payloads = _st001264(["A1.raw", "QC_x1.raw", "QC_x2.raw", "Blank_x1.raw"],
+                                      [(f"A{index}", f"A{index}.raw") for index in range(1, 5)])
+        project.download_scope = dict(UNIT_SCOPED)
+        with self.assertRaises(AttributionCoverageError) as raised:
+            self.lease(project, payloads)
+        coverage = raised.exception.coverage
+        self.assertEqual((ATTRIBUTION_COVERAGE_BELOW_MINIMUM, 3, 0, 0.25),
+                         (coverage["reason"], coverage["unattributed_inputs"], coverage["unattributed_inputs_counted"],
+                          coverage["ratio"]))
+
+
 if __name__ == "__main__":
     unittest.main()

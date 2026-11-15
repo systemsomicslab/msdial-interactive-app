@@ -34,7 +34,8 @@ paths that passed short admissions; both are closed here.
       (`attribution_admitted_only_blanks_qc_or_standards`);
     - fewer than the minimum of its biological sample rows were, however many QC rows were
       (`attribution_sample_coverage_below_minimum`);
-    - every row states another polarity while inputs were admitted, a Catalog mis-assignment
+    - none of its rows is a biological sample's of its own polarity, some are another unit's, and inputs were
+      admitted, whatever blank, QC or standard rows it also lists: a Catalog mis-assignment
       (`attribution_no_rows_of_the_unit_polarity`);
     - the rows could not be built to be counted (`attribution_coverage_not_computed`).
     `ATTRIBUTION_COVERAGE_REFUSALS` lists the codes.
@@ -52,7 +53,8 @@ paths that passed short admissions; both are closed here.
   - Where rows alone are below the minimum and unattributed inputs make up the gap, the unit passes with the warning
     `attribution_rows_below_minimum_unattributed_inputs_counted`, in the manifest's warnings too. Whether that should
     refuse is open for the author (it would refuse the 2026-10-07 ST001264 case).
-  - A unit with no sample rows, or whose own rows are blanks only, is recorded `not_evaluated` and not judged.
+  - A unit with no sample rows, or whose own rows are blanks only and either no row is another unit's or nothing was
+    admitted, is recorded `not_evaluated` and not judged.
 - **Two pairing rules, inferences on record like the others (`input_name_pairings`, the lineage row's
   `name_pairing`, the attribute stage's counts), in a unit of one stated polarity only.**
   - R4 `polarity_marked_member_stem`: a trailing `+` or `-` on a member's stem (`polarity_marker`). ST003328's

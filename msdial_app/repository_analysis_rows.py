@@ -827,7 +827,8 @@ def build_repository_analysis_rows(
 #   (ATTRIBUTION_ADMITTED_NO_SAMPLE);
 # - fewer than the minimum of its biological sample rows were admitted, however many QC rows were
 #   (ATTRIBUTION_SAMPLE_COVERAGE_BELOW_MINIMUM: 20 QCs and 1 of 20 samples is no unit);
-# - it admitted inputs while every one of its rows states another polarity, a Catalog mis-assignment
+# - it admitted inputs while none of its rows is a biological sample's of its own polarity and some are another unit's,
+#   whatever blank, QC or standard rows it also lists: a Catalog mis-assignment
 #   (ATTRIBUTION_NO_ROWS_OF_THE_UNIT_POLARITY: ST004800's positive units carrying the negative archive);
 # - its rows could not be built to be counted (ATTRIBUTION_COVERAGE_NOT_COMPUTED): never a pass for want of a verdict.
 # The rows counted are the unit's own polarity's: a row whose names state only another polarity by a token of their own,
@@ -1105,19 +1106,23 @@ def attribution_coverage(
     if not samples:
         record["reason"] = "no_sample_rows"
         return record
+    if another_unit and not samples_declared and built["rows"]:
+        # No biological sample row of the unit's own, rows of another unit, and inputs admitted: a Catalog
+        # mis-assignment, whatever blank, QC or standard rows the unit also lists (independent check of 0.5.67: one
+        # Blank1.raw or QC1.raw row let a positive unit run on its S1_neg.raw rows' files).
+        record.update(
+            status="refused",
+            reason=ATTRIBUTION_NO_ROWS_OF_THE_UNIT_POLARITY,
+            message=(
+                f"None of the {len(samples)} sample rows of analysis unit {typed.analysis_unit_id} is a biological "
+                f"sample's of its own polarity ({polarity or 'unstated'}): {len(another_unit)} are another unit's, "
+                f"{len(blanks)} blanks and {len(declared)} QCs or standards, yet attribution admitted "
+                f"{len(built['rows'])} inputs ({ATTRIBUTION_NO_ROWS_OF_THE_UNIT_POLARITY}). Refusing to run the unit on "
+                "files its rows do not declare; attribution_coverage lists each row and why."
+            ),
+        )
+        return record
     if not declared:
-        if another_unit and not blanks and built["rows"]:
-            record.update(
-                status="refused",
-                reason=ATTRIBUTION_NO_ROWS_OF_THE_UNIT_POLARITY,
-                message=(
-                    f"Every one of the {len(samples)} sample rows of analysis unit {typed.analysis_unit_id} states "
-                    f"another polarity than its own ({polarity}), yet attribution admitted {len(built['rows'])} "
-                    f"inputs ({ATTRIBUTION_NO_ROWS_OF_THE_UNIT_POLARITY}). Refusing to run the unit on files its rows "
-                    "do not declare; attribution_coverage lists each row and why."
-                ),
-            )
-            return record
         record["reason"] = "no_analytical_rows_of_the_unit_polarity"
         return record
     if ratio is not None and ratio < minimum:
