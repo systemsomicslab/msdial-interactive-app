@@ -16,14 +16,16 @@ What it refuses, without reading a body it did not ask for: a server that answer
 whole file (200), a sign-in or landing page served in its place, any other status, a byte count beyond the
 cap, a split (multi-disk) archive, a directory whose entries do not parse to the count the EOCD declares, a
 listing that runs past its overall deadline (a watchdog shuts the connection, so a server trickling headers or
-body bytes cannot hold it), and any scheme other than http and https. Nothing is written anywhere; the listing
-is returned.
+body bytes cannot hold it), and any scheme other than http and https, given directly or reached through a
+redirect. A redirect's own body is never read: it is closed unread and the hop is recorded. Nothing is written
+anywhere; the listing is returned.
 """
 
 from __future__ import annotations
 
 import hashlib
 import http.client
+import math
 import re
 import socket
 import struct
@@ -181,7 +183,46 @@ def _watched_connection(connection_class: Any, reader: "_RangeReader") -> Any:
     return factory
 
 
+_SCHEMES = ("http", "https")
+
+
+class _RedirectRefused(Exception):
+    """A redirect to a scheme other than http or https, raised out of the opener so no handler follows it."""
+
+    def __init__(self, code: int, target: str) -> None:
+        super().__init__(target)
+        self.code = code
+        self.target = target
+
+
+class _RedirectHandler(urllib.request.HTTPRedirectHandler):
+    """urllib's redirect handling, except that a redirect's body is closed unread and only http(s) is followed.
+
+    urllib's own handler reads the whole body of a 3xx answer before it follows Location, and those bytes would
+    pass outside the cap and the provenance. Here the body is closed before urllib reaches it (a closed response
+    reads as empty), and each hop is recorded with its status, target and declared Content-Length.
+    """
+
+    def __init__(self, reader: "_RangeReader") -> None:
+        super().__init__()
+        self._reader = reader
+
+    def http_error_302(self, req, fp, code, msg, headers):  # urllib's signature
+        location = headers.get("location") or headers.get("uri") or ""
+        target = urllib.parse.urljoin(req.full_url, location.strip()) if location else ""
+        self._reader._record_redirect(code, target, headers.get("Content-Length", "") or "")
+        fp.close()
+        if target and urllib.parse.urlsplit(target).scheme.lower() not in _SCHEMES:
+            raise _RedirectRefused(code, target)
+        return super().http_error_302(req, fp, code, msg, headers)
+
+    http_error_301 = http_error_303 = http_error_307 = http_error_308 = http_error_302
+
+
 def _opener(reader: "_RangeReader") -> urllib.request.OpenerDirector:
+    """An opener for http and https only. There is no ftp, file or data handler, so nothing else is opened, even
+    through a redirect, and every socket it makes is one the watchdog sees."""
+
     class _HTTPHandler(urllib.request.HTTPHandler):
         def http_open(self, req):  # urllib's signature
             return self.do_open(_watched_connection(http.client.HTTPConnection, reader), req)
@@ -197,7 +238,17 @@ def _opener(reader: "_RangeReader") -> urllib.request.OpenerDirector:
                 return self.do_open(_watched_connection(http.client.HTTPSConnection, reader), req, **options)
 
         handlers.append(_HTTPSHandler())
-    return urllib.request.build_opener(*handlers)
+    opener = urllib.request.OpenerDirector()
+    for handler in (
+        urllib.request.ProxyHandler(),
+        urllib.request.UnknownHandler(),
+        *handlers,
+        urllib.request.HTTPDefaultErrorHandler(),
+        _RedirectHandler(reader),
+        urllib.request.HTTPErrorProcessor(),
+    ):
+        opener.add_handler(handler)
+    return opener
 
 
 class _RangeReader:
@@ -227,6 +278,7 @@ class _RangeReader:
         self.final_url = url
         self.accept_ranges = ""
         self._watchdog: _Watchdog | None = None
+        self._record: dict[str, Any] | None = None
         self._open = _opener(self).open
 
     def provenance(self) -> dict[str, Any]:
@@ -246,6 +298,13 @@ class _RangeReader:
 
     def _refuse(self, reason: str, detail: str) -> RemoteArchiveError:
         return RemoteArchiveError(reason, detail, provenance=self.provenance())
+
+    def _record_redirect(self, status: int, target: str, content_length: str) -> None:
+        # The redirect's body is closed unread, so it adds nothing to the bytes fetched; its declared length is kept.
+        if self._record is not None:
+            self._record.setdefault("redirects", []).append(
+                {"status": status, "location": target, "content_length": content_length, "bytes": 0}
+            )
 
     def _watch(self, sock: Any) -> None:
         if self._watchdog is not None:
@@ -286,11 +345,11 @@ class _RangeReader:
         record: dict[str, Any] = {"range": range_value, "status": None, "bytes": 0}
         self.requests.append(record)
         with _Watchdog(remaining) as watchdog:
-            self._watchdog = watchdog
+            self._watchdog, self._record = watchdog, record
             try:
                 return self._exchange(request, headers, range_value, expected, record, watchdog)
             finally:
-                self._watchdog = None
+                self._watchdog = self._record = None
 
     def _exchange(
         self,
@@ -303,6 +362,12 @@ class _RangeReader:
     ) -> tuple[int, int, bytes]:
         try:
             response = self._open(request, timeout=min(self.timeout, max(0.001, self.deadline - time.monotonic())))
+        except _RedirectRefused as refused:
+            raise self._refuse(
+                "unsupported_redirect",
+                f"The server answered {range_value} with {refused.code}, a redirect to {refused.target!r}. Only http "
+                "and https are followed; nothing was requested from it and the redirect's body was not read.",
+            )
         except urllib.error.HTTPError as error:
             record["status"] = error.code
             error.close()
@@ -370,11 +435,18 @@ class _RangeReader:
                 self.etag = etag
                 self.last_modified = last_modified
                 self.accept_ranges = response.headers.get("Accept-Ranges", "") or ""
-            elif total != self.total or (self.etag and etag and etag != self.etag):
+            elif (
+                total != self.total
+                or (self.etag and etag and etag != self.etag)
+                # Without an ETag, Last-Modified is the only validator: a server that ignores If-Range could
+                # otherwise swap in a same-size archive unseen.
+                or (not self.etag and self.last_modified and last_modified and last_modified != self.last_modified)
+            ):
                 raise self._refuse(
                     "changed_during_listing",
                     f"The archive changed between requests (size {self.total:,} then {total:,}; ETag {self.etag!r} "
-                    f"then {etag!r}). Nothing was listed.",
+                    f"then {etag!r}; Last-Modified {self.last_modified!r} then {last_modified!r}). Nothing was "
+                    "listed.",
                 )
             length = last - first + 1
             if length <= 0 or (expected is not None and length > expected):
@@ -632,10 +704,17 @@ def list_remote_zip(
     # A declared size is checked here, before any request, so a bad one is refused rather than raised late.
     declared_size: int | None = None
     if expected_size_bytes not in (None, ""):
-        try:
-            declared_size = int(str(expected_size_bytes).strip())
-        except (TypeError, ValueError):
+        if isinstance(expected_size_bytes, bool):
             declared_size = -1
+        elif isinstance(expected_size_bytes, float):
+            # A size read from a table or JSON often arrives as a float; a finite whole number is a byte count.
+            finite_whole = math.isfinite(expected_size_bytes) and expected_size_bytes.is_integer()
+            declared_size = int(expected_size_bytes) if finite_whole else -1
+        else:
+            try:
+                declared_size = int(str(expected_size_bytes).strip())
+            except (TypeError, ValueError):
+                declared_size = -1
         if declared_size < 0:
             raise RemoteArchiveError(
                 "invalid_argument",

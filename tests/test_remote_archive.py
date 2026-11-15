@@ -12,11 +12,13 @@ import asyncio
 import io
 import json
 import re
+import socket
 import struct
 import tempfile
 import threading
 import time
 import unittest
+import urllib.parse
 import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -50,17 +52,45 @@ class _Archive:
         self.trickle_headers = trickle_headers
         # Served instead of body from the second request on: the archive replaced while it was being listed.
         self.replacement: tuple[bytes, str] | None = None
+        # The Last-Modified sent with the replacement (the first one's when empty).
+        self.replacement_last_modified = ""
         self.served = 0
 
 
 class _Handler(BaseHTTPRequestHandler):
     archives: dict[str, _Archive] = {}
     log: list[dict] = []
+    # Body bytes sent with each redirect answer, by path.
+    redirect_sent: dict[str, int] = {}
 
     def log_message(self, *args) -> None:  # quiet
         pass
 
     def do_GET(self) -> None:
+        if self.path.startswith("/redirect-to/"):
+            # /redirect-to/<url-encoded target>: a redirect to any URL, a non-http scheme included.
+            self.send_response(302)
+            self.send_header("Location", urllib.parse.unquote(self.path[len("/redirect-to/"):]))
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        if self.path.startswith("/big-redirect/"):
+            # A redirect that carries a 32 MiB body; what the client takes of it is counted.
+            size = 32 * 1024 * 1024
+            self.send_response(302)
+            self.send_header("Location", "/" + self.path[len("/big-redirect/"):])
+            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("Content-Length", str(size))
+            self.end_headers()
+            self.redirect_sent[self.path] = 0
+            chunk = b"r" * 65536
+            try:
+                for _ in range(size // len(chunk)):
+                    self.wfile.write(chunk)
+                    self.redirect_sent[self.path] += len(chunk)
+            except (ConnectionError, OSError):
+                pass
+            return
         if self.path.startswith("/redirect/"):
             self.send_response(302)
             self.send_header("Location", "/" + self.path[len("/redirect/"):])
@@ -77,9 +107,10 @@ class _Handler(BaseHTTPRequestHandler):
             return
         if archive.delay:
             time.sleep(archive.delay)
-        body, etag = archive.body, archive.etag
+        body, etag, last_modified = archive.body, archive.etag, archive.last_modified
         if archive.replacement is not None and archive.served >= 1:
             body, etag = archive.replacement
+            last_modified = archive.replacement_last_modified or last_modified
         archive.served += 1
         total = len(body)
         requested = self.headers.get("Range")
@@ -107,8 +138,8 @@ class _Handler(BaseHTTPRequestHandler):
         try:
             if etag:
                 self.send_header("ETag", etag)
-            if archive.last_modified:
-                self.send_header("Last-Modified", archive.last_modified)
+            if last_modified:
+                self.send_header("Last-Modified", last_modified)
             if archive.ranges:
                 self.send_header("Accept-Ranges", "bytes")
             self.send_header("Content-Type", archive.content_type)
@@ -134,6 +165,7 @@ class _Server:
     def __enter__(self) -> "_Server":
         _Handler.archives = {}
         _Handler.log = []
+        _Handler.redirect_sent = {}
         self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
         self.httpd.daemon_threads = True
         self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
@@ -151,6 +183,51 @@ class _Server:
     @property
     def log(self) -> list[dict]:
         return _Handler.log
+
+
+class _TricklingListener:
+    """A TCP listener that sends a banner one byte at a time: a slow FTP server reached through a redirect."""
+
+    def __init__(self, interval: float = 0.2, seconds: float = 6.0) -> None:
+        self.interval, self.seconds = interval, seconds
+        self.connections = 0
+
+    def __enter__(self) -> "_TricklingListener":
+        self.sock = socket.socket()
+        self.sock.bind(("127.0.0.1", 0))
+        self.sock.listen(4)
+        self.sock.settimeout(0.2)
+        self.port = self.sock.getsockname()[1]
+        self.stop = threading.Event()
+        self.thread = threading.Thread(target=self._serve, daemon=True)
+        self.thread.start()
+        return self
+
+    def _serve(self) -> None:
+        while not self.stop.is_set():
+            try:
+                connection, _ = self.sock.accept()
+            except OSError:
+                continue
+            self.connections += 1
+            threading.Thread(target=self._trickle, args=(connection,), daemon=True).start()
+
+    def _trickle(self, connection: socket.socket) -> None:
+        ends = time.monotonic() + self.seconds
+        try:
+            for byte in (b"220 slow ftp server ready" * 10):
+                if self.stop.is_set() or time.monotonic() > ends:
+                    break
+                connection.sendall(bytes([byte]))
+                time.sleep(self.interval)
+        except OSError:
+            pass
+        finally:
+            connection.close()
+
+    def __exit__(self, *exc) -> None:
+        self.stop.set()
+        self.sock.close()
 
 
 def _zip(members: list[tuple[str, bytes]], *, comment: bytes = b"", method=zipfile.ZIP_DEFLATED) -> bytes:
@@ -440,6 +517,62 @@ class RemoteZipRefusalTest(unittest.TestCase):
         self.assertEqual([206, 206], [entry["status"] for entry in log])
         self.assertIn('"v2"', error.detail)
 
+    def test_a_same_size_replacement_with_a_new_last_modified_is_caught_without_an_etag(self) -> None:
+        # Zenodo sends no ETag, so Last-Modified is the validator; a server that ignores If-Range must not get a
+        # listing stitched from two versions past it.
+        import random
+        members = [(f"study/folder/d_{index:04d}.bin", random.Random(index).randbytes(2_000)) for index in range(300)]
+        body = _zip(members, method=zipfile.ZIP_STORED)
+        renamed = [(name.replace("d_", "e_"), data) for name, data in members]
+        replaced = _zip(renamed, method=zipfile.ZIP_STORED)
+        self.assertEqual(len(body), len(replaced))
+        with _Server() as server:
+            archive = _Archive(body, etag="", last_modified="Mon, 01 Jan 2024 00:00:00 GMT", honour_if_range=False)
+            archive.replacement = (replaced, "")
+            archive.replacement_last_modified = "Tue, 02 Jan 2024 00:00:00 GMT"
+            error = self._refused(server.add("no-etag.zip", archive))
+            log = list(server.log)
+        self.assertEqual("changed_during_listing", error.reason)
+        self.assertEqual([206, 206], [entry["status"] for entry in log])
+        self.assertEqual("Mon, 01 Jan 2024 00:00:00 GMT", log[1]["if_range"])
+        self.assertIn("Tue, 02 Jan 2024", error.detail)
+
+    def test_a_redirect_to_a_scheme_other_than_http_is_refused_without_opening_it(self) -> None:
+        with _TricklingListener() as listener, _Server() as server:
+            base = f"http://127.0.0.1:{server.httpd.server_address[1]}"
+            ftp_target = f"ftp://127.0.0.1:{listener.port}/a.zip"
+            started = time.monotonic()
+            ftp = self._refused(base + "/redirect-to/" + urllib.parse.quote(ftp_target, safe=""),
+                                timeout_seconds=1, deadline_seconds=2)
+            elapsed = time.monotonic() - started
+            local = self._refused(base + "/redirect-to/" + urllib.parse.quote("file:///C:/data/a.zip", safe=""))
+            connections = listener.connections
+        self.assertEqual("unsupported_redirect", ftp.reason)
+        self.assertIn(ftp_target, ftp.detail)
+        self.assertEqual(0, connections)
+        self.assertLess(elapsed, 1.5)
+        self.assertEqual([{"status": 302, "location": ftp_target, "content_length": "0", "bytes": 0}],
+                         ftp.provenance["requests"][0]["redirects"])
+        self.assertEqual("unsupported_redirect", local.reason)
+
+    def test_a_redirect_body_is_not_read_and_the_hop_is_recorded(self) -> None:
+        body = _zip(_unit_members())
+        with _Server() as server:
+            server.add("a.zip", _Archive(body))
+            base = f"http://127.0.0.1:{server.httpd.server_address[1]}"
+            listing = list_remote_zip(base + "/big-redirect/a.zip", max_bytes=16 * 1024)
+            time.sleep(0.5)
+            sent = dict(_Handler.redirect_sent)
+        self.assertEqual(len(_expected(body)), listing["entry_count"])
+        # The client closed the 32 MiB body unread; only what socket buffers took before the close was sent.
+        self.assertLess(sent["/big-redirect/a.zip"], 4 * 1024 * 1024)
+        provenance = listing["provenance"]
+        self.assertLessEqual(provenance["bytes_fetched"], 16 * 1024)
+        self.assertEqual(
+            [{"status": 302, "location": base + "/a.zip", "content_length": str(32 * 1024 * 1024), "bytes": 0}],
+            provenance["requests"][0]["redirects"],
+        )
+
     def test_without_a_validator_a_changed_size_is_still_caught(self) -> None:
         import random
         members = [(f"study/folder/d_{index:04d}.bin", random.Random(index).randbytes(2_000)) for index in range(300)]
@@ -559,8 +692,18 @@ class RemoteZipRefusalTest(unittest.TestCase):
                 self.assertEqual("invalid_argument", self._refused(url, expected_size_bytes=declared).reason)
             log = list(server.log)
             listing = list_remote_zip(url, expected_size_bytes=" %d " % len(body))
+            # A whole-number float (a size read from a table or JSON) is a byte count; NaN, infinity, a fraction
+            # and a bool are refused before any request.
+            for declared in (float("nan"), float("inf"), len(body) + 0.5, True):
+                self.assertEqual("invalid_argument", self._refused(url, expected_size_bytes=declared).reason)
+            requests_before_float = len(server.log)
+            from_float = list_remote_zip(url, expected_size_bytes=float(len(body)))
+            off_by_one = list_remote_zip(url, expected_size_bytes=float(len(body) + 1))
         self.assertEqual([], log)
         self.assertEqual([], listing["warnings"])
+        self.assertEqual(1, requests_before_float)
+        self.assertEqual([], from_float["warnings"])
+        self.assertTrue(off_by_one["warnings"])
         self.assertEqual(512 * 1024, DEFAULT_MAX_BYTES)
 
 

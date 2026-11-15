@@ -561,7 +561,11 @@ status, bytes), the bytes fetched, the archive's size, ETag and Last-Modified,
 and the SHA-256 of the directory bytes. A server that answers a Range request
 with the whole file is refused (`range_not_supported`) without reading the
 body, as is a listing that would pass `max_bytes` (default 512 KiB, at most
-16 MiB) and an archive that changes between requests. A sign-in, landing or
+16 MiB) and an archive that changes between requests (a different size,
+ETag, or, when the server sends no ETag, Last-Modified). Only http and https
+are followed: a redirect to any other scheme is refused as
+`unsupported_redirect`, and a redirect's own body is closed unread, with each
+hop recorded in the request's provenance. A sign-in, landing or
 error page served in the archive's place is refused as
 `not_an_archive_response`, because the problem there is access, not range
 support, and a full download is no way round it. The whole listing has a

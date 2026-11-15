@@ -2620,8 +2620,11 @@ def msdial_list_remote_archive(
     fetch more than ``max_bytes`` (``byte_cap_exceeded``; default 512 KiB, at most 16 MiB), an archive that
     changed between requests (``changed_during_listing``), a file that is not a zip (``not_a_zip``), a split
     zip (``multi_disk``), a malformed directory, a timeout (``timeout_seconds`` per socket operation, and 120 s
-    for the whole listing, enforced while headers and bodies arrive), and any URL that is not http or https. ``expected_size_bytes`` (a size
-    the repository or the Catalog declared) adds a warning when the served archive differs. ``member_limit``
+    for the whole listing, enforced while headers and bodies arrive), any URL that is not http or https
+    (``unsupported_url``), and a redirect to any other scheme (``unsupported_redirect``, not followed). A
+    redirect's body is never read; each hop is recorded with its status, target and declared length.
+    ``expected_size_bytes`` (a size the repository or the Catalog declared, an integer or a whole-number float)
+    adds a warning when the served archive differs. ``member_limit``
     bounds the members in this reply; the counts, groups and ``output_path`` cover all of them.
     """
     from .remote_archive import RemoteArchiveError, identical_content_groups, list_remote_zip

@@ -20,11 +20,14 @@ pull request.)
     record (ZIP64 locator and end record included), more of the tail when an archive comment hides the end
     record, and the central directory, and returns each member's path, size, compressed size, CRC32,
     compression, timestamp and local header offset. Every request after the first carries If-Range with the
-    first answer's ETag or Last-Modified, and every answer must give the same total size. Bytes before the
+    first answer's ETag or Last-Modified, and every answer must give the same total size, the same ETag, and,
+    when the server sends no ETag (Zenodo sends none), the same Last-Modified. Bytes before the
     archive proper are allowed for; a split archive is refused. The provenance records the URL and the URL
-    answered after redirects, each request (range, status, bytes), the bytes fetched, the archive's size,
+    answered after redirects, each request (range, status, bytes, and each redirect hop with its status,
+    target and declared length; a redirect's body is closed unread), the bytes fetched, the archive's size,
     ETag and Last-Modified, and the SHA-256 of the central directory bytes. `expected_size_bytes` warns when
-    the served archive differs from a declared size: the Catalog declares 8,482,560,409 bytes for
+    the served archive differs from a declared size (an integer, a numeric string or a whole-number float;
+    NaN, infinity, a fraction and a bool are refused): the Catalog declares 8,482,560,409 bytes for
     ST002798_rawdata.zip, and the server sends 8,486,399,643 with the declared MD5.
   - Refused, with a reason and without reading a body it did not ask for: a 200 answer to a Range request
     (`range_not_supported`), a sign-in, landing or error page served in the archive's place, recognised by
@@ -33,8 +36,10 @@ pull request.)
     (`byte_cap_exceeded`; 512 KiB by default, at most 16 MiB, checked before each request), an archive that
     changes between requests (`changed_during_listing`), a file with no end record (`not_a_zip`), a split
     archive (`multi_disk`), a malformed directory, an HTTP error, a timeout, a non-numeric
-    `expected_size_bytes` or timeout (`invalid_argument`, before any request), and any scheme other than
-    http and https.
+    `expected_size_bytes` or timeout (`invalid_argument`, before any request), any scheme other than http
+    and https (`unsupported_url`), and a redirect to any other scheme (`unsupported_redirect`: the opener has
+    no ftp, file or data handler, so such a redirect is never followed and no socket outside the deadline's
+    watch is opened).
   - The timeout holds per socket operation (`timeout_seconds`) and for the whole listing
     (`deadline_seconds`, 120 s): a watchdog shuts the connection when the deadline passes, so a server that
     trickles header lines or body bytes inside every per-operation timeout cannot hold the listing. Bodies
