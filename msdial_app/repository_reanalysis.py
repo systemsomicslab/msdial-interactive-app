@@ -2505,6 +2505,16 @@ def create_download_lease(
                 if paired_by_rule[CONVERTED_MEMBER_STEM_PAIRING]
                 else {}
             ),
+            **(
+                {"polarity_marked_member_stem_pairings": paired_by_rule[MARKED_MEMBER_STEM_PAIRING]}
+                if paired_by_rule[MARKED_MEMBER_STEM_PAIRING]
+                else {}
+            ),
+            **(
+                {"sample_id_member_stem_pairings": paired_by_rule[SAMPLE_ID_MEMBER_STEM_PAIRING]}
+                if paired_by_rule[SAMPLE_ID_MEMBER_STEM_PAIRING]
+                else {}
+            ),
             **({"inferred_name_pairings": inferred} if inferred else {}),
             **({"unattributed_members": len(unattributed_inputs)} if unattributed_inputs else {}),
             # The samples the rule chose for among several encodings, and the files it left unused (encoding_rule).
@@ -3810,9 +3820,11 @@ def build_input_lineage(
                 declared.setdefault(alias, item.name)
     sample_names: dict[str, set[str]] = {}
     for sample in project.sample_metadata or []:
-        raw = PurePosixPath(str((sample or {}).get("raw_file") or "").replace("\\", "/")).name.casefold()
         sample_id = str((sample or {}).get("sample_id") or "").strip()
-        if raw and sample_id:
+        # Each name the row gives for this unit (unit_raw_file_names: a joined cell's own, R1).
+        for raw in (name.casefold() for name in unit_raw_file_names(sample, project)):
+            if not raw or not sample_id:
+                continue
             sample_names.setdefault(raw, set()).add(sample_id)
             alias = archives.container_alias(raw).casefold()
             if alias:
@@ -3852,7 +3864,11 @@ def build_input_lineage(
             matched = {archive_samples[key]}
         if not matched and key in prefixed_members:
             pairing = prefixed_members[key]
-            return candidates, sample_names.get(pairing["declared_raw_file"].casefold()) or set(), pairing
+            # A pairing by the row's sample id (SAMPLE_ID_MEMBER_STEM_PAIRING, R6) names its sample itself.
+            return candidates, (
+                {pairing["sample_id"]} if pairing.get("sample_id")
+                else sample_names.get(pairing["declared_raw_file"].casefold()) or set()
+            ), pairing
         if not matched and key in unattributed_members:
             return candidates, set(), unattributed_members[key]
         return candidates, matched, None
@@ -4168,10 +4184,10 @@ def _stated_inputs(
         methods = stated_methods(row.get("values") or row.get("attributes") or {})
         if sample and methods:
             stated[sample] = list(dict.fromkeys([*stated.get(sample, []), *methods]))
-        raw = PurePosixPath(str(row.get("raw_file") or "").replace("\\", "/").rstrip("/")).name.casefold()
-        if sample and raw:
-            by_name.setdefault(raw, sample)
-            by_name.setdefault(PurePosixPath(raw).stem, sample)
+        for raw in (name.casefold() for name in unit_raw_file_names(row, project)):
+            if sample and raw:
+                by_name.setdefault(raw, sample)
+                by_name.setdefault(PurePosixPath(raw).stem, sample)
     if not stated:
         return {}
     paired = _input_samples(
@@ -4476,8 +4492,9 @@ def _encoding_groups(
     # The rows by the stem of the file they name (encoding_preference.stem): a file of that stem in any encoding is
     # that row's sample's (clause 4), as the analysis CSV pairs it.
     row_stems: dict[str, set[str]] = {}
-    for sample in project.sample_metadata or []:
-        raw = PurePosixPath(str((sample or {}).get("raw_file") or "").strip().replace("\\", "/")).name.casefold()
+    for raw in (
+        name.casefold() for sample in project.sample_metadata or [] for name in unit_raw_file_names(sample, project)
+    ):
         if not raw:
             continue
         named.setdefault(raw, set()).add(raw)
@@ -8102,9 +8119,9 @@ def _part_name_pairings(
         for source in (item, stands_for.get(_file_key(item), ""))
         if source
     }
+    # Every name a row's cell gives (a joined cell's each, R1), as a refusal names its declared raw file.
     row_names = {
-        PurePosixPath(str((sample or {}).get("raw_file") or "").strip().replace("\\", "/")).name.casefold()
-        for sample in samples
+        name.casefold() for sample in samples for name in split_joined_raw_file((sample or {}).get("raw_file"))[0]
     } - {""}
 
     def entries(name: str) -> list[dict[str, Any]]:
@@ -11807,11 +11824,10 @@ def _sample_file_names(project: RepositoryProject) -> tuple[set[str], set[str]]:
     """
     exact: set[str] = set()
     stems: set[str] = set()
-    for sample in project.sample_metadata or []:
-        raw = str((sample or {}).get("raw_file") or "").strip()
-        if not raw:
-            continue
-        base = PurePosixPath(raw.replace("\\", "/")).name.casefold()
+    # A joined cell names each of its files for this unit (unit_raw_file_names, R1); any other cell its one name.
+    for base in (
+        name.casefold() for sample in project.sample_metadata or [] for name in unit_raw_file_names(sample, project)
+    ):
         if not base:
             continue
         exact.add(base)
@@ -11866,6 +11882,16 @@ LEADING_IDENTIFIER_TOKEN_PAIRING = "leading_identifier_token"
 # (_member_name_pairings). The pairing records the conversion as the mzML's own header states it (its source files and
 # the software that wrote it: deposited_conversion), and is an inference on record like the other two.
 CONVERTED_MEMBER_STEM_PAIRING = "converted_member_stem"
+# A MEMBER WHOSE STEM CARRIES A TRAILING POLARITY MARKER (R4 of the stage3b triage of 2026-11-15): ST003328 declares
+# DS1-93-001 and deposits positive/DS1-93-001+.raw and negative/DS1-93-001-.raw. See polarity_marker and
+# _member_name_pairings.
+MARKED_MEMBER_STEM_PAIRING = "polarity_marked_member_stem"
+# A ROW'S SAMPLE ID THAT IS A MEMBER'S STEM (R6 of the same triage): ST002823's row 12-5-2020Ctrl1- Fecal names
+# Ctrl1- Fecal.wiff, and the archive holds .../12-5-2020Ctrl1- Fecal.wiff; ST004757's rows name only ".RAW".
+SAMPLE_ID_MEMBER_STEM_PAIRING = "sample_id_member_stem"
+# A pos/neg token with the run's number glued to it (b1_pos1, b1_neg1): a polarity where R6 reads a sample id, and only
+# there, since elsewhere a name's polarity is a token of its own (POLARITY_NAME_TOKENS).
+SAMPLE_ID_POLARITY_TOKEN = re.compile(r"^(pos|neg|positive|negative)\d+$")
 # The unit-level warning code every inferred pairing (prefixed or by token) raises: in the attribute stage,
 # the run manifest's warnings and the campaign disposition's warnings (raw_metadata_preflight's, imported).
 # A name's tokens: what lies between these separators, compared without case.
@@ -11902,6 +11928,11 @@ def _polarity_token_reading(text: str) -> tuple[set[str], set[str]]:
     parts = [part for part in str(text or "").replace("\\", "/").split("/") if part.strip()]
     for position, part in enumerate(parts):
         is_name = position == len(parts) - 1
+        if is_name:
+            # A trailing + or - on the name's stem (R4: ST003328's DS1-93-001+.raw and DS1-93-001-.raw).
+            marked = polarity_marker(part)
+            if marked:
+                plain.add(marked[1])
         tokens = _name_tokens(part)
         for index, token in enumerate(tokens):
             if token not in POLARITY_NAME_TOKENS:
@@ -11910,6 +11941,49 @@ def _polarity_token_reading(text: str) -> tuple[set[str], set[str]]:
             exempting = is_name and any(neighbour in POLARITY_EXEMPTING_TOKENS for neighbour in beside)
             (beside_exempting if exempting else plain).add(POLARITY_NAME_TOKENS[token])
     return plain, beside_exempting
+
+
+# A TRAILING POLARITY MARKER (R4 of the stage3b triage of 2026-11-15). Metabolomics Workbench ST003328 declares
+# DS1-93-001 and deposits DS1-93 raw files/positive/DS1-93-001+.raw and .../negative/DS1-93-001-.raw; ST003792 deposits
+# AG-88-1_r1-.raw and AG-88-1_r5+.raw, a run-order suffix before the marker. The marker is the last character of the
+# name's stem (its name less a raw or converted suffix, _PAIRING_NAME_SUFFIXES), right after a letter or a digit, and a
+# run-order suffix _r<n> before it is part of the marker too. polarity_marker reads it; name_polarities reads it as the
+# name's polarity; and the pairing rule MARKED_MEMBER_STEM_PAIRING strips it before comparing stems.
+_POLARITY_MARKER = re.compile(r"^(?P<base>.*?[0-9a-z])(?P<run>_r\d+)?(?P<marker>[+-])$")
+_POLARITY_MARKERS = {"+": "Positive", "-": "Negative"}
+
+
+def _name_stem(name: str) -> str:
+    """A name's stem as the pairing rules read one: its basename, casefolded, less a raw or converted suffix."""
+    text = PurePosixPath(str(name or "").replace("\\", "/")).name.casefold()
+    for suffix in _PAIRING_NAME_SUFFIXES:
+        if text.endswith(suffix) and len(text) > len(suffix):
+            return text[: -len(suffix)]
+    return text
+
+
+def polarity_marker(name: str) -> tuple[str, str] | None:
+    """(the stem less its trailing polarity marker and run-order suffix, the polarity the marker states), or None.
+
+    DS1-93-001+.raw gives ('ds1-93-001', 'Positive'); AG-88-1_r1-.raw gives ('ag-88-1', 'Negative'); x.raw, x--.raw and
+    a bare -.raw give None. Only the stem's last character is read, so a separator inside a name states nothing."""
+    found = _POLARITY_MARKER.match(_name_stem(name))
+    if not found or not found.group("base"):
+        return None
+    return found.group("base"), _POLARITY_MARKERS[found.group("marker")]
+
+
+def _sample_id_polarities(text: str) -> set[str]:
+    """The polarities a sample id, or a member's path, states for R6: by a token of its own (name_polarities, a token
+    beside a control, ctrl, blank or QC token included), a trailing marker, or a pos/neg token glued to the run's
+    number (SAMPLE_ID_POLARITY_TOKEN)."""
+    stated = set(name_polarities(text, polarity_named=True))
+    name = PurePosixPath(str(text or "").replace("\\", "/")).name
+    for token in _name_tokens(_name_stem(name)):
+        found = SAMPLE_ID_POLARITY_TOKEN.match(token)
+        if found:
+            stated.add("Positive" if found.group(1).startswith("p") else "Negative")
+    return stated
 
 
 def names_state_polarity(texts: Iterable[str]) -> bool:
@@ -11953,6 +12027,170 @@ def leading_identifier_key(name: str) -> str:
             key = tokens[: index + 1]
             return "_".join(key) if any(character.isalpha() for character in "".join(key)) else ""
     return ""
+
+
+# A JOINED RAW FILE FIELD (R1 of the stage3b triage of 2026-11-15). Metabolomics Workbench's RAW_FILE_NAME lists, in
+# one cell, the file of every polarity and sometimes of every chromatography and encoding: ST002260's "pRPLC_1;
+# nRPLC_1", ST003720's "NEG_D1.mzML POS_D1.mzML", ST002826's four names "190201MR_PET_Hilic_neg_015;
+# 190128MR_PET_RP_pos_015; 190122MR_PET_RP_neg_021; 190130MR_PET_Hilic_pos_015". Read whole, such a cell named no file,
+# and 41 units of 22 studies admitted nothing. The cell is split on ';' always, and a part on whitespace only where
+# every word of it ends in a file suffix (so ST004945's "Pos _QC1.wiff" and ST002823's "Ctrl1- Fecal.wiff" stay
+# whole); a '-' is a placeholder and names nothing. Of the names, the unit keeps those of its own polarity and
+# chromatography (sample_raw_file_reading), and only where what is left is one sample's: the files of one stem, in any
+# encoding, which the one encoding rule chooses among (encoding_rule). Anything else is refused on record, never
+# guessed: a cell whose names for this unit are two samples (ST002044's "D_10.mzML D_10NEG.mzML D10_POS.mzML
+# D10_NEG.mzML", which states no chromatography) gives the row no name.
+_JOINED_NAME_PLACEHOLDERS = frozenset({"-", "--", "---"})
+# The chromatography a name's token states, as a token of its own, and the compound tokens that join a polarity and a
+# chromatography (ST001922's RPPOS, ST002260's pRPLC and nRPLC). Read only in a joined cell's names.
+CHROMATOGRAPHY_NAME_TOKENS = {"hilic": "HILIC", "rp": "RP", "rplc": "RP"}
+_COMPOUND_NAME_TOKEN = re.compile(
+    r"^(?:(?P<c1>hilic|rplc|rp)(?P<p1>pos|neg|positive|negative)"
+    r"|(?P<p2>pos|neg|positive|negative)(?P<c2>hilic|rplc|rp)"
+    r"|(?P<p3>[pn])(?P<c3>hilic|rplc))$"
+)
+# Why a joined cell gives a row no name for this unit.
+JOINED_NAMES_ANOTHER_UNIT = "joined_raw_file_names_only_another_unit"
+JOINED_NAMES_SEVERAL_SAMPLES = "joined_raw_file_names_several_samples"
+# Why an archive member is left out of a unit-scoped archive's unattributed inputs: a joined cell names it for another
+# polarity or chromatography (names_joined_for_other_units).
+JOINED_NAME_OF_ANOTHER_UNIT = "named_by_a_joined_raw_file_for_another_unit"
+
+
+def _has_file_suffix(word: str) -> bool:
+    name = PurePosixPath(word.replace("\\", "/")).name.casefold()
+    return bool(archives.container_alias(name)) or any(
+        name.endswith(suffix) and len(name) > len(suffix) for suffix in _PAIRING_NAME_SUFFIXES
+    )
+
+
+def split_joined_raw_file(raw_file: Any) -> tuple[list[str], bool]:
+    """(the file names a sample row's raw_file names, by their basenames; whether the cell joined several).
+
+    A cell with no ';' and no whitespace-separated file names is one name, read as it always was (its basename). See
+    the notes above _JOINED_NAME_PLACEHOLDERS."""
+    text = str(raw_file or "").strip()
+    if not text:
+        return [], False
+    pieces = [piece.strip() for piece in text.split(";")] if ";" in text else [text]
+    joined = len(pieces) > 1
+    names: list[str] = []
+    for piece in pieces:
+        if not piece or piece in _JOINED_NAME_PLACEHOLDERS:
+            continue
+        words = piece.split()
+        if len(words) > 1 and all(_has_file_suffix(word) for word in words):
+            joined = True
+            parts = words
+        else:
+            parts = [piece]
+        for part in parts:
+            if part in _JOINED_NAME_PLACEHOLDERS:
+                continue
+            base = PurePosixPath(part.replace("\\", "/")).name
+            if base:
+                names.append(base)
+    return names, joined
+
+
+def _joined_name_reading(name: str) -> tuple[set[str], set[str]]:
+    """(the polarities, the chromatographies) a name of a joined cell states by tokens of its own, compounds such as
+    RPPOS and pRPLC included, and a trailing polarity marker (polarity_marker)."""
+    plain, beside = _polarity_token_reading(name)
+    polarities = set(plain or beside)
+    chromatographies: set[str] = set()
+    for token in _name_tokens(_name_stem(name)):
+        if token in CHROMATOGRAPHY_NAME_TOKENS:
+            chromatographies.add(CHROMATOGRAPHY_NAME_TOKENS[token])
+            continue
+        found = _COMPOUND_NAME_TOKEN.match(token)
+        if not found:
+            continue
+        polarity = found.group("p1") or found.group("p2") or found.group("p3")
+        chromatography = found.group("c1") or found.group("c2") or found.group("c3")
+        polarities.add("Positive" if polarity.startswith("p") else "Negative")
+        chromatographies.add(CHROMATOGRAPHY_NAME_TOKENS[chromatography])
+    return polarities, chromatographies
+
+
+def unit_chromatography(project: RepositoryProject) -> str:
+    """HILIC or RP, as the unit's Catalog handoff (technical_settings.chromatography) or its separation states it;
+    '' where neither does."""
+    metadata = project.repository_metadata if isinstance(project.repository_metadata, dict) else {}
+    handoff = metadata.get("catalog_handoff") if isinstance(metadata.get("catalog_handoff"), dict) else {}
+    settings = handoff.get("technical_settings") if isinstance(handoff.get("technical_settings"), dict) else {}
+    for text in (settings.get("chromatography"), settings.get("column"), project.separation):
+        value = str(text or "").casefold()
+        if "hilic" in value:
+            return "HILIC"
+        if "revers" in value or re.search(r"\b(rp|rplc|c18|c8)\b", value):
+            return "RP"
+    return ""
+
+
+def sample_raw_file_reading(sample: Mapping[str, Any] | None, project: RepositoryProject) -> dict[str, Any]:
+    """What a sample row's raw_file names for this unit (R1): {"names", "joined", "dropped", "reason", "polarities"}.
+
+    names: the basenames the unit matches the row by. A cell of one name gives it, as it always did. A joined cell
+    (split_joined_raw_file) gives the names of the unit's own polarity and chromatography, read by their own tokens
+    (_joined_name_reading): a name stating another polarity, or another chromatography, is dropped (dropped, each with
+    why); a name stating neither is kept. What is left must be one sample's (one stem, encoding_preference.stem);
+    otherwise the row gets no name, and reason says why (JOINED_NAMES_SEVERAL_SAMPLES, with the names left as
+    candidates, or JOINED_NAMES_ANOTHER_UNIT where every name was another unit's).
+    polarities: what the row's names state, the coverage gate's reading of whether the row is of the unit's polarity
+    (attribution_coverage)."""
+    names, joined = split_joined_raw_file((sample or {}).get("raw_file"))
+    result: dict[str, Any] = {"names": names, "joined": joined, "dropped": [], "reason": "", "polarities": []}
+    readings = {name: _joined_name_reading(name) for name in names}
+    result["polarities"] = sorted({polarity for polarities, _ in readings.values() for polarity in polarities})
+    if not joined:
+        return result
+    unit_polarity = _unit_polarity(project)
+    chromatography = unit_chromatography(project)
+    kept = list(names)
+    dropped: list[dict[str, str]] = []
+
+    def drop(condition: Callable[[str], bool], reason: str) -> None:
+        nonlocal kept
+        for name in [name for name in kept if condition(name)]:
+            dropped.append({"name": name, "reason": reason})
+        kept = [name for name in kept if not condition(name)]
+
+    # A name that states nothing is never dropped for its silence: beside D10_POS.mzML, ST002044's D_10.mzML may be the
+    # other chromatography's positive run, so the cell is two samples for the unit and is refused.
+    if unit_polarity:
+        drop(lambda name: bool(readings[name][0] - {unit_polarity}), "states_another_polarity")
+    if chromatography:
+        drop(lambda name: bool(readings[name][1] - {chromatography}), "states_another_chromatography")
+    result["dropped"] = dropped
+    if not kept:
+        result.update(names=[], reason=JOINED_NAMES_ANOTHER_UNIT if names else "")
+    elif len({encoding_preference.stem(name) for name in kept}) > 1:
+        result.update(names=[], reason=JOINED_NAMES_SEVERAL_SAMPLES, candidates=kept)
+    else:
+        result["names"] = kept
+    return result
+
+
+def unit_raw_file_names(sample: Mapping[str, Any] | None, project: RepositoryProject) -> list[str]:
+    """The basenames a sample row names for this unit (sample_raw_file_reading's names): every reader of a row's
+    raw_file that matches files by name reads it through this."""
+    return list(sample_raw_file_reading(sample, project)["names"])
+
+
+def names_joined_for_other_units(project: RepositoryProject) -> tuple[set[str], set[str]]:
+    """(the casefolded names, their file stems) that joined cells name for another unit only: the names
+    sample_raw_file_reading dropped, less any the unit's rows name themselves (by name, and by stem). A member of one of
+    them, in any encoding, is that other unit's run and never this unit's unattributed input."""
+    exact: set[str] = set()
+    own: set[str] = set()
+    for sample in project.sample_metadata or []:
+        reading = sample_raw_file_reading(sample, project)
+        own.update(name.casefold() for name in reading["names"])
+        exact.update(item["name"].casefold() for item in reading["dropped"])
+    exact -= own
+    stems = {encoding_preference.stem(name) for name in exact} - {encoding_preference.stem(name) for name in own}
+    return exact, stems
 
 
 def _member_under_root(key: str, data_key: str) -> str:
@@ -12034,8 +12272,10 @@ def _member_name_pairings(
     named: dict[str, set[str]] = {}
     stemmed: dict[str, set[str]] = {}
     written_names: set[str] = set()
-    for sample in project.sample_metadata or []:
-        raw = PurePosixPath(str((sample or {}).get("raw_file") or "").strip().replace("\\", "/")).name
+    # Each row's names for this unit (unit_raw_file_names: a joined cell's own, R1), and the stems of each row's names.
+    row_readings = [sample_raw_file_reading(sample, project) for sample in project.sample_metadata or []]
+    row_names = [list(reading["names"]) for reading in row_readings]
+    for raw in (name for names in row_names for name in names):
         if not raw:
             continue
         written_names.add(raw)
@@ -12075,6 +12315,17 @@ def _member_name_pairings(
         if member and declared and member != declared:
             return "polarity_token_contradicts_declared_name"
         return ""
+
+    def of_another_polarity(key: str) -> bool:
+        """Whether a member's path states a polarity that is not the unit's ion mode (R3 of the stage3b triage of
+        2026-11-15): such a claimant is dropped, on record, before a rule tests one to one or uniqueness, so that
+        ST003616's Project2_POS_P-Batch-1-Preterm-1.mzML no longer stops its Neg twin from pairing in a negative
+        unit."""
+        if not unit_polarity:
+            return False
+        if "members" not in polarity_named:
+            polarity_named["members"] = names_state_polarity(relative(item) for item in pool)
+        return bool(name_polarities(relative(key), polarity_named=polarity_named["members"]) - {unit_polarity})
 
     def exactly(name: str) -> set[str]:
         """The declared names a name carries exactly: itself, or its stem where a row records no extension."""
@@ -12144,6 +12395,7 @@ def _member_name_pairings(
         take(name)
     claims: dict[str, set[str]] = {}
     claimed_by: dict[str, set[str]] = {}
+    opposite_refused: set[str] = set()
     for key, name in pool.items():
         if exactly(name):
             continue
@@ -12153,6 +12405,12 @@ def _member_name_pairings(
             for index, character in enumerate(text)
             if character in PREFIX_SEPARATORS and text[index + 1:] in table and open_to(text[index + 1:], name)
         }
+        if found and of_another_polarity(key):
+            # R3: another polarity's member claims nothing, and is refused on record as it always was.
+            for declared_name in sorted(found):
+                refuse(key, written(declared_name), PREFIXED_MEMBER_PAIRING, "polarity_token_contradicts_ion_mode")
+            opposite_refused.add(key)
+            continue
         if found:
             claims[key] = found
             for declared_name in found:
@@ -12174,6 +12432,59 @@ def _member_name_pairings(
             continue
         paired[key] = {"declared_raw_file": written(declared_name), "paired_by": PREFIXED_MEMBER_PAIRING}
 
+    # THEN A TRAILING POLARITY MARKER (MARKED_MEMBER_STEM_PAIRING, R4): a member whose stem, less its marker and any
+    # run-order suffix (polarity_marker), is a declared name's stem that nothing carries and no rule above claimed. The
+    # declared stem is one row's; members of another polarity (by the marker or a folder) are dropped on record first
+    # (R3); and what is left must be one file in one folder, or that file's other encodings beside it. Two folders
+    # holding one marked name (ST003184's negative global lipids/ and negative fatty acids/, which the Catalog must
+    # tell apart) or two marked runs of one sample (ST003792's AG-88-5) pair nothing, on record. A declared name this
+    # rule pairs or refuses is left to it, as a prefixed one is to its rule, and so is each member it reads.
+    marked_rows: Counter[str] = Counter()
+    for names in row_names:
+        for stem in {_name_stem(name) for name in names if name}:
+            marked_rows[stem] += 1
+    open_stems: dict[str, set[str]] = {}
+    for declared_name in {*named, *stemmed}:
+        if declared_name not in taken and declared_name not in claimed_by:
+            open_stems.setdefault(_name_stem(declared_name), set()).add(declared_name)
+    marked_members: dict[str, list[str]] = {}
+    for key, name in pool.items():
+        if key in claims or exactly(name):
+            continue
+        reading = polarity_marker(name)
+        if reading and reading[0] in open_stems:
+            marked_members.setdefault(reading[0], []).append(key)
+    for stem, keys in sorted(marked_members.items()):
+        declared_names = open_stems[stem]
+        declared_raw_file = written(sorted(declared_names)[0])
+        for key in keys:
+            claims[key] = set(declared_names)
+        for declared_name in declared_names:
+            claimed_by.setdefault(declared_name, set()).update(keys)
+        if marked_rows[stem] != 1:
+            for key in sorted(keys):
+                refuse(key, declared_raw_file, MARKED_MEMBER_STEM_PAIRING, "declared_stem_not_one_sample")
+            continue
+        candidates = []
+        for key in sorted(keys):
+            if of_another_polarity(key):
+                refuse(key, declared_raw_file, MARKED_MEMBER_STEM_PAIRING, "polarity_token_contradicts_ion_mode")
+            else:
+                candidates.append(key)
+        if not candidates:
+            continue
+        files = {(str(PurePosixPath(relative(key)).parent).casefold(), _name_stem(pool[key])) for key in candidates}
+        if len(files) != 1:
+            for key in candidates:
+                refuse(key, declared_raw_file, MARKED_MEMBER_STEM_PAIRING, "not_one_to_one")
+            continue
+        for key in candidates:
+            reason = polarity_conflict(key, declared_raw_file)
+            if reason:
+                refuse(key, declared_raw_file, MARKED_MEMBER_STEM_PAIRING, reason)
+                continue
+            paired[key] = {"declared_raw_file": declared_raw_file, "paired_by": MARKED_MEMBER_STEM_PAIRING}
+
     # The leading identifiers of every declared name and of every candidate member, for uniqueness. A
     # declared name a prefixed member claims, paired or refused, and a member that claims one, are left to
     # that rule: the token rule never pairs what a rule before it settled or refused.
@@ -12194,6 +12505,19 @@ def _member_name_pairings(
         # another injection, and the one encoding rule does not make it the row's (review of PR #69, follow-up 3).
         open_names = {name for name in declared_names if name not in taken and name not in claimed_by}
         if not members or not open_names:
+            continue
+        # R3: a member of another polarity is no candidate, so it never makes a key not unique; refused on record (once:
+        # a member the prefixed rule refused for its polarity already is).
+        opposite = {key for key in members if of_another_polarity(key)}
+        for key in sorted(opposite - set(claims) - opposite_refused):
+            # A member of a declared name's own stem is refused for that name alone; any other for every open name.
+            stem = encoding_preference.stem(pool[key])
+            own_names = sorted(name for name in open_names if encoding_preference.stem(name) == stem)
+            for name in own_names or sorted(open_names):
+                refuse(key, written(name), LEADING_IDENTIFIER_TOKEN_PAIRING, "polarity_token_contradicts_ion_mode",
+                       key=token_key)
+        members = members - opposite
+        if not members:
             continue
         # Unique on both sides, a sample's files counting as one candidate (sample_of), the declared name's own files
         # among them: a member of its stem in another encoding (VV_13_HEpG2_C1_pos.mzML for VV_13_HEpG2_C1_pos.raw)
@@ -12241,13 +12565,11 @@ def _member_name_pairings(
     # stem compares whole names less their encoding suffix, so x_pos.raw never takes x_neg.mzML; a member or a declared
     # name whose path states a polarity that is not the unit's ion mode, or not the other's, is refused as above.
     paired_names = {str(item["declared_raw_file"]).casefold() for item in paired.values()}
+    # Rows, not names: a joined cell naming X.raw and X.mzML (R1) is one row of the stem x.
     rows_of_stem: Counter[str] = Counter()
-    for raw in (
-        PurePosixPath(str((sample or {}).get("raw_file") or "").strip().replace("\\", "/")).name
-        for sample in project.sample_metadata or []
-    ):
-        if raw:
-            rows_of_stem[encoding_preference.stem(raw)] += 1
+    for names in row_names:
+        for stem in {encoding_preference.stem(raw) for raw in names if raw}:
+            rows_of_stem[stem] += 1
     vendor_names: dict[str, set[str]] = {}
     for declared_name in named:
         stem = encoding_preference.stem(declared_name)
@@ -12272,6 +12594,12 @@ def _member_name_pairings(
             for key in members:
                 refuse(key, declared_raw_file, CONVERTED_MEMBER_STEM_PAIRING, "declared_stem_not_one_sample")
             continue
+        # R3: another polarity's mzML of the stem is no candidate, refused on record before one sample is asked for.
+        for key in [key for key in members if of_another_polarity(key)]:
+            refuse(key, declared_raw_file, CONVERTED_MEMBER_STEM_PAIRING, "polarity_token_contradicts_ion_mode")
+        members = [key for key in members if not of_another_polarity(key)]
+        if not members:
+            continue
         if len({sample_of(key) for key in members}) != 1:
             for key in members:
                 refuse(key, declared_raw_file, CONVERTED_MEMBER_STEM_PAIRING, "member_stem_not_one_sample")
@@ -12286,6 +12614,66 @@ def _member_name_pairings(
                 "paired_by": CONVERTED_MEMBER_STEM_PAIRING,
                 "conversion": deposited_conversion(_path_on_disk(key, data_root), declared_raw_file),
             }
+
+    # LAST OF ALL, THE ROW'S SAMPLE ID (SAMPLE_ID_MEMBER_STEM_PAIRING, R6): a row none of whose names anything carries,
+    # paired or claimed is paired with the members whose stem (encoding_preference.stem) is its sample_id, whole and
+    # without case: ST002823's row 12-5-2020Ctrl1- Fecal, whose raw_file says Ctrl1- Fecal.wiff, and ST004757's rows,
+    # whose raw_file says only .RAW. Only where the sample_id is one row's, the stem is no row's file stem, the members
+    # are one sample (sample_of) once those of another polarity are dropped (R3), and neither the sample_id nor the
+    # member states another polarity, glued digits included (b1_pos1: SAMPLE_ID_POLARITY_TOKEN).
+    paired_names = {str(item["declared_raw_file"]).casefold() for item in paired.values()}
+    rows = [sample if isinstance(sample, dict) else {} for sample in project.sample_metadata or []]
+    ids = Counter(str(row.get("sample_id") or "").strip().casefold() for row in rows)
+    by_stem: dict[str, list[str]] = {}
+    for key, name in pool.items():
+        stem = encoding_preference.stem(name)
+        if key in paired or key in claims or exactly(name) or stem in rows_of_stem:
+            continue
+        by_stem.setdefault(stem, []).append(key)
+    for index, row in enumerate(rows):
+        sample_id = str(row.get("sample_id") or "").strip()
+        keys = by_stem.get(sample_id.casefold()) if sample_id and ids[sample_id.casefold()] == 1 else None
+        names = [name for name in row_names[index] if name]
+        # A joined cell refused for this unit (R1: two samples, or another unit's) is never read through its sample id,
+        # nor a row that names an archive, whose contents the archive rules attribute (_archive_sample_attribution).
+        if not keys or row_readings[index]["reason"] or any(archives.is_archive_name(name) for name in names) or any(
+            name.casefold() in taken or name.casefold() in claimed_by or name.casefold() in paired_names
+            for name in names
+        ):
+            continue
+        real = [name for name in names if not name.startswith(".") and not name.casefold().startswith("sample_data:")]
+        declared_raw_file = real[0] if real else sample_id
+        if unit_polarity and _sample_id_polarities(sample_id) - {unit_polarity}:
+            for key in sorted(keys):
+                refuse(key, declared_raw_file, SAMPLE_ID_MEMBER_STEM_PAIRING, "polarity_token_contradicts_ion_mode",
+                       sample_id=sample_id)
+            continue
+        candidates = []
+        for key in sorted(keys):
+            if unit_polarity and (
+                of_another_polarity(key) or _sample_id_polarities(relative(key)) - {unit_polarity}
+            ):
+                refuse(key, declared_raw_file, SAMPLE_ID_MEMBER_STEM_PAIRING, "polarity_token_contradicts_ion_mode",
+                       sample_id=sample_id)
+            else:
+                candidates.append(key)
+        if not candidates:
+            continue
+        if len({sample_of(key) for key in candidates}) != 1:
+            for key in candidates:
+                refuse(key, declared_raw_file, SAMPLE_ID_MEMBER_STEM_PAIRING, "member_stem_not_one_sample",
+                       sample_id=sample_id)
+            continue
+        for key in candidates:
+            reason = polarity_conflict(key, declared_raw_file)
+            if reason:
+                refuse(key, declared_raw_file, SAMPLE_ID_MEMBER_STEM_PAIRING, reason, sample_id=sample_id)
+                continue
+            paired[key] = {
+                "declared_raw_file": declared_raw_file,
+                "paired_by": SAMPLE_ID_MEMBER_STEM_PAIRING,
+                "sample_id": sample_id,
+            }
     # A declared name its own deposited conversion now carries is, to the token rule, what a name carried exactly is:
     # one it never pairs by its token. Its refusals of the study's other members for that name (ST004806's blanks and
     # pooled MS/MS runs, 35 of them, all leading_identifier_not_unique) say nothing about the name, and are dropped.
@@ -12297,6 +12685,16 @@ def _member_name_pairings(
         for entry in result["refused"]
         if not (entry["rule"] == LEADING_IDENTIFIER_TOKEN_PAIRING and entry["declared_raw_file"] in converted)
     ]
+    # One refusal of a member for a name and a reason: R3 refuses another polarity's member in each rule it reaches.
+    seen: set[tuple[str, str, str]] = set()
+    unique: list[dict[str, Any]] = []
+    for entry in result["refused"]:
+        identity = (entry["member_name"], entry["declared_raw_file"], entry["reason"])
+        if entry["reason"] == "polarity_token_contradicts_ion_mode" and identity in seen:
+            continue
+        seen.add(identity)
+        unique.append(entry)
+    result["refused"] = unique
     return result
 
 
@@ -12524,8 +12922,13 @@ def _unattributed_members(
     unit_polarity = str(project.ion_mode or "").strip().capitalize()
     unit_polarity = unit_polarity if unit_polarity in {"Positive", "Negative"} else ""
     polarity_named = names_state_polarity(_member_under_root(key, data_key) for key in pool)
+    other_exact, other_stems = names_joined_for_other_units(project)
     for key, name in remaining.items():
         base = Path(name).name
+        if base.casefold() in other_exact or encoding_preference.stem(base) in other_stems:
+            # A joined cell names it for another polarity or chromatography (R1): that unit's run, never this one's.
+            left_out.append({"member_name": name, "reason": JOINED_NAME_OF_ANOTHER_UNIT})
+            continue
         # An mzXML as the extract stage left it, which the convert stage finds (_find_mzxml_files) and converts.
         convertible = base.casefold().endswith(CONVERTIBLE_SUFFIXES)
         if (convertible and not converts) or (

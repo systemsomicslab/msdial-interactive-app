@@ -104,6 +104,7 @@ from .repository_reanalysis import (
     match_declared_inputs,
     project_from_dict,
     travels_with_sciex_file,
+    unit_raw_file_names,
     update_manifest,
     with_order_source,
 )
@@ -361,9 +362,11 @@ def build_repository_analysis_rows(
     file_keys: list[set[str]] = []
     for index, row in enumerate(samples):
         rows_of_id.setdefault(str(row.get("sample_id") or ""), []).append(index)
-        for key in metadata_match_keys(row.get("raw_file", ""), row.get("sample_id", "")):
+        # The names the row gives for this unit: a joined cell's own (unit_raw_file_names, R1), else its one name.
+        names = unit_raw_file_names(row, typed)
+        for key in metadata_match_keys(*names, row.get("sample_id", "")):
             by_key.setdefault(key, []).append(index)
-        file_keys.append(metadata_match_keys(row.get("raw_file", "")))
+        file_keys.append(metadata_match_keys(*names))
 
     def input_names(candidate: str, entry: dict[str, Any] | None, lineage_row: dict[str, Any] | None) -> set[str]:
         """Every name a sample row may give an input by: its own; the declared input's path and archive; the
