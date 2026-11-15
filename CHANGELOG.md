@@ -34,9 +34,16 @@ paths that passed short admissions; both are closed here.
       (`attribution_admitted_only_blanks_qc_or_standards`);
     - fewer than the minimum of its biological sample rows were, however many QC rows were
       (`attribution_sample_coverage_below_minimum`);
-    - none of its rows is a biological sample's of its own polarity, some are another unit's, and inputs were
-      admitted, whatever blank, QC or standard rows it also lists: a Catalog mis-assignment
-      (`attribution_no_rows_of_the_unit_polarity`);
+    - none of its rows is a biological sample's of its own polarity, some are another unit's, and it admitted an
+      input no row of its own declares (another unit's row's file, or an unattributed member), whatever blank, QC or
+      standard rows it also lists: a Catalog mis-assignment (`attribution_no_rows_of_the_unit_polarity`). A row of
+      another unit whose file was not admitted refuses nothing: a QC-only or pooled-only unit beside one such row runs
+      on its own files, as before;
+    - it admitted the file of a row that is another unit's, however many of its own samples it admitted
+      (`attribution_admitted_another_units_inputs`). The gate counted only the unit's own rows, so one positive sample
+      row passed a unit carrying ten negative files at 0.5; on stage3b, ST002798's HILIC and reversed-phase units each
+      carried the other chromatography's files (16 and 102 of 220) and ran. `inputs_of_another_units_rows` counts
+      them;
     - the rows could not be built to be counted (`attribution_coverage_not_computed`).
     `ATTRIBUTION_COVERAGE_REFUSALS` lists the codes.
   - The failed manifest is `download_failed` with `download_failure.stage: attribute`, `reason_code`,
@@ -44,17 +51,17 @@ paths that passed short admissions; both are closed here.
     exclusion), and the record less its per-input list (`download_failure.attribution_coverage`, which the download
     job carries verbatim); the whole record is `attribution_coverage` beside it.
   - Every lease that passes writes `manifest.attribution_coverage`: rule, minimum, status, reason, the unit's polarity
-    and chromatography, `sample_rows`, `rows_of_another_unit(_listed)`, `blank_rows`, `declared_rows`, `admitted_rows`,
-    `ratio`, `row_ratio`, `analysed_ratio`, `sample_rows_declared`, `sample_rows_admitted`, `sample_ratio`,
-    `unattributed_inputs(_counted)`, `admitted_by` (the rule that admitted each input, counted), `inputs` (each input
-    with its row, type and rule), `rows_without_input` (first 100, with the count), `joined_raw_files` (rows split,
-    rows of another unit, cells refused and whether each was read whole) and `warnings`. The attribute stage carries
-    its status, reason, counts and ratios.
+    and chromatography, `sample_rows`, `rows_of_another_unit(_listed)`, `inputs_of_another_units_rows`, `blank_rows`,
+    `declared_rows`, `admitted_rows`, `ratio`, `row_ratio`, `analysed_ratio`, `sample_rows_declared`,
+    `sample_rows_admitted`, `sample_ratio`, `unattributed_inputs(_counted)`, `admitted_by` (the rule that admitted
+    each input, counted), `inputs` (each input with its row, type and rule), `rows_without_input` (first 100, with
+    the count), `joined_raw_files` (rows split, rows of another unit, cells refused and whether each was read whole)
+    and `warnings`. The attribute stage carries its status, reason, counts and ratios.
   - Where rows alone are below the minimum and unattributed inputs make up the gap, the unit passes with the warning
     `attribution_rows_below_minimum_unattributed_inputs_counted`, in the manifest's warnings too. Whether that should
     refuse is open for the author (it would refuse the 2026-10-07 ST001264 case).
-  - A unit with no sample rows, or whose own rows are blanks only and either no row is another unit's or nothing was
-    admitted, is recorded `not_evaluated` and not judged.
+  - A unit with no sample rows, or whose own rows are blanks only and which, where some rows are another unit's,
+    admitted no input but its own rows' files, is recorded `not_evaluated` and not judged.
 - **Two pairing rules, inferences on record like the others (`input_name_pairings`, the lineage row's
   `name_pairing`, the attribute stage's counts), in a unit of one stated polarity only.**
   - R4 `polarity_marked_member_stem`: a trailing `+` or `-` on a member's stem (`polarity_marker`). ST003328's

@@ -827,9 +827,13 @@ def build_repository_analysis_rows(
 #   (ATTRIBUTION_ADMITTED_NO_SAMPLE);
 # - fewer than the minimum of its biological sample rows were admitted, however many QC rows were
 #   (ATTRIBUTION_SAMPLE_COVERAGE_BELOW_MINIMUM: 20 QCs and 1 of 20 samples is no unit);
-# - it admitted inputs while none of its rows is a biological sample's of its own polarity and some are another unit's,
-#   whatever blank, QC or standard rows it also lists: a Catalog mis-assignment
-#   (ATTRIBUTION_NO_ROWS_OF_THE_UNIT_POLARITY: ST004800's positive units carrying the negative archive);
+# - none of its rows is a biological sample's of its own polarity, some are another unit's, and it admitted an input no
+#   row of its own declares (another unit's row's file, or an unattributed member), whatever blank, QC or standard rows
+#   it also lists: a Catalog mis-assignment (ATTRIBUTION_NO_ROWS_OF_THE_UNIT_POLARITY: ST004800's positive units
+#   carrying the negative archive);
+# - it admitted the file of a row that is another unit's, however many of its own samples it also admitted
+#   (ATTRIBUTION_ADMITTED_ANOTHER_UNITS_INPUTS: one positive sample row would otherwise carry ten negative files into
+#   the run); a row of another unit whose file the unit did not admit is only not counted;
 # - its rows could not be built to be counted (ATTRIBUTION_COVERAGE_NOT_COMPUTED): never a pass for want of a verdict.
 # The rows counted are the unit's own polarity's: a row whose names state only another polarity by a token of their own,
 # or a joined cell all of whose names are another unit's (sample_raw_file_reading), is another unit's row, each listed
@@ -851,6 +855,7 @@ ATTRIBUTION_COVERAGE_BELOW_MINIMUM = "attribution_coverage_below_minimum"
 ATTRIBUTION_ADMITTED_NO_SAMPLE = "attribution_admitted_only_blanks_qc_or_standards"
 ATTRIBUTION_SAMPLE_COVERAGE_BELOW_MINIMUM = "attribution_sample_coverage_below_minimum"
 ATTRIBUTION_NO_ROWS_OF_THE_UNIT_POLARITY = "attribution_no_rows_of_the_unit_polarity"
+ATTRIBUTION_ADMITTED_ANOTHER_UNITS_INPUTS = "attribution_admitted_another_units_inputs"
 ATTRIBUTION_COVERAGE_NOT_COMPUTED = "attribution_coverage_not_computed"
 ATTRIBUTION_COVERAGE_NOT_EVALUATED = "not_evaluated"
 # Every reason the gate refuses a unit for (a campaign runner records each as a terminal failure, not a retry).
@@ -860,6 +865,7 @@ ATTRIBUTION_COVERAGE_REFUSALS = frozenset(
         ATTRIBUTION_ADMITTED_NO_SAMPLE,
         ATTRIBUTION_SAMPLE_COVERAGE_BELOW_MINIMUM,
         ATTRIBUTION_NO_ROWS_OF_THE_UNIT_POLARITY,
+        ATTRIBUTION_ADMITTED_ANOTHER_UNITS_INPUTS,
         ATTRIBUTION_COVERAGE_NOT_COMPUTED,
     }
 )
@@ -916,7 +922,8 @@ def attribution_coverage(
     ``manifest`` is the unit's manifest, or the lease's view of it at the attribute stage (project, input_candidates,
     input_lineage, excluded_input_candidates, input_directory, raw_directory, archive_extractions, encoding_choices).
     Returns the record the lease writes as manifest.attribution_coverage: status passed, refused or not_evaluated; the
-    reason code; the counts (sample_rows, rows_of_another_unit with why for each, blank_rows, declared_rows,
+    reason code; the counts (sample_rows, rows_of_another_unit with why for each, inputs_of_another_units_rows (the
+    inputs paired with such a row), blank_rows, declared_rows,
     admitted_rows, ratio, row_ratio, analysed_ratio, sample_rows_declared, sample_rows_admitted, sample_ratio);
     admitted_by, the rule that admitted each input, counted, and inputs, each input with its row and that rule; the
     declared rows left without an input; the joined cells refused; and warnings. See the notes above
@@ -1045,6 +1052,18 @@ def attribution_coverage(
         if row.get("raw_file_paired_by") == UNATTRIBUTED_MEMBER_PAIRING
     ]
     unattributed_counted = [kind for kind in unattributed if kind not in {"Blank", "QC"}]
+    # The inputs no row of the unit's own declares: those the analysis CSV pairs with a row of another unit, and those
+    # with no row at all (an unattributed member of a unit-scoped archive).
+    another_rows = {int(item["sample_row_index"]) for item in another_unit}
+    own_rows = {*declared, *blanks}
+    another_inputs = [
+        row for row in built["rows"]
+        if row.get("sample_row_index") is not None and int(row["sample_row_index"]) in another_rows
+    ]
+    undeclared_inputs = [
+        row for row in built["rows"]
+        if row.get("sample_row_index") is None or int(row["sample_row_index"]) not in own_rows
+    ]
     unattributed_samples = len([kind for kind in unattributed_counted if kind == "Sample"])
     admitted_count = len(admitted) + len(unattributed_counted)
 
@@ -1079,6 +1098,7 @@ def attribution_coverage(
         sample_rows=len(samples),
         rows_of_another_unit=len(another_unit),
         rows_of_another_unit_listed=another_unit[:_COVERAGE_LISTED],
+        inputs_of_another_units_rows=len(another_inputs),
         blank_rows=len(blanks),
         declared_rows=len(declared),
         admitted_rows=len(admitted),
@@ -1106,10 +1126,11 @@ def attribution_coverage(
     if not samples:
         record["reason"] = "no_sample_rows"
         return record
-    if another_unit and not samples_declared and built["rows"]:
-        # No biological sample row of the unit's own, rows of another unit, and inputs admitted: a Catalog
-        # mis-assignment, whatever blank, QC or standard rows the unit also lists (independent check of 0.5.67: one
-        # Blank1.raw or QC1.raw row let a positive unit run on its S1_neg.raw rows' files).
+    if another_unit and not samples_declared and undeclared_inputs:
+        # No biological sample row of the unit's own, rows of another unit, and an input admitted that no row of its own
+        # declares: a Catalog mis-assignment, whatever blank, QC or standard rows the unit also lists (independent check
+        # of 0.5.67: one Blank1.raw or QC1.raw row let a positive unit run on its S1_neg.raw rows' files). A stray row of
+        # another unit whose file was not admitted refuses nothing: the unit runs on its own rows' files alone.
         record.update(
             status="refused",
             reason=ATTRIBUTION_NO_ROWS_OF_THE_UNIT_POLARITY,
@@ -1117,8 +1138,26 @@ def attribution_coverage(
                 f"None of the {len(samples)} sample rows of analysis unit {typed.analysis_unit_id} is a biological "
                 f"sample's of its own polarity ({polarity or 'unstated'}): {len(another_unit)} are another unit's, "
                 f"{len(blanks)} blanks and {len(declared)} QCs or standards, yet attribution admitted "
-                f"{len(built['rows'])} inputs ({ATTRIBUTION_NO_ROWS_OF_THE_UNIT_POLARITY}). Refusing to run the unit on "
-                "files its rows do not declare; attribution_coverage lists each row and why."
+                f"{len(undeclared_inputs)} of its {len(built['rows'])} inputs for no row of the unit's own "
+                f"({ATTRIBUTION_NO_ROWS_OF_THE_UNIT_POLARITY}). Refusing to run the unit on files its rows do not "
+                "declare; attribution_coverage lists each row and why."
+            ),
+        )
+        return record
+    if another_inputs:
+        # Rows of another unit whose files attribution admitted: one admitted sample row of the unit's own polarity hid
+        # any number of another polarity's inputs, each run as the unit's (verification of 0.5.67's fix: one positive
+        # and ten negative files passed at 0.5). The unit's own samples never excuse another unit's files.
+        names = sorted({Path(str(row["input_path"])).name for row in another_inputs})
+        record.update(
+            status="refused",
+            reason=ATTRIBUTION_ADMITTED_ANOTHER_UNITS_INPUTS,
+            message=(
+                f"Attribution admitted {len(another_inputs)} of the {len(built['rows'])} inputs of analysis unit "
+                f"{typed.analysis_unit_id} for rows that are another unit's ({len(another_unit)} such rows; the unit's "
+                f"polarity {polarity or 'unstated'}), for example {', '.join(names[:3])} "
+                f"({ATTRIBUTION_ADMITTED_ANOTHER_UNITS_INPUTS}). Refusing to run the unit on another unit's files; "
+                "attribution_coverage lists each row and why, and each input with its row."
             ),
         )
         return record
