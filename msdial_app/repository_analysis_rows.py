@@ -1075,32 +1075,45 @@ def attribution_coverage(
     # A sample id's pos/neg token beside a control, ctrl, blank or QC token is a polarity only where the ids name
     # polarities elsewhere, as the names' readers read one (name_polarities).
     ids_named = names_state_polarity(str(row.get("sample_id") or "") for row in samples)
-    # A row whose one name (or, its names silent, its attribute) states another chromatography is another unit's only
-    # where the unit's rows state two (ST002330's RP unit lists HILIC-RN1-neg.mzXML beside C18-RN1-neg.mzXML), or one
-    # that is not the unit's by HILIC or by an attribute (below); elsewhere "RP" may be a sample's code.
+    # A row whose one name (or its attribute) states another chromatography is another unit's only where the unit's rows
+    # state two by the same kind of statement (ST002330's RP unit lists HILIC-RN1-neg.mzXML beside C18-RN1-neg.mzXML),
+    # or one that is not the unit's by HILIC or by an attribute (below); elsewhere "RP" may be a sample's code.
     chromatography = unit_chromatography(typed)
-    # What each row's own attributes state (_row_attribute_statement), read where its names state nothing.
+    # What each row's own attributes state (_row_attribute_statement). A row's attribute outweighs a name that states
+    # only RP, which may be a sample's code (a HILIC unit's RP_1.raw, C8_1.raw or P1_C18_1.raw beside Column type HILIC:
+    # verification of 00c3562); a name's HILIC, which no sample code states, is read before it.
     attributes = [_row_attribute_statement(row) for row in samples]
     row_chromatographies: dict[str, tuple[set[str], str]] = {}
+    # What the rows state by each kind of statement, every row's counted whichever its own reading takes.
+    stated_by_source: dict[str, set[str]] = {
+        "raw_file_states_another_chromatography": set(), ROW_ATTRIBUTE_STATES_ANOTHER_CHROMATOGRAPHY: set()
+    }
     for index, row in enumerate(samples):
         names = split_names(row)
         stated_by_name = name_chromatographies(names[0]) if len(names) == 1 else set()
-        if stated_by_name:
+        stated_by_attribute = attributes[index][1] if len(names) <= 1 else set()
+        stated_by_source["raw_file_states_another_chromatography"].update(stated_by_name)
+        stated_by_source[ROW_ATTRIBUTE_STATES_ANOTHER_CHROMATOGRAPHY].update(stated_by_attribute)
+        if stated_by_name and ("HILIC" in stated_by_name or not stated_by_attribute):
             row_chromatographies[str(index)] = (stated_by_name, "raw_file_states_another_chromatography")
-        elif len(names) <= 1 and attributes[index][1]:
-            row_chromatographies[str(index)] = (attributes[index][1], ROW_ATTRIBUTE_STATES_ANOTHER_CHROMATOGRAPHY)
+        elif stated_by_attribute:
+            row_chromatographies[str(index)] = (stated_by_attribute, ROW_ATTRIBUTE_STATES_ANOTHER_CHROMATOGRAPHY)
     rows_state = {item for stated, _source in row_chromatographies.values() for item in stated}
     # Or where the rows state one chromatography that is not the unit's, by a statement no sample code makes: HILIC, or
     # a row's attribute (ST002796's RP unit's aif-pos part held 3 rows, each named for HILIC positive, and ran them).
-    read_chromatography = bool(chromatography) and (
-        len(rows_state) > 1
-        or (
-            bool(rows_state) and chromatography not in rows_state
-            and (rows_state == {"HILIC"} or any(
-                source == ROW_ATTRIBUTE_STATES_ANOTHER_CHROMATOGRAPHY for _stated, source in row_chromatographies.values()
-            ))
-        )
+    one_not_the_units = (
+        bool(rows_state) and chromatography not in rows_state
+        and (rows_state == {"HILIC"} or any(
+            source == ROW_ATTRIBUTE_STATES_ANOTHER_CHROMATOGRAPHY for _stated, source in row_chromatographies.values()
+        ))
     )
+    # Two chromatographies are read by the kind of statement that states both: names' two for the rows read by name,
+    # attributes' two for those read by attribute. Other rows' HILIC attributes never read a name's RP code.
+    read_by_source = {
+        source: bool(chromatography) and (len(stated) > 1 or one_not_the_units)
+        for source, stated in stated_by_source.items()
+    }
+    read_chromatography = any(read_by_source.values())
     for index, row in enumerate(samples):
         reading = sample_raw_file_reading(row, typed)
         sample_id = str(row.get("sample_id") or "")
@@ -1136,7 +1149,10 @@ def attribution_coverage(
                 why = source
         if not why and not reading["joined"] and read_chromatography:
             stated_chromatographies, source = row_chromatographies.get(str(index)) or (set(), "")
-            if stated_chromatographies and chromatography not in stated_chromatographies:
+            if (
+                stated_chromatographies and read_by_source.get(source)
+                and chromatography not in stated_chromatographies
+            ):
                 why = source
         if why:
             another_unit.append({"sample_row_index": index, "sample_id": sample_id, "reason": why})

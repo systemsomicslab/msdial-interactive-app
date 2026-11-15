@@ -587,6 +587,37 @@ class TheGateReadsEveryStatementOfAChromatography(_Workspace):
         coverage = self.lease_then_judge([raw for _sample, raw in rows], rows, "HILIC", values)
         self.assertEqual(("passed", 0), (coverage["status"], coverage["rows_of_another_unit"]))
 
+    def test_a_hilic_attribute_on_every_row_outweighs_an_rp_sample_code_in_a_name(self) -> None:
+        """MetaboLights gives every row its Column type: a HILIC unit's RP_1 and C8_1 are sample codes, and the row's
+        own HILIC attribute says so (verification of 00c3562)."""
+        # The last name silent, or stating HILIC itself, so that the names state two chromatographies.
+        for last in ("H_1.raw", "HILIC_1.raw"):
+            rows = [("S1", "RP_1.raw"), ("S2", "C8_1.raw"), ("S3", "P1_C18_1.raw"), ("S4", last)]
+            for key, value in (("Parameter Value[Column type]", "HILIC"),
+                               ("Parameter Value[Column type]", "BEH Amide HILIC"), ("Mode", "HILIC Positive")):
+                with self.subTest(last=last, key=key, value=value):
+                    coverage = self.lease_then_judge([raw for _sample, raw in rows], rows, "HILIC",
+                                                     [{key: value} for _row in rows])
+                    self.assertEqual(("passed", 0), (coverage["status"], coverage["rows_of_another_unit"]))
+
+    def test_an_rp_sample_code_is_not_read_against_other_rows_hilic_attributes(self) -> None:
+        """Rows whose names state only RP are read by their names only where the names themselves state two
+        chromatographies: other rows' HILIC attributes, agreeing with a HILIC unit, never make RP_1 another unit's."""
+        rows = [("S1", "RP_1.raw"), ("S2", "C8_1.raw"), ("S3", "H_1.raw"), ("S4", "H_2.raw")]
+        values = [{}, {}, {"Parameter Value[Column type]": "HILIC"}, {"Parameter Value[Column type]": "HILIC"}]
+        coverage = self.lease_then_judge([raw for _sample, raw in rows], rows, "HILIC", values)
+        self.assertEqual(("passed", 0), (coverage["status"], coverage["rows_of_another_unit"]))
+
+    def test_a_hilic_name_against_a_reversed_phase_attribute_still_states_hilic(self) -> None:
+        """An attribute outweighs only a name's RP, which may be a code: a name's HILIC is read as before."""
+        rows = [("A1", "A_1_C18neg.mzML"), ("A2", "A_2_C18neg.mzML"), ("B1", "B_1_HILICneg.mzML")]
+        values = [{"Column type": "C18"} for _row in rows]
+        coverage = self.lease_then_judge([raw for _sample, raw in rows], rows, "Reversed phase", values,
+                                         ion_mode="Negative")
+        self.assertEqual(("refused", 1, {"raw_file_states_another_chromatography"}),
+                         (coverage["status"], coverage["rows_of_another_unit"],
+                          {item["reason"] for item in coverage["rows_of_another_unit_listed"]}))
+
 
 if __name__ == "__main__":
     unittest.main()

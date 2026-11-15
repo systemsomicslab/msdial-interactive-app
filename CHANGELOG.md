@@ -25,7 +25,12 @@ paths that passed short admissions; both are closed here.
       `Chromatography ion mode`, `Scan polarity`, `Ionization mode`, `Column type` and the like, an ISA
       `Parameter Value[...]` unwrapped (ST004606's rows state nothing by name and say `HILIC POS` or `RP NEG`; ST002796's
       say `C18 Negative`); `both`, `alternating`, `switching` or `mixed` states no polarity
-      (`row_attribute_states_another_polarity`, `row_attribute_states_another_chromatography`). A sample id's polarity
+      (`row_attribute_states_another_polarity`, `row_attribute_states_another_chromatography`). A row's chromatography
+      attribute outweighs a name that states only RP, which may be a sample's code: a HILIC unit whose every row says
+      `Column type` HILIC passes with files `RP_1.raw`, `C8_1.raw` or `P1_C18_1.raw`. Two chromatographies are read
+      by the kind of statement that states both, names' two for rows read by name and attributes' two for rows read
+      by attribute, so other rows' HILIC attributes never read a name's RP. A name's HILIC is read before any
+      attribute. A sample id's polarity
       counts only where the names and attributes state none, a glued run number (`b1_neg1`) only for a row that names
       no file of its own.
     - A blank row is no analytical row. Blanks and QCs are read by whole tokens as well (`Bk_1`, `BK1`, `Blk_01`,
