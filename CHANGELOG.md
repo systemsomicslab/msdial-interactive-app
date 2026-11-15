@@ -4,6 +4,50 @@ Notable changes to MS-DIAL Interactive. The package version is kept in
 `pyproject.toml` and `msdial_app/__init__.py`; the Agent API version is separate.
 Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
 
+## [0.5.66] - Unreleased
+
+### Changed
+- **A campaign unit keeps its automatic alignment RT correction map, and a viewing restore puts it back.**
+  - Why: since MsdialWorkbench#884 the Console writes `AlignResult-<ts>.rtcorrection.tsv` beside the
+    alignment result whenever the automatic alignment RT correction ran. It holds the maps the alignment was
+    made with, and the MS-DIAL GUI reads it from beside the `.arf2` to move RTs between each file's measured
+    axis and the reference file's axis in its curation windows. Finalisation moved the alignment's other
+    containers out of the raw tree but not this file, so it was deleted with the raw data, and a reopened
+    project fell back to each peak's stored bounds.
+  - Now finalisation moves it into `output/msdial-intermediates/` with the rest of the alignment set,
+    inventories it as an `msdial_intermediate`, and `msdial_restore_project_for_viewing` copies it back beside
+    the `.arf2` (and its undo removes it) like every other moved container. A run without the correction
+    writes no map, and nothing changes for it. A laboratory or trial run leaves it beside its inputs, as it
+    leaves the other containers.
+- **The merged lipidome says which RT axis each polarity's rows are on.**
+  - Why: since #884 a Console run whose alignment the automatic RT correction moved onto a reference file's
+    axis writes a note in the first cell of its alignment exports' first line ("RT axis: aligned RTs are on
+    the RT axis of reference file ..."), appends `rt_original_min` to `.mdprovenance.tsv`, and adds one
+    `custom[n]` line to the mzTab-M. Interactive reads all three as before: every alignment export reader
+    finds the samples from the `Class` label, the provenance table has no reader here, and the mzTab-M
+    redaction numbers its own `custom[n]` after the highest. But `msdial_lipidomics_merge` reads the
+    matrices Console `normalize` wrote afterwards, copied into `quant\`, and those carry no note and have
+    no correction audit beside them. So the merged lipidome said nothing of either polarity's axis, and
+    0.5.65's CONF-54 offset warning (`polarity_rt_axes`), which looks for
+    `automatic_alignment_rt_correction_summary.tsv` beside the export it is given, always reported that
+    neither export had an audit beside it.
+  - Now the normalize record keeps the run's own Height export (`run_height_export`), and the merge reads
+    each polarity's axis from it (`merge_pos_neg(..., rt_axis_sources=...)`): the note in its first line,
+    and the correction audit in its run folder. When either polarity carries a note, the first cell of the
+    merged table and of its not-quantified side table names both, as `Positive rows: ... | Negative rows:
+    ...`. A polarity without a note is described as "its run's alignment export carries no RT axis note",
+    because a Console before #884 corrected RTs without writing one. The merge report records the sources,
+    the notes and the header note under `rt_axis`. Exports without a note merge to the same bytes as before.
+  - The record also keeps the sha256 of that export and of the audit summary beside it (or that there was
+    none), and the merge refuses when either changed since normalize, as it refuses a changed candidate
+    table: a polarity run again into its folder replaces the audit but leaves the earlier run's
+    timestamped exports, and the merged note would then name one run's axis while the report named
+    another's.
+  - A polarity whose run export cannot be read, or whose normalize was recorded before 0.5.66 and names
+    none, is not taken for one without a note: its axis is "not known" in the merged note (when the other
+    polarity has one), in `rt_axis.unread`, in a warning, and in the CONF-54 sentence, which then says the
+    audit was not looked for.
+
 ## [0.5.65] - Unreleased
 
 Follow-ups to 0.5.64's anchor preview and approval, from a multi-agent review of the automatic alignment RT

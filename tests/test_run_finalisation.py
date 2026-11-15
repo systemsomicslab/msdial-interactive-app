@@ -55,7 +55,8 @@ CURRENT = "20269271740"
 EARLIER = "20269261728"
 DIAGNOSTIC = "2026925025"
 SIBLING = "20269271814"
-ALIGNMENT_SUFFIXES = (".arf2", ".dcl", ".EIC.aef", "_PeakProperties.arf", "_DriftSopts.arf", "_tags.xml")
+ALIGNMENT_SUFFIXES = (".arf2", ".dcl", ".EIC.aef", "_PeakProperties.arf", "_DriftSopts.arf", "_tags.xml",
+                      ".rtcorrection.tsv")
 PRIVATE = "E:\\lab libs\\Synthetic-Private-pos.msp"  # synthetic; nothing is read from it
 CROSSING = {
     "schema": "msdial-campaign-authorization.v1", "approval_id": "approval-syn", "campaign_id": "campaign-syn",

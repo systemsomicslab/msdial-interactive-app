@@ -21,7 +21,10 @@ THREE THINGS, decided by the user on 2026-09-30 for the unattended repository ca
    CSV's file_name: ``<file_name>_<ts>.dcl``, ``.pai2`` (MessagePackHandler appends the version to ``.pai``),
    ``.rtc``, ``.sfs``, ``_tags.xml`` and ``<file_name>_<ts>_<CE x 100>.dcl`` for an AIF run's per-energy
    deconvolution; in the first input's directory, ``AlignResult-<ts>.arf2``, ``.dcl``, ``.EIC.aef``,
-   ``_PeakProperties.arf``, ``_DriftSopts.arf`` and ``_tags.xml``. ``<ts>`` is ``yyyyMdHm`` with no zero padding,
+   ``_PeakProperties.arf``, ``_DriftSopts.arf``, ``_tags.xml`` and, when the automatic alignment RT correction
+   ran, ``.rtcorrection.tsv`` (MsdialWorkbench#884: the maps the alignment was made with, which the GUI reads
+   beside the alignment to move RTs between each file's axis and the reference's; without it a reopened
+   project's curation falls back to each peak's stored bounds). ``<ts>`` is ``yyyyMdHm`` with no zero padding,
    so it cannot be parsed back into a time, and every earlier attempt - a failed run, a peak-count
    diagnostic - left a set of its own. The finalised run's set is the one whose timestamp its mzTab-M carries
    (``AlignResult-<ts>.mzTab``), else, per input, the newest; it moves to ``output/msdial-intermediates/``
@@ -145,7 +148,8 @@ PER_FILE_SUFFIX = re.compile(
 )
 ALIGNMENT_FILE = re.compile(
     r"AlignResult-" + _TIMESTAMP
-    + r"(?P<suffix>(?:_\d+)?\.dcl|\.arf2?|\.EIC\.aef|_PeakProperties\.arf2?|_DriftSopts\.arf2?|_tags\.xml)",
+    + r"(?P<suffix>(?:_\d+)?\.dcl|\.arf2?|\.EIC\.aef|_PeakProperties\.arf2?|_DriftSopts\.arf2?|_tags\.xml"
+    + r"|\.rtcorrection\.tsv)",
     re.IGNORECASE,
 )
 ALIGNMENT_EXPORT = re.compile(r"AlignResult-" + _TIMESTAMP + r"\.mztab", re.IGNORECASE)
@@ -163,7 +167,8 @@ PROJECT_REOPEN = {
     "references": (
         "The .mdproject names the output directory and the .mddata. The .mddata names every input by its "
         "absolute raw path, the per-file .dcl/.pai2 and the alignment .arf2/.dcl/.EIC.aef by their absolute "
-        "paths beside the inputs, and the project loader reads the libraries back from "
+        "paths beside the inputs, the GUI reads an automatically RT-corrected alignment's maps from "
+        "<alignment>.rtcorrection.tsv beside the .arf2, and the project loader reads the libraries back from "
         "<project>_Loaded.msp2 and <project>_Loaded.msp2.dbs."
     ),
     "restore": (
