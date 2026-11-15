@@ -12,6 +12,7 @@ import asyncio
 import io
 import json
 import re
+import struct
 import tempfile
 import threading
 import time
@@ -32,12 +33,21 @@ from msdial_app.remote_archive import (
 
 class _Archive:
     def __init__(self, body: bytes, *, ranges: bool = True, etag: str = '"v1"', last_modified: str = "",
-                 delay: float = 0.0) -> None:
+                 delay: float = 0.0, content_type: str = "application/zip", honour_if_range: bool = True,
+                 short_suffix: bool = False, trickle: float = 0.0, trickle_headers: float = 0.0) -> None:
         self.body = body
         self.ranges = ranges
         self.etag = etag
         self.last_modified = last_modified
         self.delay = delay
+        self.content_type = content_type
+        # False: a server that ignores If-Range and answers every Range request with a range.
+        self.honour_if_range = honour_if_range
+        # True: a suffix range answered with a range that stops one byte short of the end.
+        self.short_suffix = short_suffix
+        # Seconds between 64-byte pieces of the body, or between padding header lines: a trickling server.
+        self.trickle = trickle
+        self.trickle_headers = trickle_headers
         # Served instead of body from the second request on: the archive replaced while it was being listed.
         self.replacement: tuple[bytes, str] | None = None
         self.served = 0
@@ -74,12 +84,16 @@ class _Handler(BaseHTTPRequestHandler):
         total = len(body)
         requested = self.headers.get("Range")
         if_range = self.headers.get("If-Range")
-        partial = archive.ranges and requested and (if_range is None or if_range == etag)
+        partial = archive.ranges and requested and (
+            if_range is None or if_range == etag or not archive.honour_if_range
+        )
         if partial:
             match = re.match(r"bytes=(\d*)-(\d*)$", requested)
             first_text, last_text = match.group(1), match.group(2)
             if first_text == "":
                 first, last = max(0, total - int(last_text)), total - 1
+                if archive.short_suffix:
+                    last -= 1
             else:
                 first = int(first_text)
                 last = min(total - 1, int(last_text)) if last_text else total - 1
@@ -90,19 +104,28 @@ class _Handler(BaseHTTPRequestHandler):
             piece = body
             self.send_response(200)
         entry["status"] = 206 if partial else 200
-        if etag:
-            self.send_header("ETag", etag)
-        if archive.last_modified:
-            self.send_header("Last-Modified", archive.last_modified)
-        if archive.ranges:
-            self.send_header("Accept-Ranges", "bytes")
-        self.send_header("Content-Type", "application/zip")
-        self.send_header("Content-Length", str(len(piece)))
-        self.end_headers()
         try:
-            for start in range(0, len(piece), 65536):
-                self.wfile.write(piece[start:start + 65536])
-                entry["sent"] += len(piece[start:start + 65536])
+            if etag:
+                self.send_header("ETag", etag)
+            if archive.last_modified:
+                self.send_header("Last-Modified", archive.last_modified)
+            if archive.ranges:
+                self.send_header("Accept-Ranges", "bytes")
+            self.send_header("Content-Type", archive.content_type)
+            self.send_header("Content-Length", str(len(piece)))
+            if archive.trickle_headers:
+                for index in range(90):
+                    self.send_header(f"X-Padding-{index}", "x")
+                    self.flush_headers()
+                    time.sleep(archive.trickle_headers)
+            self.end_headers()
+            step = 64 if archive.trickle else 65536
+            for start in range(0, len(piece), step):
+                self.wfile.write(piece[start:start + step])
+                if archive.trickle:
+                    self.wfile.flush()
+                    time.sleep(archive.trickle)
+                entry["sent"] += len(piece[start:start + step])
         except (ConnectionError, OSError):
             pass
 
@@ -151,6 +174,15 @@ def _zip64(members: list[tuple[str, bytes]]) -> bytes:
                 with archive.open(zipfile.ZipInfo(name, (2024, 1, 2, 3, 4, 6)), "w", force_zip64=True) as handle:
                     handle.write(data)
     return buffer.getvalue()
+
+
+def _eocd_at(body: bytes) -> int:
+    return body.rfind(b"PK")
+
+
+def _patched(body: bytes, offset: int, fmt: str, *values: int) -> bytes:
+    patch_bytes = struct.pack(fmt, *values)
+    return body[:offset] + patch_bytes + body[offset + len(patch_bytes):]
 
 
 def _unit_members() -> list[tuple[str, bytes]]:
@@ -283,6 +315,55 @@ class RemoteZipListingTest(unittest.TestCase):
         self.assertEqual(["HILIC_NEGATIVE/SA_02_HILICneg.mzML", "RPLC_NEGATIVE/SA_02_RPLCneg.mzML"],
                          groups[0]["paths"])
 
+    def test_exactly_65535_entries_without_zip64_records(self) -> None:
+        # CPython's zipfile writes ZIP64 end records only above 65,535 entries; at exactly 65,535 the plain end
+        # record carries 0xFFFF as the real count and no locator precedes it.
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_STORED) as archive:
+            for index in range(65_535):
+                archive.writestr(zipfile.ZipInfo(f"{index:04x}", (2023, 3, 18, 11, 32, 4)), b"")
+        body = buffer.getvalue()
+        self.assertNotIn(b"PK\x06\x07", body)
+        self.assertEqual(0xFFFF, struct.unpack_from("<H", body, _eocd_at(body) + 10)[0])
+        with _Server() as server:
+            listing = list_remote_zip(server.add("many.zip", _Archive(body)), max_bytes=4 * 1024 * 1024)
+        self.assertFalse(listing["zip64"])
+        self.assertEqual(65_535, listing["entry_count"])
+        self.assertEqual(_expected(body), _observed(listing))
+
+    def test_a_zip64_end_record_with_extensible_data_is_found_at_its_recorded_offset(self) -> None:
+        members = [(f"RP_POS/sample_{index}.mzML", (b"zip64 member %d " % index) * 200) for index in range(4)]
+        original = _zip64(members)
+        record = original.rfind(b"PK\x06\x06")
+        self.assertEqual(44, struct.unpack_from("<Q", original, record + 4)[0])
+        # 40 bytes of extensible data after the fixed record: the locator no longer sits 56 bytes after it.
+        body = (original[:record] + b"PK\x06\x06" + struct.pack("<Q", 44 + 40) + original[record + 12:record + 56]
+                + b"\xAB" * 40 + original[record + 56:])
+        with _Server() as server:
+            listing = list_remote_zip(server.add("z64x.zip", _Archive(body)))
+        self.assertTrue(listing["zip64"])
+        self.assertEqual(_expected(original), _observed(listing))
+        self.assertEqual(0, listing["provenance"]["prefix_bytes"])
+
+    def test_an_info_zip_unicode_path_extra_names_a_cp437_member_while_its_crc_matches(self) -> None:
+        import zlib
+        raw, unicode_name = b"Lipids/s_rum_01.mzML", "Lipids/s\u00e9rum_01.mzML".encode("utf-8")
+        fresh = zipfile.ZipInfo(raw.decode("ascii"), (2023, 3, 18, 11, 32, 4))
+        fresh.extra = struct.pack("<HHBI", 0x7075, 5 + len(unicode_name), 1, zlib.crc32(raw)) + unicode_name
+        # A stale extra (its CRC is of another name, as after a rename by a tool that ignored it) is not used.
+        stale = zipfile.ZipInfo("QC/renamed_01.mzML", (2023, 3, 18, 11, 32, 4))
+        stale.extra = struct.pack("<HHBI", 0x7075, 5 + len(unicode_name), 1, zlib.crc32(b"other")) + unicode_name
+        buffer = io.BytesIO()
+        with zipfile.ZipFile(buffer, "w") as archive:
+            archive.writestr(fresh, b"x" * 100)
+            archive.writestr(stale, b"y" * 100)
+        with _Server() as server:
+            listing = list_remote_zip(server.add("u.zip", _Archive(buffer.getvalue())))
+        self.assertEqual(
+            [("Lipids/s\u00e9rum_01.mzML", "unicode_path_extra"), ("QC/renamed_01.mzML", "cp437")],
+            [(member["path"], member["name_encoding"]) for member in listing["members"]],
+        )
+
 
 class RemoteZipRefusalTest(unittest.TestCase):
     def _refused(self, url: str, **options) -> RemoteArchiveError:
@@ -343,6 +424,22 @@ class RemoteZipRefusalTest(unittest.TestCase):
         self.assertEqual("changed_during_listing", error.reason)
         self.assertEqual([206, 200], [entry["status"] for entry in log])
 
+    def test_a_same_size_replacement_with_a_new_etag_is_caught_when_if_range_is_ignored(self) -> None:
+        import random
+        members = [(f"study/folder/d_{index:04d}.bin", random.Random(index).randbytes(2_000)) for index in range(300)]
+        body = _zip(members, method=zipfile.ZIP_STORED)
+        replaced = body[:1000] + bytes([body[1000] ^ 0xFF]) + body[1001:]
+        self.assertEqual(len(body), len(replaced))
+        with _Server() as server:
+            archive = _Archive(body, honour_if_range=False)
+            archive.replacement = (replaced, '"v2"')
+            error = self._refused(server.add("same-size.zip", archive))
+            log = list(server.log)
+        self.assertEqual("changed_during_listing", error.reason)
+        # The server answered both requests with ranges; only the ETag tells the two versions apart.
+        self.assertEqual([206, 206], [entry["status"] for entry in log])
+        self.assertIn('"v2"', error.detail)
+
     def test_without_a_validator_a_changed_size_is_still_caught(self) -> None:
         import random
         members = [(f"study/folder/d_{index:04d}.bin", random.Random(index).randbytes(2_000)) for index in range(300)]
@@ -357,6 +454,77 @@ class RemoteZipRefusalTest(unittest.TestCase):
         with _Server() as server:
             listing = list_remote_zip(server.add("a.zip", _Archive(_zip(_unit_members()), etag="")))
         self.assertTrue(any("ETag" in warning for warning in listing["warnings"]))
+
+    def test_a_sign_in_page_after_a_redirect_is_an_access_refusal_not_missing_range_support(self) -> None:
+        with _Server() as server:
+            server.add("login", _Archive(b"<html><form>Sign in</form></html>" * 1000, ranges=False,
+                                         content_type="text/html; charset=utf-8"))
+            base = f"http://127.0.0.1:{server.httpd.server_address[1]}"
+            redirected = self._refused(base + "/redirect/login")
+            direct = self._refused(base + "/login")
+            # An archive that is served whole after a redirect is still a missing-range refusal, and says so.
+            server.add("whole.zip", _Archive(_zip(_unit_members()), ranges=False))
+            whole = self._refused(base + "/redirect/whole.zip")
+        self.assertEqual("not_an_archive_response", redirected.reason)
+        self.assertEqual(0, redirected.provenance["bytes_fetched"])
+        self.assertTrue(redirected.provenance["final_url"].endswith("/login"))
+        self.assertIn("text/html", redirected.detail)
+        self.assertIn("redirect", redirected.detail)
+        self.assertEqual("text/html; charset=utf-8", redirected.provenance["requests"][0]["content_type"])
+        self.assertEqual("not_an_archive_response", direct.reason)
+        self.assertEqual("range_not_supported", whole.reason)
+        self.assertIn("after a redirect", whole.detail)
+
+    def test_a_trickled_body_is_cut_off_at_the_overall_deadline(self) -> None:
+        body = _zip(_unit_members(), method=zipfile.ZIP_STORED)
+        self.assertGreater(len(body), 64 * 20)
+        with _Server() as server:
+            url = server.add("trickle.zip", _Archive(body, trickle=0.3))
+            started = time.monotonic()
+            error = self._refused(url, timeout_seconds=1, deadline_seconds=2)
+            elapsed = time.monotonic() - started
+        self.assertEqual("timeout", error.reason)
+        self.assertIn("deadline", error.detail)
+        self.assertLess(elapsed, 4)
+        # What arrived before the cut is counted.
+        self.assertGreater(error.provenance["bytes_fetched"], 0)
+        self.assertLess(error.provenance["bytes_fetched"], len(body))
+
+    def test_trickled_headers_are_cut_off_at_the_overall_deadline(self) -> None:
+        with _Server() as server:
+            url = server.add("slow-headers.zip", _Archive(_zip(_unit_members()), trickle_headers=0.3))
+            started = time.monotonic()
+            error = self._refused(url, timeout_seconds=1, deadline_seconds=2)
+            elapsed = time.monotonic() - started
+        self.assertEqual("timeout", error.reason)
+        self.assertLess(elapsed, 4)
+        self.assertEqual(0, error.provenance["bytes_fetched"])
+
+    def test_a_suffix_range_that_stops_short_of_the_end_is_refused(self) -> None:
+        with _Server() as server:
+            error = self._refused(server.add("short.zip", _Archive(_zip(_unit_members()), short_suffix=True)))
+        self.assertEqual("unexpected_range", error.reason)
+
+    def test_an_end_record_whose_entry_count_the_directory_does_not_hold(self) -> None:
+        body = _zip(_unit_members())
+        eocd = _eocd_at(body)
+        count = struct.unpack_from("<H", body, eocd + 10)[0]
+        with _Server() as server:
+            error = self._refused(server.add("count.zip", _Archive(_patched(body, eocd + 8, "<HH", count + 1,
+                                                                           count + 1))))
+        self.assertEqual("malformed_central_directory", error.reason)
+        self.assertIn(f"{count + 1:,} entries", error.detail)
+
+    def test_a_split_archive_is_refused_from_its_end_record_or_its_zip64_locator(self) -> None:
+        body = _zip(_unit_members())
+        split_eocd = _patched(body, _eocd_at(body) + 4, "<H", 1)
+        zip64_body = _zip64([(f"RP_POS/sample_{index}.mzML", b"m" * 300) for index in range(3)])
+        locator = zip64_body.rfind(b"PK\x06\x07")
+        split_locator = _patched(zip64_body, locator + 16, "<I", 2)
+        with _Server() as server:
+            from_eocd = self._refused(server.add("split1.zip", _Archive(split_eocd)))
+            from_locator = self._refused(server.add("split2.zip", _Archive(split_locator)))
+        self.assertEqual(("multi_disk", "multi_disk"), (from_eocd.reason, from_locator.reason))
 
     def test_a_file_that_is_not_a_zip(self) -> None:
         with _Server() as server:
@@ -381,6 +549,18 @@ class RemoteZipRefusalTest(unittest.TestCase):
             self.assertEqual("unsupported_url", self._refused(url).reason, url)
         for cap in (0, 10, 64 * 1024 * 1024, "lots"):
             self.assertEqual("invalid_argument", self._refused("https://example.org/a.zip", max_bytes=cap).reason)
+        for options in ({"timeout_seconds": "slow"}, {"deadline_seconds": 0}, {"deadline_seconds": None}):
+            self.assertEqual("invalid_argument", self._refused("https://example.org/a.zip", **options).reason)
+        # A declared size from repository metadata that is not a number is refused before any request.
+        body = _zip(_unit_members())
+        with _Server() as server:
+            url = server.add("a.zip", _Archive(body))
+            for declared in ("unknown", -5, "8.5 GB"):
+                self.assertEqual("invalid_argument", self._refused(url, expected_size_bytes=declared).reason)
+            log = list(server.log)
+            listing = list_remote_zip(url, expected_size_bytes=" %d " % len(body))
+        self.assertEqual([], log)
+        self.assertEqual([], listing["warnings"])
         self.assertEqual(512 * 1024, DEFAULT_MAX_BYTES)
 
 

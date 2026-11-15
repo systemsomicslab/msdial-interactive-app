@@ -2615,10 +2615,12 @@ def msdial_list_remote_archive(
     central directory bytes.
 
     Refused, with ``ok: false`` and a ``reason``: a server that does not answer Range requests with 206
-    (``range_not_supported``, its body unread), a listing that would fetch more than ``max_bytes``
-    (``byte_cap_exceeded``; default 512 KiB, at most 16 MiB), an archive that changed between requests
-    (``changed_during_listing``), a file that is not a zip (``not_a_zip``), a split zip (``multi_disk``), a
-    malformed directory, a timeout, and any URL that is not http or https. ``expected_size_bytes`` (a size
+    (``range_not_supported``, its body unread), a sign-in, landing or error page answered in the archive's
+    place (``not_an_archive_response``: an access problem, not missing range support), a listing that would
+    fetch more than ``max_bytes`` (``byte_cap_exceeded``; default 512 KiB, at most 16 MiB), an archive that
+    changed between requests (``changed_during_listing``), a file that is not a zip (``not_a_zip``), a split
+    zip (``multi_disk``), a malformed directory, a timeout (``timeout_seconds`` per socket operation, and 120 s
+    for the whole listing, enforced while headers and bodies arrive), and any URL that is not http or https. ``expected_size_bytes`` (a size
     the repository or the Catalog declared) adds a warning when the served archive differs. ``member_limit``
     bounds the members in this reply; the counts, groups and ``output_path`` cover all of them.
     """

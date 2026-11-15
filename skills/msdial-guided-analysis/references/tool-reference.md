@@ -427,7 +427,10 @@ For an accession-to-mzTab-M workflow, prefer the higher-level repository tools:
   byte-identical files (same CRC32 and size), records the URL, each request,
   the bytes fetched, ETag, Last-Modified and the directory's SHA-256, and
   refuses a server without Range support (`range_not_supported`) or a listing
-  beyond `max_bytes` (default 512 KiB) without reading more.
+  beyond `max_bytes` (default 512 KiB) without reading more. A sign-in or
+  landing page served instead is `not_an_archive_response` (an access problem;
+  do not fall back to a full download), and a listing past its 120 s deadline
+  is `timeout`.
 - `msdial_restore_project_for_viewing`: preview with `confirmed=false`, then,
   after the user approves, make a finalised campaign unit's MS-DIAL project
   openable for viewing: its retained containers are copied back to the paths

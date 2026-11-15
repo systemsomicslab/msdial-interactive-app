@@ -13,17 +13,21 @@ the first carries If-Range with the first answer's validator, and every answer m
 so a listing is never stitched together from two versions of the archive.
 
 What it refuses, without reading a body it did not ask for: a server that answers a Range request with the
-whole file (200), any other status, a total over no Range answer, a byte count beyond the cap, a split
-(multi-disk) archive, a directory whose entries do not parse to the count the EOCD declares, and any scheme
-other than http and https. Nothing is written anywhere; the listing is returned.
+whole file (200), a sign-in or landing page served in its place, any other status, a byte count beyond the
+cap, a split (multi-disk) archive, a directory whose entries do not parse to the count the EOCD declares, a
+listing that runs past its overall deadline (a watchdog shuts the connection, so a server trickling headers or
+body bytes cannot hold it), and any scheme other than http and https. Nothing is written anywhere; the listing
+is returned.
 """
 
 from __future__ import annotations
 
 import hashlib
+import http.client
 import re
 import socket
 import struct
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -107,6 +111,93 @@ def _dos_datetime(date: int, time_value: int) -> str:
 
 
 _CONTENT_RANGE = re.compile(r"^\s*bytes\s+(\d+)-(\d+)/(\d+|\*)\s*$", re.IGNORECASE)
+# Bodies are read in pieces of this size, and the deadline is checked after each.
+READ_CHUNK_BYTES = 64 * 1024
+# A Content-Type naming a page or a document, not an archive: what a sign-in, landing or error page is served as.
+_PAGE_CONTENT_TYPE = re.compile(r"^\s*(text/|application/(xhtml\+xml|json|xml|problem\+json)\b)", re.IGNORECASE)
+
+
+class _Watchdog:
+    """Shuts the sockets of the request in flight when the overall deadline passes.
+
+    urlopen's timeout bounds each socket operation, not the request: a server that sends a header line or a few
+    body bytes inside every timeout would hold a listing for as long as it liked. Shutting the socket ends the
+    blocked read at once (the read sees end of stream), and the caller then refuses with reason timeout.
+    """
+
+    def __init__(self, seconds: float) -> None:
+        self.fired = False
+        self._sockets: list[Any] = []
+        self._lock = threading.Lock()
+        self._timer = threading.Timer(max(0.0, seconds), self._fire)
+        self._timer.daemon = True
+
+    def watch(self, sock: Any) -> None:
+        if sock is None:
+            return
+        with self._lock:
+            self._sockets.append(sock)
+            fired = self.fired
+        if fired:
+            self._shut(sock)
+
+    @staticmethod
+    def _shut(sock: Any) -> None:
+        try:
+            # The plain socket's shutdown, also for a TLS socket: the TLS layer then reads end of stream.
+            socket.socket.shutdown(sock, socket.SHUT_RDWR)
+        except (OSError, ValueError, TypeError):
+            pass
+
+    def _fire(self) -> None:
+        with self._lock:
+            self.fired = True
+            sockets = list(self._sockets)
+        for sock in sockets:
+            self._shut(sock)
+
+    def __enter__(self) -> "_Watchdog":
+        self._timer.start()
+        return self
+
+    def __exit__(self, *exc: Any) -> None:
+        self._timer.cancel()
+
+
+def _watched_connection(connection_class: Any, reader: "_RangeReader") -> Any:
+    """A connection factory for urllib's do_open that hands each connected socket to the reader's watchdog."""
+
+    def factory(host: str, **kwargs: Any) -> Any:
+        connection = connection_class(host, **kwargs)
+        connect = connection.connect
+
+        def connect_and_watch() -> None:
+            connect()
+            reader._watch(connection.sock)
+
+        connection.connect = connect_and_watch
+        return connection
+
+    return factory
+
+
+def _opener(reader: "_RangeReader") -> urllib.request.OpenerDirector:
+    class _HTTPHandler(urllib.request.HTTPHandler):
+        def http_open(self, req):  # urllib's signature
+            return self.do_open(_watched_connection(http.client.HTTPConnection, reader), req)
+
+    handlers: list[Any] = [_HTTPHandler()]
+    if hasattr(http.client, "HTTPSConnection"):
+
+        class _HTTPSHandler(urllib.request.HTTPSHandler):
+            def https_open(self, req):  # urllib's signature
+                options: dict[str, Any] = {"context": self._context}
+                if hasattr(self, "_check_hostname"):  # Python 3.10 and 3.11
+                    options["check_hostname"] = self._check_hostname
+                return self.do_open(_watched_connection(http.client.HTTPSConnection, reader), req, **options)
+
+        handlers.append(_HTTPSHandler())
+    return urllib.request.build_opener(*handlers)
 
 
 class _RangeReader:
@@ -135,6 +226,8 @@ class _RangeReader:
         self.last_modified = ""
         self.final_url = url
         self.accept_ranges = ""
+        self._watchdog: _Watchdog | None = None
+        self._open = _opener(self).open
 
     def provenance(self) -> dict[str, Any]:
         return {
@@ -153,6 +246,19 @@ class _RangeReader:
 
     def _refuse(self, reason: str, detail: str) -> RemoteArchiveError:
         return RemoteArchiveError(reason, detail, provenance=self.provenance())
+
+    def _watch(self, sock: Any) -> None:
+        if self._watchdog is not None:
+            self._watchdog.watch(sock)
+
+    def _past_deadline(self, range_value: str, watchdog: _Watchdog) -> RemoteArchiveError | None:
+        if watchdog.fired or time.monotonic() >= self.deadline:
+            return self._refuse(
+                "timeout",
+                f"The listing ran past its overall deadline while {range_value} was being answered; the "
+                "connection was shut and nothing more was read.",
+            )
+        return None
 
     def _validator(self) -> str:
         # If-Range takes a strong entity tag or an HTTP date; a weak tag cannot be used for it.
@@ -179,8 +285,24 @@ class _RangeReader:
         request = urllib.request.Request(self.url, headers=headers, method="GET")
         record: dict[str, Any] = {"range": range_value, "status": None, "bytes": 0}
         self.requests.append(record)
+        with _Watchdog(remaining) as watchdog:
+            self._watchdog = watchdog
+            try:
+                return self._exchange(request, headers, range_value, expected, record, watchdog)
+            finally:
+                self._watchdog = None
+
+    def _exchange(
+        self,
+        request: urllib.request.Request,
+        headers: dict[str, str],
+        range_value: str,
+        expected: int | None,
+        record: dict[str, Any],
+        watchdog: _Watchdog,
+    ) -> tuple[int, int, bytes]:
         try:
-            response = urllib.request.urlopen(request, timeout=min(self.timeout, remaining))
+            response = self._open(request, timeout=min(self.timeout, max(0.001, self.deadline - time.monotonic())))
         except urllib.error.HTTPError as error:
             record["status"] = error.code
             error.close()
@@ -188,17 +310,38 @@ class _RangeReader:
                 raise self._refuse("range_not_satisfiable", f"The server refused the range {range_value} (416).")
             raise self._refuse("http_error", f"The server answered {error.code} {error.reason} for {range_value}.")
         except (socket.timeout, TimeoutError) as error:
-            raise self._refuse("timeout", f"No answer within {self.timeout:g} s for {range_value}: {error}.")
+            raise self._past_deadline(range_value, watchdog) or self._refuse(
+                "timeout", f"No answer within {self.timeout:g} s for {range_value}: {error}."
+            )
         except urllib.error.URLError as error:
+            late = self._past_deadline(range_value, watchdog)
+            if late is not None:
+                raise late
             if isinstance(error.reason, (socket.timeout, TimeoutError)):
                 raise self._refuse("timeout", f"No answer within {self.timeout:g} s for {range_value}.")
             raise self._refuse("connection_error", f"Could not reach the server: {error.reason}.")
+        except (http.client.HTTPException, OSError, ValueError) as error:
+            # Raised while the status line and headers were read (urlopen wraps only the sending in URLError).
+            raise self._past_deadline(range_value, watchdog) or self._refuse(
+                "connection_error", f"The answer to {range_value} could not be read: {type(error).__name__}: {error}."
+            )
         with response:
             status = response.status
             record["status"] = status
             self.final_url = response.geturl() or self.final_url
+            content_type = response.headers.get("Content-Type", "") or ""
             if status != 206:
-                # A 200 is the whole archive on its way: close it without reading a byte of the body.
+                # Whatever came instead of a range, close it without reading a byte of the body.
+                record["content_type"] = content_type
+                redirected = self.final_url != self.url
+                if _PAGE_CONTENT_TYPE.match(content_type):
+                    raise self._refuse(
+                        "not_an_archive_response",
+                        f"The server answered {status} with {content_type.strip()!r} instead of the archive"
+                        + (f", after a redirect to {self.final_url}" if redirected else "")
+                        + ": a sign-in, landing or error page, not a zip. Access to the archive is the problem, "
+                        "not range support. The body was not read.",
+                    )
                 if status == 200 and "If-Range" in headers:
                     raise self._refuse(
                         "changed_during_listing",
@@ -207,9 +350,10 @@ class _RangeReader:
                     )
                 raise self._refuse(
                     "range_not_supported",
-                    f"The server answered {status} instead of 206 Partial Content to {range_value}: it does not "
-                    "serve byte ranges for this URL, so the central directory cannot be read without downloading "
-                    "the archive. The body was not read.",
+                    f"The server answered {status} instead of 206 Partial Content to {range_value}"
+                    + (f" (after a redirect to {self.final_url})" if redirected else "")
+                    + ": it does not serve byte ranges for this URL, so the central directory cannot be read "
+                    "without downloading the archive. The body was not read.",
                 )
             match = _CONTENT_RANGE.match(response.headers.get("Content-Range", ""))
             if not match or match.group(3) == "*":
@@ -245,12 +389,34 @@ class _RangeReader:
                     f"The server offered {length:,} bytes, which would pass the cap of {self.max_bytes:,}. The body "
                     "was not read.",
                 )
-            try:
-                body = response.read(length + 1)
-            except (socket.timeout, TimeoutError):
-                raise self._refuse("timeout", f"The body of {range_value} did not arrive within {self.timeout:g} s.")
-        record["bytes"] = len(body)
-        self.bytes_fetched += len(body)
+            pieces: list[bytes] = []
+            received = 0
+            # read1 returns what one socket read brings, so a trickled body is counted as it arrives and the
+            # deadline is checked between pieces. One byte past the promised length notices a server sending more.
+            read_piece = getattr(response, "read1", None) or response.read
+            while received < length + 1:
+                try:
+                    piece = read_piece(min(READ_CHUNK_BYTES, length + 1 - received))
+                except (socket.timeout, TimeoutError):
+                    raise self._past_deadline(range_value, watchdog) or self._refuse(
+                        "timeout", f"The body of {range_value} stalled for more than {self.timeout:g} s."
+                    )
+                except (http.client.HTTPException, OSError, ValueError) as error:
+                    raise self._past_deadline(range_value, watchdog) or self._refuse(
+                        "connection_error",
+                        f"The body of {range_value} broke off after {received:,} bytes: {type(error).__name__}.",
+                    )
+                if piece:
+                    pieces.append(piece)
+                    received += len(piece)
+                    record["bytes"] += len(piece)
+                    self.bytes_fetched += len(piece)
+                late = self._past_deadline(range_value, watchdog)
+                if late is not None:
+                    raise late
+                if not piece:
+                    break
+            body = b"".join(pieces)
         if len(body) != length:
             raise self._refuse(
                 "unexpected_range",
@@ -455,15 +621,31 @@ def list_remote_zip(
         raise RemoteArchiveError(
             "invalid_argument", f"max_bytes must lie between 1,024 and {HARD_MAX_BYTES:,}; {cap:,} was given."
         )
-    if not (0 < float(timeout_seconds) <= 300) or not (0 < float(deadline_seconds) <= 900):
+    try:
+        timeout_value, deadline_value = float(timeout_seconds), float(deadline_seconds)
+    except (TypeError, ValueError):
+        timeout_value = deadline_value = float("nan")
+    if not (0 < timeout_value <= 300) or not (0 < deadline_value <= 900):
         raise RemoteArchiveError(
             "invalid_argument", "timeout_seconds must lie in (0, 300] and deadline_seconds in (0, 900]."
         )
+    # A declared size is checked here, before any request, so a bad one is refused rather than raised late.
+    declared_size: int | None = None
+    if expected_size_bytes not in (None, ""):
+        try:
+            declared_size = int(str(expected_size_bytes).strip())
+        except (TypeError, ValueError):
+            declared_size = -1
+        if declared_size < 0:
+            raise RemoteArchiveError(
+                "invalid_argument",
+                f"expected_size_bytes must be a whole number of bytes or empty, not {expected_size_bytes!r}.",
+            )
     reader = _RangeReader(
         text,
         max_bytes=cap,
-        timeout=float(timeout_seconds),
-        deadline_seconds=float(deadline_seconds),
+        timeout=timeout_value,
+        deadline_seconds=deadline_value,
         user_agent=user_agent,
     )
     started_at = _utc_now()
@@ -534,11 +716,9 @@ def list_remote_zip(
             directory_offset,
         ) = struct.unpack_from("<QHHIIQQQQ", record, 4)
         directory_end = zip64_offset
-    elif 0xFFFF in (disk_entries, entries) or 0xFFFFFFFF in (directory_size, directory_offset):
-        raise reader._refuse(
-            "malformed_archive",
-            "The end record defers to ZIP64 values but no ZIP64 locator precedes it.",
-        )
+    # Without a ZIP64 locator, 0xFFFF and 0xFFFFFFFF in the end record are the values themselves: CPython's
+    # zipfile writes a plain end record for exactly 65,535 entries. The directory's fit and its parsed entry
+    # count below decide whether they are.
     if disk_number != 0 or directory_disk != 0 or disk_entries != entries:
         raise reader._refuse("multi_disk", "The archive is split across disks (a multi-part zip).")
 
@@ -549,7 +729,12 @@ def list_remote_zip(
         raise reader._refuse(
             "malformed_archive",
             f"The central directory ({directory_size:,} bytes at offset {directory_offset:,}) does not fit "
-            f"before the end record at {directory_end:,}.",
+            f"before the end record at {directory_end:,}."
+            + (
+                " The end record holds 0xFFFFFFFF, the ZIP64 placeholder, but no ZIP64 locator precedes it."
+                if not zip64 and 0xFFFFFFFF in (directory_size, directory_offset)
+                else ""
+            ),
         )
     directory_start = directory_offset + prefix
     if reader.start is not None and directory_start < reader.start:
@@ -566,9 +751,9 @@ def list_remote_zip(
 
     files = [member for member in members if not member["is_dir"]]
     warnings: list[str] = []
-    if expected_size_bytes not in (None, "") and int(expected_size_bytes) != total:
+    if declared_size is not None and declared_size != total:
         warnings.append(
-            f"The server's archive is {total:,} bytes and {int(expected_size_bytes):,} were declared for it; the "
+            f"The server's archive is {total:,} bytes and {declared_size:,} were declared for it; the "
             "listing describes the archive served now."
         )
     if prefix:

@@ -27,10 +27,21 @@ pull request.)
     the served archive differs from a declared size: the Catalog declares 8,482,560,409 bytes for
     ST002798_rawdata.zip, and the server sends 8,486,399,643 with the declared MD5.
   - Refused, with a reason and without reading a body it did not ask for: a 200 answer to a Range request
-    (`range_not_supported`), a fetch that would pass `max_bytes` (`byte_cap_exceeded`; 512 KiB by default, at
-    most 16 MiB, checked before each request), an archive that changes between requests
-    (`changed_during_listing`), a file with no end record (`not_a_zip`), a malformed directory, an HTTP error,
-    a timeout (per request and overall), and any scheme other than http and https.
+    (`range_not_supported`), a sign-in, landing or error page served in the archive's place, recognised by
+    its Content-Type and named with the URL it was redirected to (`not_an_archive_response`: the problem is
+    access, and a full download is no way round it), a fetch that would pass `max_bytes`
+    (`byte_cap_exceeded`; 512 KiB by default, at most 16 MiB, checked before each request), an archive that
+    changes between requests (`changed_during_listing`), a file with no end record (`not_a_zip`), a split
+    archive (`multi_disk`), a malformed directory, an HTTP error, a timeout, a non-numeric
+    `expected_size_bytes` or timeout (`invalid_argument`, before any request), and any scheme other than
+    http and https.
+  - The timeout holds per socket operation (`timeout_seconds`) and for the whole listing
+    (`deadline_seconds`, 120 s): a watchdog shuts the connection when the deadline passes, so a server that
+    trickles header lines or body bytes inside every per-operation timeout cannot hold the listing. Bodies
+    are read piece by piece and what arrived before the cut is counted in the provenance.
+  - An end record without a ZIP64 locator is read at face value: CPython's zipfile writes a plain end record
+    holding 0xFFFF for an archive of exactly 65,535 entries, and the directory's fit and its parsed entry count
+    decide whether the values hold.
   - The MCP tool adds `identical_content_groups` (files with one CRC32 and size under two or more paths),
     bounds the members in its reply with `member_limit`, and writes the full listing only to a new absolute
     `.json` `output_path`. Nothing else is written.
