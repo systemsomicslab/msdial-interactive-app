@@ -975,7 +975,11 @@ class AUnitOfFilesRecordsWhatItAlwaysDid(_Workspace):
         )
         lease = create_download_lease(project, self.root, 10_000, client=_Client(payloads))
 
-        self.assertEqual({"lease_stages", "archive_extractions"}, set(lease) - self.LEGACY_KEYS)
+        # And the coverage gate's record (0.5.67), which every lease writes.
+        self.assertEqual({"lease_stages", "archive_extractions", "attribution_coverage"}, set(lease) - self.LEGACY_KEYS)
+        self.assertEqual(("passed", 2, 2), (lease["attribution_coverage"]["status"],
+                                            lease["attribution_coverage"]["declared_rows"],
+                                            lease["attribution_coverage"]["admitted_rows"]))
         self.assertEqual(set(), self.LEGACY_KEYS - set(lease))
         self.assertEqual([], lease["archive_extractions"])
         self.assertEqual(

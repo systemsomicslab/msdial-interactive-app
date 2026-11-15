@@ -2458,6 +2458,26 @@ def create_download_lease(
                     *(_file_key(value) for value in stands_for.values()),
                 },
             )
+        # THE COVERAGE GATE (the author's decision of 2026-11-15; repository_analysis_rows.attribution_coverage): how
+        # many of the unit's analytical sample rows of its own polarity this attribution gave an input, as the analysis
+        # CSV will pair them. Below ATTRIBUTION_COVERAGE_MINIMUM, or with no biological sample's row among them, the lease
+        # fails here, at the attribute stage, with the record: never a unit run on a fraction of its samples.
+        from .repository_analysis_rows import attribution_coverage
+
+        coverage = attribution_coverage(
+            {
+                "project": project.as_dict(),
+                "input_candidates": inputs,
+                "input_lineage": input_lineage,
+                "excluded_input_candidates": excluded_inputs,
+                "input_directory": str(data_root),
+                "raw_directory": str(raw_root),
+                "archive_extractions": archive_extractions,
+                **({"encoding_choices": encodings["records"]} if encodings["records"] else {}),
+            }
+        )
+        if coverage["status"] == "refused":
+            raise AttributionCoverageError(coverage)
         pruned: dict[str, Any] = {}
         if store_lease is not None:
             # Now that the unit's own files are known: the links to anything else the store's objects
@@ -2515,6 +2535,10 @@ def create_download_lease(
                 if paired_by_rule[SAMPLE_ID_MEMBER_STEM_PAIRING]
                 else {}
             ),
+            # The coverage gate's verdict (manifest.attribution_coverage holds the whole record).
+            attribution_coverage={
+                key: coverage.get(key) for key in ("status", "reason", "declared_rows", "admitted_rows", "ratio")
+            },
             **({"inferred_name_pairings": inferred} if inferred else {}),
             **({"unattributed_members": len(unattributed_inputs)} if unattributed_inputs else {}),
             # The samples the rule chose for among several encodings, and the files it left unused (encoding_rule).
@@ -2598,6 +2622,8 @@ def create_download_lease(
             manifest["execution_allowed"] = project.eligible
         if container_completeness["required"]:
             manifest["container_completeness"] = container_completeness
+        # The coverage gate's record, passed or not evaluated (a refused unit fails at the attribute stage with it).
+        manifest["attribution_coverage"] = coverage
         if inferred or name_pairings["refused"]:
             # Which declared raw file an archive member is, where a rule inferred it rather than an exact name:
             # the user decided on 2026-10-06 that such a pairing is always left on record. Only where one was
@@ -2963,6 +2989,15 @@ def _record_download_failure(
         # No other download of the same objects holds anything else: an exclusion, never a retry.
         record["download_failure"]["retryable"] = False
         record["download_failure"]["disposition"] = error.disposition()
+    if isinstance(error, AttributionCoverageError):
+        # The coverage gate refused the unit (2026-11-15): its reason code and record in the failure (less the per-input
+        # list, since the download job carries the failure verbatim), and the whole record beside it, where a passed
+        # unit's manifest carries it. A failure, not an exclusion: the campaign records it so.
+        record["download_failure"]["reason_code"] = str(error.coverage.get("reason") or "")
+        record["download_failure"]["attribution_coverage"] = {
+            key: value for key, value in error.coverage.items() if key != "inputs"
+        }
+        record["attribution_coverage"] = dict(error.coverage)
     try:
         error.download_failure = dict(record["download_failure"])  # type: ignore[attr-defined]
     except (AttributeError, TypeError):
@@ -13725,6 +13760,17 @@ def match_declared_inputs(
 DECLARED_INPUTS_UNSUPPORTED_FORMAT = "declared_inputs_unsupported_format"
 # How many of an archive's commonest suffixes the disposition names for it (the error's own text names five).
 DISPOSITION_SUFFIXES = 10
+
+
+class AttributionCoverageError(ValueError):
+    """The coverage gate refused a unit at its lease's attribute stage (repository_analysis_rows.attribution_coverage,
+    the author's decision of 2026-11-15): its attribution gave an input to fewer than the minimum share of its
+    analytical sample rows, or to no biological sample's row. ``coverage`` is the gate's record, which the failed
+    lease's manifest carries (download_failure.attribution_coverage) and the error's text summarises."""
+
+    def __init__(self, coverage: dict[str, Any]) -> None:
+        self.coverage = dict(coverage)
+        super().__init__(str(coverage.get("message") or coverage.get("reason") or "attribution coverage refused"))
 
 
 class DeclaredInputsUnsupportedError(ValueError):
