@@ -12193,8 +12193,18 @@ def _legacy_raw_file_name(raw_file: Any) -> str:
     return PurePosixPath(str(raw_file or "").strip().replace("\\", "/")).name
 
 
+# A chromatography glued to a polarity at a token's end, read for the chromatography only (verification of 0.5.67's
+# gate on stage3b): ST002796 names its reversed-phase runs A_01_C18neg.mzML and its folders C18neg/, which the compound
+# token above (hilic, rplc, rp) never read, so its RP and HILIC units each ran the other's files; ST003964 glues the
+# column into a longer token, ...xHILICneg_... and ...xRPneg_.... The distinctive columns (hilic, rplc, c18) are
+# read after any prefix; rp and c8, short enough to end an ordinary word, only alone or after a digit or an x.
+_GLUED_CHROMATOGRAPHY_TOKEN = re.compile(r"^(?P<prefix>[0-9a-z]*?)(?P<c>hilic|rplc|c18|c8|rp)(?:pos|neg|positive|negative)$")
+_GLUED_CHROMATOGRAPHY_ANY_PREFIX = frozenset({"hilic", "rplc", "c18"})
+
+
 def _chromatography_tokens(text: str) -> set[str]:
-    """The chromatographies the tokens of a text state (CHROMATOGRAPHY_NAME_TOKENS, and compounds such as RPPOS)."""
+    """The chromatographies the tokens of a text state (CHROMATOGRAPHY_NAME_TOKENS, compounds such as RPPOS, and a
+    column glued to a polarity at a token's end: C18neg, ...xHILICneg; _GLUED_CHROMATOGRAPHY_TOKEN)."""
     chromatographies: set[str] = set()
     for token in _name_tokens(text):
         if token in CHROMATOGRAPHY_NAME_TOKENS:
@@ -12203,6 +12213,12 @@ def _chromatography_tokens(text: str) -> set[str]:
         found = _COMPOUND_NAME_TOKEN.match(token)
         if found:
             chromatographies.add(CHROMATOGRAPHY_NAME_TOKENS[found.group("c1") or found.group("c2") or found.group("c3")])
+            continue
+        glued = _GLUED_CHROMATOGRAPHY_TOKEN.match(token)
+        if glued:
+            prefix, column = glued.group("prefix"), glued.group("c")
+            if column in _GLUED_CHROMATOGRAPHY_ANY_PREFIX or not prefix or prefix[-1].isdigit() or prefix[-1] == "x":
+                chromatographies.add(CHROMATOGRAPHY_NAME_TOKENS[column])
     return chromatographies
 
 

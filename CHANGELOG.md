@@ -21,8 +21,13 @@ paths that passed short admissions; both are closed here.
     - Another unit's row, listed with why (`rows_of_another_unit_listed`): a row whose names state only the other
       polarity by a token of their own; a joined cell all of whose names are another unit's; a row whose one name
       states another chromatography where the unit's rows state two (ST002330's `HILIC-RN1-neg.mzXML` beside
-      `C18-RN1-neg.mzXML`). A sample id's polarity counts only where the names state none, a glued run number
-      (`b1_neg1`) only for a row that names no file of its own.
+      `C18-RN1-neg.mzXML`). A row's own attribute of its mode counts where its names state none: `Mode`,
+      `Chromatography ion mode`, `Scan polarity`, `Ionization mode`, `Column type` and the like, an ISA
+      `Parameter Value[...]` unwrapped (ST004606's rows state nothing by name and say `HILIC POS` or `RP NEG`; ST002796's
+      say `C18 Negative`); `both`, `alternating`, `switching` or `mixed` states no polarity
+      (`row_attribute_states_another_polarity`, `row_attribute_states_another_chromatography`). A sample id's polarity
+      counts only where the names and attributes state none, a glued run number (`b1_neg1`) only for a row that names
+      no file of its own.
     - A blank row is no analytical row. Blanks and QCs are read by whole tokens as well (`Bk_1`, `BK1`, `Blk_01`,
       `QC01`, `IQC_…`, `Pool_3`, `NIST`, `SRM1950`), since ST002512's admitted `Neg_bk_1.raw` was typed Sample.
     - A row whose input the lease excluded for what it holds counts as admitted; `analysed_ratio` says how many ran.
@@ -34,16 +39,26 @@ paths that passed short admissions; both are closed here.
       (`attribution_admitted_only_blanks_qc_or_standards`);
     - fewer than the minimum of its biological sample rows were, however many QC rows were
       (`attribution_sample_coverage_below_minimum`);
-    - none of its rows is a biological sample's of its own polarity, some are another unit's, and it admitted an
-      input no row of its own declares (another unit's row's file, or an unattributed member), whatever blank, QC or
-      standard rows it also lists: a Catalog mis-assignment (`attribution_no_rows_of_the_unit_polarity`). A row of
-      another unit whose file was not admitted refuses nothing: a QC-only or pooled-only unit beside one such row runs
-      on its own files, as before;
+    - none of its rows is a biological sample's of its own polarity, some are another unit's, it admitted inputs, and
+      either a row of another unit is a biological sample's (whether or not its file was admitted) or it admitted an
+      input no row of its own declares (another unit's row's file, or an unattributed member that is no blank or QC),
+      whatever blank, QC or standard rows it also lists: a Catalog mis-assignment
+      (`attribution_no_rows_of_the_unit_polarity`). A positive unit whose rows were `S1_neg.raw`…`S5_neg.raw` beside
+      `Blank1.raw` and `Blank2.raw`, the negative files absent, would otherwise run on its two blanks. Only a stray
+      blank or QC row of another unit whose file was not admitted refuses nothing: a QC-only or pooled-only unit beside
+      one such row runs on its own files, as before;
     - it admitted the file of a row that is another unit's, however many of its own samples it admitted
       (`attribution_admitted_another_units_inputs`). The gate counted only the unit's own rows, so one positive sample
       row passed a unit carrying ten negative files at 0.5; on stage3b, ST002798's HILIC and reversed-phase units each
-      carried the other chromatography's files (16 and 102 of 220) and ran. `inputs_of_another_units_rows` counts
-      them;
+      carried the other chromatography's files and ran. An input counts as another unit's by its own evidence: its
+      row's own attribute says so, or its own name (or, its name silent, its folders below the data root) states
+      another polarity or chromatography. A row read as another unit's only by a token its file does not carry (a
+      sample id's `HIV_neg_1` beside `H3.raw`) counts the row, never the file. `inputs_of_another_units_rows` counts
+      them, a floor: the message says it covers only rows and inputs whose own names or attributes say so. A file's
+      own pos/neg token is still its polarity (`ER_neg_1.raw` refuses a positive unit; `Neg_Ctrl_1.raw` does in a
+      listing that names files by polarity), open for the author since the raw-header preflight runs after the gate;
+    - it admitted only blanks and no row is an analytical sample's, whether or not any row is another unit's
+      (`attribution_admitted_only_blanks_qc_or_standards`; until this version recorded `not_evaluated`);
     - the rows could not be built to be counted (`attribution_coverage_not_computed`).
     `ATTRIBUTION_COVERAGE_REFUSALS` lists the codes.
   - The failed manifest is `download_failed` with `download_failure.stage: attribute`, `reason_code`,
@@ -60,8 +75,13 @@ paths that passed short admissions; both are closed here.
   - Where rows alone are below the minimum and unattributed inputs make up the gap, the unit passes with the warning
     `attribution_rows_below_minimum_unattributed_inputs_counted`, in the manifest's warnings too. Whether that should
     refuse is open for the author (it would refuse the 2026-10-07 ST001264 case).
-  - A unit with no sample rows, or whose own rows are blanks only and which, where some rows are another unit's,
-    admitted no input but its own rows' files, is recorded `not_evaluated` and not judged.
+  - A unit with no sample rows, or whose own rows are blanks only and which admitted no input but its own rows' files
+    and something other than blanks (an unpaired input), is recorded `not_evaluated` and not judged.
+  - Still uncaught, open for the author (stage3b's done units that ran another Catalog unit's files and pass): where
+    neither the names, the folders nor the rows' attributes state the chromatography (ST002283's `_Lip_` and ST002747's
+    `Lipids/` beside `_Hilic_`, ST004544, ST003128), and the opposite-polarity part of a Catalog unit that declares one
+    polarity. Both need a check across Catalog units (two units of different chromatography admitting the same file
+    set) or a ruling on header-first polarity against the Catalog's, which this per-unit gate cannot make.
 - **Two pairing rules, inferences on record like the others (`input_name_pairings`, the lineage row's
   `name_pairing`, the attribute stage's counts), in a unit of one stated polarity only.**
   - R4 `polarity_marked_member_stem`: a trailing `+` or `-` on a member's stem (`polarity_marker`). ST003328's
@@ -113,6 +133,10 @@ paths that passed short admissions; both are closed here.
   (`chromatography_folder_contradicts_unit`).** Folders (never names) that state HILIC, RP, RPLC, C18 or C8 against
   the unit's chromatography (its handoff's `technical_settings` or its separation) exclude the member: ST002044's
   HILIC unit no longer takes `rp/esipos/NHF_80.mzML`, nor ST002330's RP unit `metabolomics-mzxml-hilic/…`.
+- **A column glued to a polarity states the chromatography (`name_chromatographies`, `folder_chromatographies`).**
+  `C18neg`, `C18pos` and a token ending in one (`…xHILICneg`, `…xRPneg`) were read as nothing, so ST002796's
+  C18 and HILIC units, and ST003964's, each ran the other's files. `hilic`, `rplc` and `c18` are read after any
+  prefix; `rp` and `c8` only alone or after a digit or an `x` (`Sharpneg` states nothing).
 - **A trailing `+` or `-` is not a polarity to `name_polarities`.** Only the marker rule, a joined cell's reading,
   and a unit-scoped archive whose listing marks twins (`listing_marks_polarity`: some stem with both; the other twin
   is left out as `polarity_marker_contradicts_ion_mode`) read one. `Tcell_CD8+.raw` and ST004304's typo

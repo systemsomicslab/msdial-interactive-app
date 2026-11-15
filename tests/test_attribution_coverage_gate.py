@@ -31,7 +31,7 @@ with patch.dict(os.environ, {"LOCALAPPDATA": _CONFIG.name}):
         _coverage_file_type,
         attribution_coverage,
     )
-    from msdial_app.repository_reanalysis import AttributionCoverageError, read_manifest
+    from msdial_app.repository_reanalysis import AttributionCoverageError, name_chromatographies, read_manifest
 
 from test_replicate_injections import UNIT_SCOPED, _st001264, _Workspace
 
@@ -392,6 +392,200 @@ class NoUnitRunsOnAnotherUnitsFiles(_Workspace):
         coverage = raised.exception.coverage
         self.assertEqual((ATTRIBUTION_NO_ROWS_OF_THE_UNIT_POLARITY, 1, 1),
                          (coverage["reason"], coverage["inputs_of_another_units_rows"], coverage["rows_of_another_unit"]))
+
+
+# ---- Verification of f0084e2 -------------------------------------------------------------------------------------
+
+
+class NoUnitRunsOnItsBlanksOrQcsAlone(_Workspace):
+    """f0084e2 refused a unit with no sample row of its own only where it admitted another unit's file, so a positive unit
+    whose every biological row was the other polarity's, with those files absent, ran on its blanks or QCs alone (the
+    ST002512 defect). A row of another unit that is a biological sample's now refuses such a unit whether or not its file
+    was admitted; a stray blank or QC row of another unit still refuses nothing."""
+
+    NEGATIVE_ROWS = [(f"S{index}", f"S{index}_neg.raw") for index in range(1, 6)]
+
+    def refused(self, members: list[str], rows: list[tuple[str, str]], reason: str, scope: dict | None = None) -> dict:
+        project, payloads = _st001264(members, rows)
+        if scope:
+            project.download_scope = dict(scope)
+        with self.assertRaises(AttributionCoverageError) as raised:
+            self.lease(project, payloads)
+        self.assertEqual(reason, raised.exception.coverage["reason"])
+        return raised.exception.coverage
+
+    def test_blank_rows_beside_another_polaritys_sample_rows_whose_files_are_absent_are_refused(self) -> None:
+        coverage = self.refused(["Blank1.raw", "Blank2.raw"],
+                                [*self.NEGATIVE_ROWS, ("Blank1", "Blank1.raw"), ("Blank2", "Blank2.raw")],
+                                ATTRIBUTION_NO_ROWS_OF_THE_UNIT_POLARITY)
+        self.assertEqual((5, 0, 2), (coverage["rows_of_another_unit"], coverage["inputs_of_another_units_rows"],
+                                     len(coverage["inputs"])))
+
+    def test_the_same_in_a_unit_scoped_archive(self) -> None:
+        self.refused(["Blank1.raw", "Blank2.raw"], [*self.NEGATIVE_ROWS, ("Blank1", "Blank1.raw"),
+                                                    ("Blank2", "Blank2.raw")],
+                     ATTRIBUTION_NO_ROWS_OF_THE_UNIT_POLARITY, scope=UNIT_SCOPED)
+
+    def test_qc_rows_beside_another_polaritys_sample_rows_whose_files_are_absent_are_refused(self) -> None:
+        self.refused(["QC1.raw", "QC2.raw"], [*self.NEGATIVE_ROWS, ("QC1", "QC1.raw"), ("QC2", "QC2.raw")],
+                     ATTRIBUTION_NO_ROWS_OF_THE_UNIT_POLARITY)
+        self.refused(["QC1.raw", "Blank1.raw"], [*self.NEGATIVE_ROWS, ("QC1", "QC1.raw"), ("Blank1", "Blank1.raw")],
+                     ATTRIBUTION_NO_ROWS_OF_THE_UNIT_POLARITY)
+
+    def test_a_unit_that_admits_only_blanks_is_refused(self) -> None:
+        coverage = self.refused(["Blank1.raw", "Blank2.raw"], [("Blank1", "Blank1.raw"), ("Blank2", "Blank2.raw")],
+                                ATTRIBUTION_ADMITTED_NO_SAMPLE)
+        self.assertEqual((2, 0, 0), (coverage["blank_rows"], coverage["declared_rows"], coverage["rows_of_another_unit"]))
+
+    def test_own_blank_and_qc_rows_beside_a_stray_blank_row_of_another_unit_pass(self) -> None:
+        """The stray row's file is absent: the unit's own Blank1 and QC1 are its own rows' files, not undeclared ones."""
+        project, payloads = _st001264(["QC1_pos.raw", "Blank1.raw"],
+                                      [("QC1", "QC1_pos.raw"), ("Blank1", "Blank1.raw"), ("X", "Blank_neg.raw")])
+        coverage = self.lease(project, payloads)["attribution_coverage"]
+        self.assertEqual(("passed", 1, 0, 1, 1), (coverage["status"], coverage["rows_of_another_unit"],
+                                                  coverage["inputs_of_another_units_rows"], coverage["blank_rows"],
+                                                  coverage["declared_rows"]))
+
+    def test_an_unattributed_sample_member_beside_a_stray_row_refuses_a_qc_only_unit(self) -> None:
+        """f0084e2's 'or an unattributed member' half: Z9.raw is admitted with no row of the unit's own."""
+        coverage = self.refused(["QC1_pos.raw", "QC2_pos.raw", "Z9.raw"],
+                                [("QC1", "QC1_pos.raw"), ("QC2", "QC2_pos.raw"), ("X", "Blank_neg.raw")],
+                                ATTRIBUTION_NO_ROWS_OF_THE_UNIT_POLARITY, scope=UNIT_SCOPED)
+        self.assertEqual((1, 0), (coverage["unattributed_inputs"], coverage["inputs_of_another_units_rows"]))
+
+    def test_an_unattributed_qc_member_beside_a_stray_row_does_not(self) -> None:
+        """A QC member counts nowhere, as a declared QC row's file does not: the unit runs on its QCs as before."""
+        project, payloads = _st001264(["QC1_pos.raw", "QC2_pos.raw", "QC_x9.raw"],
+                                      [("QC1", "QC1_pos.raw"), ("QC2", "QC2_pos.raw"), ("X", "Blank_neg.raw")])
+        project.download_scope = dict(UNIT_SCOPED)
+        coverage = self.lease(project, payloads)["attribution_coverage"]
+        self.assertEqual(("passed", 1, 0), (coverage["status"], coverage["unattributed_inputs"],
+                                            coverage["unattributed_inputs_counted"]))
+
+
+class AnInputIsAnotherUnitsByItsOwnEvidence(_Workspace):
+    """f0084e2 refused every input paired with a row read as another unit's, by the row's tokens: H3.raw, whose own name
+    states nothing, was refused because its row's sample id was HIV_neg_1. An input is now another unit's only where its
+    own name (or, its name silent, its folders) states another polarity or chromatography, or its row's own attribute
+    does."""
+
+    def test_a_sample_ids_pos_or_neg_never_makes_a_silent_file_another_units(self) -> None:
+        rows = [("HIV_pos_1", "H1.raw"), ("HIV_pos_2", "H2.raw"), ("HIV_neg_1", "H3.raw"), ("HIV_neg_2", "H4.raw")]
+        project, payloads = _st001264(["H1.raw", "H2.raw", "H3.raw", "H4.raw"], rows)
+        coverage = self.lease(project, payloads)["attribution_coverage"]
+        self.assertEqual(("passed", 2, 0, 4), (coverage["status"], coverage["rows_of_another_unit"],
+                                               coverage["inputs_of_another_units_rows"], len(coverage["inputs"])))
+
+    def test_its_folders_speak_where_its_name_is_silent(self) -> None:
+        rows = [("HIV_pos_1", "H1.raw"), ("HIV_pos_2", "H2.raw"), ("HIV_neg_1", "H3.raw")]
+        project, payloads = _st001264(["POS/H1.raw", "POS/H2.raw", "NEG/H3.raw"], rows)
+        with self.assertRaises(AttributionCoverageError) as raised:
+            self.lease(project, payloads)
+        self.assertEqual((ATTRIBUTION_ADMITTED_ANOTHER_UNITS_INPUTS, 1),
+                         (raised.exception.coverage["reason"], raised.exception.coverage["inputs_of_another_units_rows"]))
+
+    def test_a_files_own_pos_or_neg_token_still_refuses_the_unit(self) -> None:
+        """Pinned, conservative: ER_neg_1.raw may name an ER-negative tumour run in positive mode, but a name's own
+        polarity token is read as its polarity, as PR #58's census found it to be in every Catalog case (19 units).
+        Raw-header preflight runs after this gate, so the gate cannot ask the header; the author's to rule."""
+        rows = [("ER_pos_1", "ER_pos_1.raw"), ("ER_pos_2", "ER_pos_2.raw"), ("ER_neg_1", "ER_neg_1.raw"),
+                ("ER_neg_2", "ER_neg_2.raw")]
+        project, payloads = _st001264([raw for _sample, raw in rows], rows)
+        with self.assertRaises(AttributionCoverageError) as raised:
+            self.lease(project, payloads)
+        self.assertEqual((ATTRIBUTION_ADMITTED_ANOTHER_UNITS_INPUTS, 2),
+                         (raised.exception.coverage["reason"], raised.exception.coverage["inputs_of_another_units_rows"]))
+        # And a negative control in a listing that names its files by polarity is read as the negative run.
+        project, payloads = _st001264(["S1_pos.raw", "S2_pos.raw", "Neg_Ctrl_1.raw"],
+                                      [("S1", "S1_pos.raw"), ("S2", "S2_pos.raw"), ("NC1", "Neg_Ctrl_1.raw")])
+        with self.assertRaises(AttributionCoverageError) as raised:
+            self.lease(project, payloads)
+        self.assertEqual(ATTRIBUTION_ADMITTED_ANOTHER_UNITS_INPUTS, raised.exception.coverage["reason"])
+
+
+class TheGateReadsEveryStatementOfAChromatography(_Workspace):
+    """Stage3b's done units that ran another Catalog unit's files although f0084e2 passed them: ST002796's C18neg names
+    and ST003964's glued ...xHILICneg_ tokens, which no reader read, and ST004606's rows, whose names state nothing and
+    whose attribute "Chromatography ion mode" says HILIC POS or RP NEG. Synthetic names of those shapes."""
+
+    def test_a_column_glued_to_a_polarity_states_the_chromatography(self) -> None:
+        self.assertEqual({"RP"}, name_chromatographies("A_01_C18neg.mzML"))
+        self.assertEqual({"RP"}, name_chromatographies("C18pos/A_01.mzML"))
+        self.assertEqual({"HILIC"}, name_chromatographies("A_01_HILICneg.mzML"))
+        self.assertEqual({"HILIC"}, name_chromatographies("A_01xHILICneg_B.raw"))
+        self.assertEqual({"RP"}, name_chromatographies("A_01xRPneg_B.raw"))
+        self.assertEqual({"RP"}, name_chromatographies("A_7rppos.raw"))
+        for name in ("Sharpneg_1.raw", "Harppos_2.raw", "Grc8neg.raw", "S1_neg.raw"):
+            self.assertEqual(set(), name_chromatographies(name), name)
+
+    def lease_then_judge(self, members: list[str], rows: list[tuple[str, str]], separation: str,
+                         values: list[dict] | None = None, ion_mode: str = "Positive") -> dict:
+        project, payloads = _st001264(members, rows)
+        project.ion_mode = ion_mode
+        if values:
+            for sample, value in zip(project.sample_metadata, values):
+                sample["values"] = dict(value)
+        manifest = self.lease(project, payloads)
+        manifest["project"]["separation"] = separation
+        return attribution_coverage(manifest)
+
+    def test_a_c18_unit_carrying_hilic_files_is_refused(self) -> None:
+        rows = [("A_01", "A_01_C18neg.mzML"), ("A_02", "A_02_C18neg.mzML"), ("B_01", "B_01_HILICneg.mzML"),
+                ("B_02", "B_02_HILICneg.mzML")]
+        coverage = self.lease_then_judge([raw for _sample, raw in rows], rows, "Reversed phase", ion_mode="Negative")
+        self.assertEqual(("refused", ATTRIBUTION_ADMITTED_ANOTHER_UNITS_INPUTS, 2, 2),
+                         (coverage["status"], coverage["reason"], coverage["rows_of_another_unit"],
+                          coverage["inputs_of_another_units_rows"]))
+
+    def test_a_glued_hilic_unit_carrying_rp_files_is_refused(self) -> None:
+        rows = [("H1", "R_1xHILICneg_K.raw"), ("H2", "R_2xHILICneg_K.raw"), ("P1", "R_3xRPneg_K.raw")]
+        coverage = self.lease_then_judge([raw for _sample, raw in rows], rows, "HILIC", ion_mode="Negative")
+        self.assertEqual((ATTRIBUTION_ADMITTED_ANOTHER_UNITS_INPUTS, 1),
+                         (coverage["reason"], coverage["inputs_of_another_units_rows"]))
+
+    def test_a_reversed_phase_part_whose_every_row_states_hilic_is_refused(self) -> None:
+        """ST002796's RP unit's aif-pos part: three QC rows, every one named ..._HILICpos, run as the RP unit's."""
+        rows = [(f"QCX_0{index}_HILICpos", f"QCX_0{index}_HILICpos.mzML") for index in range(1, 4)]
+        coverage = self.lease_then_judge([raw for _sample, raw in rows], rows, "Reversed phase")
+        self.assertEqual(("refused", ATTRIBUTION_NO_ROWS_OF_THE_UNIT_POLARITY, 3, 3),
+                         (coverage["status"], coverage["reason"], coverage["rows_of_another_unit"],
+                          coverage["inputs_of_another_units_rows"]))
+
+    def test_rows_that_state_only_rp_by_name_are_a_hilic_units_own(self) -> None:
+        """"RP" alone may be a sample's code: a HILIC unit whose rows all say RP is not judged by it."""
+        rows = [("RP1", "S_RP_1.raw"), ("RP2", "S_RP_2.raw")]
+        coverage = self.lease_then_judge([raw for _sample, raw in rows], rows, "HILIC")
+        self.assertEqual(("passed", 0), (coverage["status"], coverage["rows_of_another_unit"]))
+
+    def test_a_rows_chromatography_attribute_is_its_own_statement(self) -> None:
+        rows = [(f"F{index}", f"F{index}.raw") for index in range(1, 5)]
+        values = [{"Chromatography ion mode": mode} for mode in ("HILIC POS", "HILIC POS", "RP POS", "RP POS")]
+        coverage = self.lease_then_judge([raw for _sample, raw in rows], rows, "HILIC", values)
+        self.assertEqual(("refused", ATTRIBUTION_ADMITTED_ANOTHER_UNITS_INPUTS, 2, 2),
+                         (coverage["status"], coverage["reason"], coverage["rows_of_another_unit"],
+                          coverage["inputs_of_another_units_rows"]))
+        self.assertEqual({"row_attribute_states_another_chromatography"},
+                         {item["reason"] for item in coverage["rows_of_another_unit_listed"]})
+
+    def test_a_rows_polarity_attribute_is_its_own_statement(self) -> None:
+        rows = [(f"F{index}", f"F{index}.raw") for index in range(1, 5)]
+        values = [{"Parameter Value[Scan polarity]": mode} for mode in ("positive", "positive", "negative", "negative")]
+        project, payloads = _st001264([raw for _sample, raw in rows], rows)
+        for sample, value in zip(project.sample_metadata, values):
+            sample["values"] = dict(value)
+        with self.assertRaises(AttributionCoverageError) as raised:
+            self.lease(project, payloads)
+        coverage = raised.exception.coverage
+        self.assertEqual((ATTRIBUTION_ADMITTED_ANOTHER_UNITS_INPUTS, 2), (coverage["reason"],
+                                                                         coverage["inputs_of_another_units_rows"]))
+        self.assertEqual({"row_attribute_states_another_polarity"},
+                         {item["reason"] for item in coverage["rows_of_another_unit_listed"]})
+
+    def test_attributes_that_agree_with_the_unit_or_state_both_polarities_pass(self) -> None:
+        rows = [(f"F{index}", f"F{index}.raw") for index in range(1, 4)]
+        values = [{"Mode": "HILIC Positive"}, {"Mode": "HILIC Positive"}, {"Mode": "HILIC both polarities negative"}]
+        coverage = self.lease_then_judge([raw for _sample, raw in rows], rows, "HILIC", values)
+        self.assertEqual(("passed", 0), (coverage["status"], coverage["rows_of_another_unit"]))
 
 
 if __name__ == "__main__":

@@ -827,17 +827,21 @@ def build_repository_analysis_rows(
 #   (ATTRIBUTION_ADMITTED_NO_SAMPLE);
 # - fewer than the minimum of its biological sample rows were admitted, however many QC rows were
 #   (ATTRIBUTION_SAMPLE_COVERAGE_BELOW_MINIMUM: 20 QCs and 1 of 20 samples is no unit);
-# - none of its rows is a biological sample's of its own polarity, some are another unit's, and it admitted an input no
-#   row of its own declares (another unit's row's file, or an unattributed member), whatever blank, QC or standard rows
-#   it also lists: a Catalog mis-assignment (ATTRIBUTION_NO_ROWS_OF_THE_UNIT_POLARITY: ST004800's positive units
-#   carrying the negative archive);
+# - none of its rows is a biological sample's of its own polarity, some are another unit's, it admitted inputs, and
+#   either a row of another unit is a biological sample's or it admitted an input no row of its own declares (another
+#   unit's row's file, or an unattributed member that is no blank or QC), whatever blank, QC or standard rows it also
+#   lists: a Catalog mis-assignment (ATTRIBUTION_NO_ROWS_OF_THE_UNIT_POLARITY: ST004800's positive units carrying the
+#   negative archive; a unit whose every sample row is the other polarity's would otherwise run on its blanks);
 # - it admitted the file of a row that is another unit's, however many of its own samples it also admitted
 #   (ATTRIBUTION_ADMITTED_ANOTHER_UNITS_INPUTS: one positive sample row would otherwise carry ten negative files into
-#   the run); a row of another unit whose file the unit did not admit is only not counted;
+#   the run), the file being that unit's by evidence of its own: its row's attribute, or its own name or folders
+#   stating another polarity or chromatography; a row of another unit whose file the unit did not admit, or whose file
+#   states nothing of the kind, is only not counted;
+# - it admitted blanks only, with no analytical row (ATTRIBUTION_ADMITTED_NO_SAMPLE, as for blanks, QCs or standards);
 # - its rows could not be built to be counted (ATTRIBUTION_COVERAGE_NOT_COMPUTED): never a pass for want of a verdict.
 # The rows counted are the unit's own polarity's: a row whose names state only another polarity by a token of their own,
-# or a joined cell all of whose names are another unit's (sample_raw_file_reading), is another unit's row, each listed
-# with why; a blank row is no analytical row. A row is admitted when an input the analysis CSV would give it, or one the
+# or whose names state none and whose own attribute does (_row_attribute_statement), or a joined cell all of whose names
+# are another unit's (sample_raw_file_reading), is another unit's row, each listed with why; a blank row is no analytical row. A row is admitted when an input the analysis CSV would give it, or one the
 # lease excluded for what it holds (an undecodable mzML, a fragmentation method other than CID/HCD), is its; the record
 # also gives the share actually analysed (analysed_ratio). An unattributed input of a unit-scoped archive (the user's
 # decision of 2026-10-07: the unit's own run, with no row) counts as an admitted file, a blank or QC never; where the rows
@@ -907,6 +911,85 @@ def _row_file_type(row: dict[str, Any], names: list[str]) -> str:
     return "Sample"
 
 
+# A ROW'S OWN STATEMENT OF ITS MODE (verification of 0.5.67's gate on stage3b). The Catalog attaches a study's whole
+# sample table to every analysis that shares its archive, and some tables say each row's chromatography and polarity in
+# an attribute of its own: ST004606's "Chromatography ion mode" (HILIC POS, RP NEG, ...), whose file names state
+# nothing, so each of its four units ran 56 HILIC and 52 RP files; ST002796's and ST002798's "Mode" (C18 Negative, HILIC
+# Positive, ...); MetaboLights' Parameter Value[Scan polarity] and [Column type]. Such an attribute is the depositor's
+# statement for that row, read as the row's own where its names state nothing. Only these attribute names are read
+# (casefolded, an ISA Parameter Value[...] or Factor Value[...] unwrapped); "both", "alternating", "switching" or "mixed"
+# states no polarity.
+_ROW_MODE_ATTRIBUTES = frozenset(
+    {
+        "mode", "polarity", "scan polarity", "ion polarity", "ion mode", "ionization mode", "ionisation mode",
+        "ms ionization mode", "ms ion mode", "ms mode", "chromatography ion mode", "chromatography mode",
+        "chromatography", "column type",
+    }
+)
+_ROW_ATTRIBUTE_WRAPPER = re.compile(r"^(?:parameter value|factor value|characteristics|comment)\s*\[(?P<name>.*)\]$")
+_ROW_MODE_BOTH_TOKENS = frozenset({"both", "alternating", "switching", "mixed"})
+# Why a row is another unit's where its own attribute says so (_row_attribute_statement): its inputs are that other
+# unit's whatever their names state.
+ROW_ATTRIBUTE_STATES_ANOTHER_POLARITY = "row_attribute_states_another_polarity"
+ROW_ATTRIBUTE_STATES_ANOTHER_CHROMATOGRAPHY = "row_attribute_states_another_chromatography"
+_ROW_ATTRIBUTE_REASONS = frozenset({ROW_ATTRIBUTE_STATES_ANOTHER_POLARITY, ROW_ATTRIBUTE_STATES_ANOTHER_CHROMATOGRAPHY})
+
+
+def _row_attribute_statement(row: dict[str, Any]) -> tuple[set[str], set[str]]:
+    """(the polarities, the chromatographies) a sample row's own attributes state (_ROW_MODE_ATTRIBUTES): "HILIC POS"
+    gives ({Positive}, {HILIC}), "C18 Negative" ({Negative}, {RP}), "reverse phase" or "ODS" (set(), {RP})."""
+    from .repository_reanalysis import POLARITY_NAME_TOKENS
+
+    polarities: set[str] = set()
+    chromatographies: set[str] = set()
+    values = row.get("values") if isinstance(row.get("values"), dict) else {}
+    for key, value in values.items():
+        name = re.sub(r"\s+", " ", str(key or "")).strip().casefold()
+        wrapped = _ROW_ATTRIBUTE_WRAPPER.match(name)
+        if wrapped:
+            name = wrapped.group("name").strip()
+        if name not in _ROW_MODE_ATTRIBUTES:
+            continue
+        text = str(value or "").casefold()
+        tokens = {token for token in re.split(r"[^0-9a-z]+", text) if token}
+        if not tokens & _ROW_MODE_BOTH_TOKENS:
+            polarities.update(POLARITY_NAME_TOKENS[token] for token in tokens if token in POLARITY_NAME_TOKENS)
+        if "hilic" in text:
+            chromatographies.add("HILIC")
+        if "revers" in text or tokens & {"rp", "rplc", "c18", "c8", "ods"}:
+            chromatographies.add("RP")
+    return polarities, chromatographies
+
+
+def _path_under(path: str, root: str) -> str:
+    """A path below a root, '/'-separated, compared without case; its name alone where it is not below the root."""
+    text = str(path or "").replace("\\", "/")
+    base = str(root or "").replace("\\", "/").rstrip("/")
+    if base and text.casefold().startswith(base.casefold() + "/"):
+        return text[len(base) + 1:]
+    return text.rsplit("/", 1)[-1]
+
+
+def _input_statement(path: str, root: str, *, polarity_named: bool, joined: bool) -> tuple[set[str], set[str]]:
+    """(the polarities, the chromatographies) an admitted input states of itself: by its own name's tokens, and where
+    its name states nothing, by its folders below the data root (_path_under) too. ``joined``: read as a joined cell's
+    name is (_joined_name_reading: compounds and a trailing marker), for an input paired with such a row."""
+    from .repository_reanalysis import _joined_name_reading, name_chromatographies, name_polarities
+
+    name = Path(str(path)).name
+    if joined:
+        polarities, chromatographies = _joined_name_reading(name, polarity_named=polarity_named)
+    else:
+        polarities, chromatographies = set(name_polarities(name, polarity_named=polarity_named)), name_chromatographies(name)
+    if not polarities or not chromatographies:
+        below = _path_under(path, root)
+        if not polarities:
+            polarities = set(name_polarities(below, polarity_named=polarity_named))
+        if not chromatographies:
+            chromatographies = name_chromatographies(below)
+    return set(polarities), set(chromatographies)
+
+
 def split_names(row: dict[str, Any]) -> list[str]:
     """Every name a row's raw_file cell gives, unfiltered (split_joined_raw_file)."""
     from .repository_reanalysis import split_joined_raw_file
@@ -934,6 +1017,7 @@ def attribution_coverage(
         _sample_id_polarities,
         name_chromatographies,
         names_state_polarity,
+        rows_name_files_by_polarity,
         sample_raw_file_reading,
         unit_chromatography,
     )
@@ -985,23 +1069,38 @@ def attribution_coverage(
     blanks: list[int] = []
     declared: list[int] = []
     types: dict[int, str] = {}
+    another_types: dict[int, str] = {}
     joined_rows = 0
     joined_refused: list[dict[str, Any]] = []
     # A sample id's pos/neg token beside a control, ctrl, blank or QC token is a polarity only where the ids name
     # polarities elsewhere, as the names' readers read one (name_polarities).
     ids_named = names_state_polarity(str(row.get("sample_id") or "") for row in samples)
-    # A row whose one name states another chromatography is another unit's only where the unit's rows state two
-    # (ST002330's RP unit lists HILIC-RN1-neg.mzXML beside C18-RN1-neg.mzXML); elsewhere "RP" may be a sample's code.
+    # A row whose one name (or, its names silent, its attribute) states another chromatography is another unit's only
+    # where the unit's rows state two (ST002330's RP unit lists HILIC-RN1-neg.mzXML beside C18-RN1-neg.mzXML), or one
+    # that is not the unit's by HILIC or by an attribute (below); elsewhere "RP" may be a sample's code.
     chromatography = unit_chromatography(typed)
-    row_chromatographies = {
-        str(index): name_chromatographies(name)
-        for index, row in enumerate(samples)
-        for name in split_names(row)[:1]
-        if len(split_names(row)) == 1
-    }
-    read_chromatography = bool(chromatography) and len(
-        {item for stated in row_chromatographies.values() for item in stated}
-    ) > 1
+    # What each row's own attributes state (_row_attribute_statement), read where its names state nothing.
+    attributes = [_row_attribute_statement(row) for row in samples]
+    row_chromatographies: dict[str, tuple[set[str], str]] = {}
+    for index, row in enumerate(samples):
+        names = split_names(row)
+        stated_by_name = name_chromatographies(names[0]) if len(names) == 1 else set()
+        if stated_by_name:
+            row_chromatographies[str(index)] = (stated_by_name, "raw_file_states_another_chromatography")
+        elif len(names) <= 1 and attributes[index][1]:
+            row_chromatographies[str(index)] = (attributes[index][1], ROW_ATTRIBUTE_STATES_ANOTHER_CHROMATOGRAPHY)
+    rows_state = {item for stated, _source in row_chromatographies.values() for item in stated}
+    # Or where the rows state one chromatography that is not the unit's, by a statement no sample code makes: HILIC, or
+    # a row's attribute (ST002796's RP unit's aif-pos part held 3 rows, each named for HILIC positive, and ran them).
+    read_chromatography = bool(chromatography) and (
+        len(rows_state) > 1
+        or (
+            bool(rows_state) and chromatography not in rows_state
+            and (rows_state == {"HILIC"} or any(
+                source == ROW_ATTRIBUTE_STATES_ANOTHER_CHROMATOGRAPHY for _stated, source in row_chromatographies.values()
+            ))
+        )
+    )
     for index, row in enumerate(samples):
         reading = sample_raw_file_reading(row, typed)
         sample_id = str(row.get("sample_id") or "")
@@ -1026,6 +1125,9 @@ def attribution_coverage(
             stated = set(reading["polarities"])
             source = "raw_file_states_another_polarity"
             real = [name for name in reading["names"] if not name.startswith(".") and ":" not in name]
+            if not stated and attributes[index][0]:
+                stated = set(attributes[index][0])
+                source = ROW_ATTRIBUTE_STATES_ANOTHER_POLARITY
             if not stated:
                 # Glued run numbers (b1_neg1) are read only for a row that names no file of its own (".RAW").
                 stated = _sample_id_polarities(sample_id, polarity_named=ids_named, glued=not real)
@@ -1033,11 +1135,12 @@ def attribution_coverage(
             if stated and polarity not in stated:
                 why = source
         if not why and not reading["joined"] and read_chromatography:
-            stated_chromatographies = row_chromatographies.get(str(index)) or set()
+            stated_chromatographies, source = row_chromatographies.get(str(index)) or (set(), "")
             if stated_chromatographies and chromatography not in stated_chromatographies:
-                why = "raw_file_states_another_chromatography"
+                why = source
         if why:
             another_unit.append({"sample_row_index": index, "sample_id": sample_id, "reason": why})
+            another_types[index] = _row_file_type(row, list(reading["names"]) or split_names(row))
             continue
         types[index] = _row_file_type(row, list(reading["names"]) or split_names(row))
         (blanks if types[index] == "Blank" else declared).append(index)
@@ -1053,17 +1156,54 @@ def attribution_coverage(
     ]
     unattributed_counted = [kind for kind in unattributed if kind not in {"Blank", "QC"}]
     # The inputs no row of the unit's own declares: those the analysis CSV pairs with a row of another unit, and those
-    # with no row at all (an unattributed member of a unit-scoped archive).
-    another_rows = {int(item["sample_row_index"]) for item in another_unit}
+    # with no row at all but an unattributed blank or QC member of a unit-scoped archive (counted nowhere, as above).
+    another_reasons = {int(item["sample_row_index"]): str(item["reason"]) for item in another_unit}
     own_rows = {*declared, *blanks}
+    input_root = str(manifest.get("input_directory") or "")
+    inputs_named = rows_name_files_by_polarity(typed)
+
+    def states_another_unit(row: dict[str, Any]) -> bool:
+        """Whether an input paired with a row of another unit is that unit's file by evidence of its own: the row's own
+        attribute says so, or the input's own name (or, where its name is silent, its folders) states another polarity
+        or chromatography. A row read as another unit's only by a token its file does not carry (a sample id's
+        HIV_neg_1 beside the file H3.raw) never makes the file another unit's (verification of f0084e2)."""
+        reason = another_reasons[int(row["sample_row_index"])]
+        if reason in _ROW_ATTRIBUTE_REASONS:
+            return True
+        joined = reason == JOINED_NAMES_ANOTHER_UNIT
+        stated_polarities, stated_chromatographies = _input_statement(
+            str(row["input_path"]), input_root, polarity_named=inputs_named, joined=joined
+        )
+        if polarity and stated_polarities and polarity not in stated_polarities:
+            return True
+        return bool(
+            chromatography and (read_chromatography or joined) and stated_chromatographies
+            and chromatography not in stated_chromatographies
+        )
+
     another_inputs = [
         row for row in built["rows"]
-        if row.get("sample_row_index") is not None and int(row["sample_row_index"]) in another_rows
+        if row.get("sample_row_index") is not None and int(row["sample_row_index"]) in another_reasons
+        and states_another_unit(row)
     ]
+
+    def input_type(row: dict[str, Any]) -> str:
+        """An input's type as the gate reads it: its own row's, else its own name's (an unattributed member's)."""
+        if row.get("sample_row_index") is not None and int(row["sample_row_index"]) in types:
+            return types[int(row["sample_row_index"])]
+        if row.get("raw_file_paired_by") == UNATTRIBUTED_MEMBER_PAIRING:
+            return _coverage_file_type(Path(str(row["input_path"])).stem)
+        return str(row.get("file_type") or "") or _coverage_file_type(Path(str(row["input_path"])).stem)
+
     undeclared_inputs = [
         row for row in built["rows"]
-        if row.get("sample_row_index") is None or int(row["sample_row_index"]) not in own_rows
+        if (row.get("sample_row_index") is None
+            and not (row.get("raw_file_paired_by") == UNATTRIBUTED_MEMBER_PAIRING
+                     and input_type(row) in {"Blank", "QC"}))
+        or (row.get("sample_row_index") is not None and int(row["sample_row_index"]) not in own_rows)
     ]
+    # Rows of another unit that are biological samples' (typed as the unit's own rows are, _row_file_type).
+    another_samples = [index for index, kind in another_types.items() if kind == "Sample"]
     unattributed_samples = len([kind for kind in unattributed_counted if kind == "Sample"])
     admitted_count = len(admitted) + len(unattributed_counted)
 
@@ -1126,21 +1266,24 @@ def attribution_coverage(
     if not samples:
         record["reason"] = "no_sample_rows"
         return record
-    if another_unit and not samples_declared and undeclared_inputs:
-        # No biological sample row of the unit's own, rows of another unit, and an input admitted that no row of its own
-        # declares: a Catalog mis-assignment, whatever blank, QC or standard rows the unit also lists (independent check
-        # of 0.5.67: one Blank1.raw or QC1.raw row let a positive unit run on its S1_neg.raw rows' files). A stray row of
-        # another unit whose file was not admitted refuses nothing: the unit runs on its own rows' files alone.
+    if another_unit and not samples_declared and built["rows"] and (undeclared_inputs or another_samples):
+        # No biological sample row of the unit's own, rows of another unit, inputs admitted, and either a row of another
+        # unit is a biological sample's or an input was admitted that no row of the unit's own declares: a Catalog
+        # mis-assignment, whatever blank, QC or standard rows the unit also lists (independent check of 0.5.67: one
+        # Blank1.raw or QC1.raw row let a positive unit run on its S1_neg.raw rows' files; verification of f0084e2: with
+        # those files absent, it ran on its blanks or QCs alone). Only a stray blank or QC row of another unit whose file
+        # was not admitted refuses nothing: the unit runs on its own rows' files.
         record.update(
             status="refused",
             reason=ATTRIBUTION_NO_ROWS_OF_THE_UNIT_POLARITY,
             message=(
                 f"None of the {len(samples)} sample rows of analysis unit {typed.analysis_unit_id} is a biological "
-                f"sample's of its own polarity ({polarity or 'unstated'}): {len(another_unit)} are another unit's, "
-                f"{len(blanks)} blanks and {len(declared)} QCs or standards, yet attribution admitted "
-                f"{len(undeclared_inputs)} of its {len(built['rows'])} inputs for no row of the unit's own "
-                f"({ATTRIBUTION_NO_ROWS_OF_THE_UNIT_POLARITY}). Refusing to run the unit on files its rows do not "
-                "declare; attribution_coverage lists each row and why."
+                f"sample's of its own polarity ({polarity or 'unstated'}): {len(another_unit)} are another unit's "
+                f"({len(another_samples)} of them biological samples'), {len(blanks)} blanks and {len(declared)} QCs "
+                f"or standards, and attribution admitted {len(undeclared_inputs)} of its {len(built['rows'])} inputs "
+                f"for no row of the unit's own ({ATTRIBUTION_NO_ROWS_OF_THE_UNIT_POLARITY}). Refusing to run the unit "
+                "on files its rows do not declare, or on its blanks and QCs without its samples; attribution_coverage "
+                "lists each row and why."
             ),
         )
         return record
@@ -1155,13 +1298,27 @@ def attribution_coverage(
             message=(
                 f"Attribution admitted {len(another_inputs)} of the {len(built['rows'])} inputs of analysis unit "
                 f"{typed.analysis_unit_id} for rows that are another unit's ({len(another_unit)} such rows; the unit's "
-                f"polarity {polarity or 'unstated'}), for example {', '.join(names[:3])} "
-                f"({ATTRIBUTION_ADMITTED_ANOTHER_UNITS_INPUTS}). Refusing to run the unit on another unit's files; "
-                "attribution_coverage lists each row and why, and each input with its row."
+                f"polarity {polarity or 'unstated'}, chromatography {chromatography or 'unstated'}), for example "
+                f"{', '.join(names[:3])} ({ATTRIBUTION_ADMITTED_ANOTHER_UNITS_INPUTS}). The counts are a floor: they "
+                "cover only the rows whose own names or attributes state another unit, and the inputs whose own names "
+                "or rows' attributes do. Refusing to run the unit on another unit's files; attribution_coverage lists "
+                "each row and why, and each input with its row."
             ),
         )
         return record
     if not declared:
+        if built["rows"] and all(input_type(row) == "Blank" for row in built["rows"]):
+            # Blanks alone, and no row of another unit to blame: what ST002512's unit ran on (verification of f0084e2).
+            record.update(
+                status="refused",
+                reason=ATTRIBUTION_ADMITTED_NO_SAMPLE,
+                message=(
+                    f"Every one of the {len(built['rows'])} inputs attribution admitted for analysis unit "
+                    f"{typed.analysis_unit_id} is a blank, and none of its {len(samples)} sample rows is an analytical "
+                    f"sample's ({ATTRIBUTION_ADMITTED_NO_SAMPLE}). Refusing to run the unit on its blanks alone."
+                ),
+            )
+            return record
         record["reason"] = "no_analytical_rows_of_the_unit_polarity"
         return record
     if ratio is not None and ratio < minimum:
