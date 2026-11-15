@@ -13,6 +13,7 @@ from __future__ import annotations
 import os
 import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 _CONFIG = tempfile.TemporaryDirectory()
@@ -21,6 +22,12 @@ with patch.dict(os.environ, {"LOCALAPPDATA": _CONFIG.name}):
         ATTRIBUTION_ADMITTED_NO_SAMPLE,
         ATTRIBUTION_COVERAGE_BELOW_MINIMUM,
         ATTRIBUTION_COVERAGE_MINIMUM,
+        ATTRIBUTION_COVERAGE_NOT_COMPUTED,
+        ATTRIBUTION_COVERAGE_REFUSALS,
+        ATTRIBUTION_NO_ROWS_OF_THE_UNIT_POLARITY,
+        ATTRIBUTION_ROWS_BELOW_MINIMUM_WARNING,
+        ATTRIBUTION_SAMPLE_COVERAGE_BELOW_MINIMUM,
+        _coverage_file_type,
         attribution_coverage,
     )
     from msdial_app.repository_reanalysis import AttributionCoverageError, read_manifest
@@ -65,8 +72,11 @@ class TheCoverageGate(_Workspace):
                          (manifest["status"], manifest["attribution_coverage"]["status"]))
         self.assertEqual(manifest["download_failure"], raised.exception.download_failure)
         failure = raised.exception.download_failure
-        self.assertEqual(("attribute", ATTRIBUTION_COVERAGE_BELOW_MINIMUM, "AttributionCoverageError"),
-                         (failure["stage"], failure["reason_code"], failure["error_type"]))
+        self.assertEqual(("attribute", ATTRIBUTION_COVERAGE_BELOW_MINIMUM, "AttributionCoverageError", False),
+                         (failure["stage"], failure["reason_code"], failure["error_type"], failure["retryable"]))
+        # A failure, not an exclusion: no disposition; and never retried as it stands (the same attribution repeats).
+        self.assertNotIn("disposition", failure)
+        self.assertIn(failure["reason_code"], ATTRIBUTION_COVERAGE_REFUSALS)
         self.assertEqual((5, 1, 0.2), (failure["attribution_coverage"]["declared_rows"],
                                        failure["attribution_coverage"]["admitted_rows"],
                                        failure["attribution_coverage"]["ratio"]))
@@ -91,16 +101,24 @@ class TheCoverageGate(_Workspace):
                                                     coverage["declared_rows"], coverage["admitted_rows"],
                                                     coverage["ratio"]))
         attribute = next(entry for entry in manifest["lease_stages"] if entry["stage"] == "attribute")
-        self.assertEqual({"status": "passed", "reason": "", "declared_rows": 2, "admitted_rows": 1, "ratio": 0.5},
+        self.assertEqual({"status": "passed", "reason": "", "declared_rows": 2, "admitted_rows": 1, "ratio": 0.5,
+                          "row_ratio": 0.5, "sample_ratio": 0.5},
                          attribute["attribution_coverage"])
 
-    def test_a_unit_with_no_rows_of_its_polarity_is_recorded_and_not_judged(self) -> None:
+    def test_a_unit_whose_rows_are_all_another_polaritys_is_refused_and_one_with_only_blanks_is_not_judged(self) -> None:
         project, payloads = _st001264(["S1.raw"], [("S1", "S1.raw")])
         manifest = self.lease(project, payloads)
         manifest["project"]["sample_metadata"] = [{"sample_id": "S1", "raw_file": "S1_neg.raw"}]
         coverage = attribution_coverage(manifest)
-        self.assertEqual(("not_evaluated", "no_analytical_rows_of_the_unit_polarity", 1),
+        # Rows all of another polarity while inputs were admitted: a Catalog mis-assignment, refused (review of 0.5.67).
+        self.assertEqual(("refused", ATTRIBUTION_NO_ROWS_OF_THE_UNIT_POLARITY, 1),
                          (coverage["status"], coverage["reason"], coverage["rows_of_another_unit"]))
+        self.assertEqual([{"sample_row_index": 0, "sample_id": "S1", "reason": "raw_file_states_another_polarity"}],
+                         coverage["rows_of_another_unit_listed"])
+        # A unit whose own rows are blanks only is recorded and not judged.
+        manifest["project"]["sample_metadata"] = [{"sample_id": "Blank1", "raw_file": "Blank1.raw"}]
+        self.assertEqual(("not_evaluated", "no_analytical_rows_of_the_unit_polarity"),
+                         (attribution_coverage(manifest)["status"], attribution_coverage(manifest)["reason"]))
         manifest["project"]["sample_metadata"] = []
         self.assertEqual(("not_evaluated", "no_sample_rows"),
                          (attribution_coverage(manifest)["status"], attribution_coverage(manifest)["reason"]))
@@ -113,6 +131,9 @@ class TheCoverageGate(_Workspace):
         coverage = manifest["attribution_coverage"]
         self.assertEqual(("passed", 0, 2, 1.0), (coverage["status"], coverage["admitted_rows"],
                                                  coverage["unattributed_inputs_counted"], coverage["ratio"]))
+        # Its rows alone are below the minimum: passed, but never silently (the author's ruling is open).
+        self.assertEqual((0.0, [ATTRIBUTION_ROWS_BELOW_MINIMUM_WARNING]), (coverage["row_ratio"], coverage["warnings"]))
+        self.assertIn(ATTRIBUTION_ROWS_BELOW_MINIMUM_WARNING, manifest["warnings"])
 
     def test_a_joined_cells_rows_are_counted_by_the_unit_and_the_other_units_rows_are_not(self) -> None:
         """R1's ST003720 shape: three rows, each naming both polarities; the positive unit admits all three."""
@@ -137,6 +158,84 @@ class TheCoverageGate(_Workspace):
         self.assertEqual(("passed", 1, 2, 2), (coverage["status"], coverage["rows_of_another_unit"],
                                                coverage["declared_rows"], coverage["admitted_rows"]))
         self.assertEqual({"sample_id_member_stem": 2}, coverage["admitted_by"])
+
+
+# ---- The review of 0.5.67: what the gate must never pass ----------------------------------------------------------
+
+
+class TheGateReadsBlanksQcsAndSamplesApart(_Workspace):
+    def test_blank_and_qc_names_in_common_shapes_are_no_samples(self) -> None:
+        """ST002512's admitted blanks were Neg_bk_1.raw and Bk_1(1).raw, which file_type_for typed Sample."""
+        for name in ("Bk_1", "bk_12", "BK1", "Neg_bk_1.raw", "Bk_1(1).raw", "Blk_01", "Blank1"):
+            self.assertEqual("Blank", _coverage_file_type(name), name)
+        for name in ("QC1", "QC01", "QC_01", "IQC_Neg_Start", "Pool_3", "SRM1950", "NIST_2"):
+            self.assertEqual("QC", _coverage_file_type(name), name)
+        for name in ("S1", "Bkg1", "Ctrl1- Fecal", "Poolside7", "Dobk_1"):
+            self.assertEqual("Sample", _coverage_file_type(name), name)
+
+    def test_a_unit_that_admits_only_its_bk_blanks_is_refused(self) -> None:
+        """Four samples and four Bk_n blanks, only the blanks admitted: 4 of 8 passed before the review."""
+        rows = [(f"A{index}", f"A{index}.raw") for index in range(1, 5)]
+        rows += [(f"Bk_{index}", f"Neg_bk_{index}.raw") for index in range(1, 5)]
+        project, payloads = _st001264([f"Neg_bk_{index}.raw" for index in range(1, 5)], rows)
+        project.ion_mode = "Negative"
+        with self.assertRaises(AttributionCoverageError) as raised:
+            self.lease(project, payloads)
+        coverage = raised.exception.coverage
+        self.assertEqual((ATTRIBUTION_COVERAGE_BELOW_MINIMUM, 4, 4, 0), (coverage["reason"], coverage["blank_rows"],
+                                                                      coverage["declared_rows"], coverage["admitted_rows"]))
+
+    def test_qc_rows_never_make_up_for_missing_samples(self) -> None:
+        """Four QCs and one of four samples: 5 of 8 rows, but a quarter of the samples."""
+        rows = [(f"QC0{index}", f"QC0{index}.raw") for index in range(1, 5)]
+        rows += [(f"A{index}", f"A{index}.raw") for index in range(1, 5)]
+        project, payloads = _st001264([*(f"QC0{index}.raw" for index in range(1, 5)), "A1.raw"], rows)
+        with self.assertRaises(AttributionCoverageError) as raised:
+            self.lease(project, payloads)
+        coverage = raised.exception.coverage
+        self.assertEqual((ATTRIBUTION_SAMPLE_COVERAGE_BELOW_MINIMUM, 0.625, 0.25),
+                         (coverage["reason"], coverage["ratio"], coverage["sample_ratio"]))
+        self.assertIn(coverage["reason"], ATTRIBUTION_COVERAGE_REFUSALS)
+
+
+class TheGateNeverPassesForWantOfAVerdict(_Workspace):
+    def test_rows_that_cannot_be_built_refuse_the_unit(self) -> None:
+        project, payloads = _st001264(["S1.raw"], [("S1", "S1.raw")])
+        manifest = self.lease(project, payloads)
+        with patch("msdial_app.repository_analysis_rows.build_repository_analysis_rows",
+                   side_effect=ValueError("broken row")):
+            coverage = attribution_coverage(manifest)
+        self.assertEqual(("refused", ATTRIBUTION_COVERAGE_NOT_COMPUTED), (coverage["status"], coverage["reason"]))
+        manifest["project"]["sample_metadata"] = []
+        with patch("msdial_app.repository_analysis_rows.build_repository_analysis_rows",
+                   side_effect=ValueError("broken row")):
+            self.assertEqual("not_evaluated", attribution_coverage(manifest)["status"])
+
+
+class TheGatesDenominator(_Workspace):
+    def test_a_control_sample_id_or_name_is_the_units_own_row(self) -> None:
+        """PR #58's exemption: Neg_Ctrl_1 in a positive unit names a negative control, not a polarity."""
+        project, payloads = _st001264(["NC1.raw", "Neg_Ctrl_2.raw", "S1.raw"],
+                                      [("Neg_Ctrl_1", "NC1.raw"), ("NC2", "Neg_Ctrl_2.raw"), ("S1", "S1.raw")])
+        coverage = self.lease(project, payloads)["attribution_coverage"]
+        self.assertEqual(("passed", 0, 3, 3), (coverage["status"], coverage["rows_of_another_unit"],
+                                               coverage["declared_rows"], coverage["admitted_rows"]))
+
+    def test_a_row_of_another_chromatography_is_another_units_where_the_rows_state_two(self) -> None:
+        """ST002330's reversed-phase unit lists HILIC-RN1-neg.mzXML beside C18-RN1-neg.mzXML."""
+        project, payloads = _st001264(["C18-R1.raw"], [("R1", "C18-R1.raw"), ("H1", "HILIC-H1.raw")])
+        manifest = self.lease(project, payloads)
+        manifest["project"]["separation"] = "Reversed phase"
+        coverage = attribution_coverage(manifest)
+        self.assertEqual((1, 1, 1.0), (coverage["declared_rows"], coverage["rows_of_another_unit"], coverage["ratio"]))
+        self.assertEqual([{"sample_row_index": 1, "sample_id": "H1", "reason": "raw_file_states_another_chromatography"}],
+                         coverage["rows_of_another_unit_listed"])
+
+    def test_a_glued_sample_id_is_read_only_for_a_row_that_names_no_file(self) -> None:
+        """b1_neg1 with raw_file .RAW is the negative unit's; Neg1 with a file of its own is this unit's row."""
+        project, payloads = _st001264(["Neg1.raw", "S1.raw"], [("Neg1", "Neg1.raw"), ("S1", "S1.raw")])
+        coverage = self.lease(project, payloads)["attribution_coverage"]
+        self.assertEqual((0, 2), (coverage["rows_of_another_unit"], coverage["declared_rows"]))
 
 
 if __name__ == "__main__":

@@ -984,7 +984,9 @@ class TheMembersNoRowPairsWithAreUnattributedInputs(_Workspace):
         manifest = self.unit(UNIT_SCOPED, members=YOUN, samples=[("Sample1", "Sample1")])
 
         self.assertEqual(sorted(YOUN), sorted(Path(item).name for item in manifest["input_candidates"]))
-        self.assertEqual(["unattributed_members_included"], manifest["warnings"])
+        # It runs (2026-10-07), and the coverage gate says on record that its rows alone are below the minimum (0.5.67).
+        self.assertEqual(["unattributed_members_included", "attribution_rows_below_minimum_unattributed_inputs_counted"],
+                         manifest["warnings"])
 
     def test_unit_scope_is_read_from_the_catalogs_download_scope(self) -> None:
         from msdial_app.repository_reanalysis import unit_scoped_download

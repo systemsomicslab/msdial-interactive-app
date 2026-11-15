@@ -821,34 +821,80 @@ def build_repository_analysis_rows(
 # The unit ran on those five, was marked done, and its raw data were deleted: a success that analysed 5% of its samples.
 #
 # The lease's attribute stage now asks how many of the unit's analytical sample rows attribution gave an input
-# (attribution_coverage), and refuses the unit before anything runs when that is fewer than ATTRIBUTION_COVERAGE_MINIMUM
-# of them, or when it admitted no row of a biological sample where the unit declares some (only blanks, QCs or
-# standards). The rows counted are the unit's own polarity's: a row whose names state only another polarity, or a
-# joined cell all of whose names are another unit's (sample_raw_file_reading), is another unit's row; a blank row is
-# no analytical row. A row is admitted when an input the analysis CSV would give it, or one the lease excluded for what
-# it holds (an undecodable mzML, a fragmentation method other than CID/HCD), is its. A unit with no such row is
-# recorded and not judged: the gate changes nothing for a unit whose declared rows are unknown or zero.
+# (attribution_coverage), and refuses the unit before anything runs when:
+# - fewer than ATTRIBUTION_COVERAGE_MINIMUM of its analytical rows were admitted (ATTRIBUTION_COVERAGE_BELOW_MINIMUM);
+# - it admitted no row of a biological sample where the unit declares some, only blanks, QCs or standards
+#   (ATTRIBUTION_ADMITTED_NO_SAMPLE);
+# - fewer than the minimum of its biological sample rows were admitted, however many QC rows were
+#   (ATTRIBUTION_SAMPLE_COVERAGE_BELOW_MINIMUM: 20 QCs and 1 of 20 samples is no unit);
+# - it admitted inputs while every one of its rows states another polarity, a Catalog mis-assignment
+#   (ATTRIBUTION_NO_ROWS_OF_THE_UNIT_POLARITY: ST004800's positive units carrying the negative archive);
+# - its rows could not be built to be counted (ATTRIBUTION_COVERAGE_NOT_COMPUTED): never a pass for want of a verdict.
+# The rows counted are the unit's own polarity's: a row whose names state only another polarity by a token of their own,
+# or a joined cell all of whose names are another unit's (sample_raw_file_reading), is another unit's row, each listed
+# with why; a blank row is no analytical row. A row is admitted when an input the analysis CSV would give it, or one the
+# lease excluded for what it holds (an undecodable mzML, a fragmentation method other than CID/HCD), is its; the record
+# also gives the share actually analysed (analysed_ratio). An unattributed input of a unit-scoped archive (the user's
+# decision of 2026-10-07: the unit's own run, with no row) counts as an admitted file, a blank or QC never; where the rows
+# alone fall short and such inputs make up the gap, the unit passes with the warning
+# ATTRIBUTION_ROWS_BELOW_MINIMUM_WARNING (whether that should refuse is the author's ruling, still open). A unit with no
+# sample rows is recorded and not judged: the gate changes nothing for a unit whose declared rows are unknown or zero.
 #
-# 0.5: conservative. The triage's partial cases that are right to run lose a row or two to repository typos (ST002044
-# 285 of 286, ST003576 18 of 20, ST005105 17 of 18), while the misfire it was written for admitted 5%. Below half, the
-# unit's samples are more missing than present, which no Class or contrast survives.
+# 0.5: conservative. The triage's partial cases that are right to run lose a row or two to repository typos (ST003576
+# 18 of 20, ST005105 17 of 18), while the misfire it was written for admitted 5%; on stage3b's done units every pass was
+# at 0.9 or more and every refusal a real short run. Below half, the unit's samples are more missing than present, which
+# no Class or contrast survives.
 ATTRIBUTION_COVERAGE_MINIMUM = 0.5
 ATTRIBUTION_COVERAGE_RULE = "attribution_coverage_2026_11_15"
 ATTRIBUTION_COVERAGE_BELOW_MINIMUM = "attribution_coverage_below_minimum"
 ATTRIBUTION_ADMITTED_NO_SAMPLE = "attribution_admitted_only_blanks_qc_or_standards"
+ATTRIBUTION_SAMPLE_COVERAGE_BELOW_MINIMUM = "attribution_sample_coverage_below_minimum"
+ATTRIBUTION_NO_ROWS_OF_THE_UNIT_POLARITY = "attribution_no_rows_of_the_unit_polarity"
+ATTRIBUTION_COVERAGE_NOT_COMPUTED = "attribution_coverage_not_computed"
 ATTRIBUTION_COVERAGE_NOT_EVALUATED = "not_evaluated"
+# Every reason the gate refuses a unit for (a campaign runner records each as a terminal failure, not a retry).
+ATTRIBUTION_COVERAGE_REFUSALS = frozenset(
+    {
+        ATTRIBUTION_COVERAGE_BELOW_MINIMUM,
+        ATTRIBUTION_ADMITTED_NO_SAMPLE,
+        ATTRIBUTION_SAMPLE_COVERAGE_BELOW_MINIMUM,
+        ATTRIBUTION_NO_ROWS_OF_THE_UNIT_POLARITY,
+        ATTRIBUTION_COVERAGE_NOT_COMPUTED,
+    }
+)
+# The warning a passed unit carries where its rows alone are below the minimum and unattributed inputs made up the gap.
+ATTRIBUTION_ROWS_BELOW_MINIMUM_WARNING = "attribution_rows_below_minimum_unattributed_inputs_counted"
 # How many rows the record lists by name (each list is counted in full beside it).
 _COVERAGE_LISTED = 100
+# Blank and QC names the gate reads beyond file_type_for's (review of 0.5.67: ST002512's admitted blanks were
+# Neg_bk_1.raw and Bk_1(1).raw, typed Sample). Whole tokens of a name, between non-alphanumerics, compared without case.
+_COVERAGE_BLANK_TOKEN = re.compile(r"^(?:bk|blk|blnk|blank|blanks)\d*$")
+_COVERAGE_QC_TOKEN = re.compile(r"^(?:qc|iqc|pqc|sqc|tqc|pool|pooled|nist|srm|srm1950|nist1950)\d*$")
+
+
+def _coverage_file_type(text: str) -> str:
+    """Blank, QC or Sample for a name or sample id as the gate reads it: file_type_for, and then its whole tokens
+    (_COVERAGE_BLANK_TOKEN, _COVERAGE_QC_TOKEN), so Bk_1, BK1, QC01, IQC_Neg_Start, Pool_3 and SRM1950 are no samples."""
+    stem = Path(text).stem if Path(text).suffix else text
+    found = file_type_for(stem)
+    if found != "Sample":
+        return found
+    tokens = [token for token in re.split(r"[^0-9a-z]+", str(stem).casefold()) if token]
+    if any(_COVERAGE_BLANK_TOKEN.match(token) for token in tokens):
+        return "Blank"
+    if any(_COVERAGE_QC_TOKEN.match(token) for token in tokens):
+        return "QC"
+    return "Sample"
 
 
 def _row_file_type(row: dict[str, Any], names: list[str]) -> str:
     """Sample, Blank, QC or Standard for a sample row, as the analysis CSV types its input: the row's own fields
-    (infer_analysis_file_type), else its sample id's and its names' tokens (file_type_for)."""
+    (infer_analysis_file_type), else its sample id's and its names' tokens (_coverage_file_type)."""
     inferred = infer_analysis_file_type(row)
     if inferred != "Sample":
         return inferred
     for text in (str(row.get("sample_id") or ""), *names):
-        found = file_type_for(Path(text).stem if Path(text).suffix else text)
+        found = _coverage_file_type(text)
         if found != "Sample":
             return found
     return "Sample"
@@ -869,14 +915,17 @@ def attribution_coverage(
     ``manifest`` is the unit's manifest, or the lease's view of it at the attribute stage (project, input_candidates,
     input_lineage, excluded_input_candidates, input_directory, raw_directory, archive_extractions, encoding_choices).
     Returns the record the lease writes as manifest.attribution_coverage: status passed, refused or not_evaluated; the
-    reason code; the counts (sample_rows, rows_of_another_unit, blank_rows, declared_rows, admitted_rows, ratio,
-    sample_rows_declared, sample_rows_admitted); admitted_by, the rule that admitted each input, counted, and inputs,
-    each input with its row and that rule; the declared rows left without an input; and the joined cells refused. See
-    the notes above ATTRIBUTION_COVERAGE_MINIMUM.
+    reason code; the counts (sample_rows, rows_of_another_unit with why for each, blank_rows, declared_rows,
+    admitted_rows, ratio, row_ratio, analysed_ratio, sample_rows_declared, sample_rows_admitted, sample_ratio);
+    admitted_by, the rule that admitted each input, counted, and inputs, each input with its row and that rule; the
+    declared rows left without an input; the joined cells refused; and warnings. See the notes above
+    ATTRIBUTION_COVERAGE_MINIMUM.
     """
     from .repository_reanalysis import (
         JOINED_NAMES_ANOTHER_UNIT,
         _sample_id_polarities,
+        name_chromatographies,
+        names_state_polarity,
         sample_raw_file_reading,
         unit_chromatography,
     )
@@ -892,6 +941,7 @@ def attribution_coverage(
         "reason": "",
         "unit_polarity": polarity or None,
         "unit_chromatography": unit_chromatography(typed) or None,
+        "warnings": [],
     }
     if not typed.analysis_unit_id:
         record["reason"] = "not_an_analysis_unit"
@@ -900,43 +950,86 @@ def attribution_coverage(
         built = build_repository_analysis_rows(manifest)
         samples = [row for row in _unit_workspace(manifest).get("rows") or [] if isinstance(row, dict)]
     except (KeyError, TypeError, ValueError, OSError) as error:
-        record.update(reason="rows_not_built", message=str(error) or type(error).__name__)
+        if not typed.sample_metadata:
+            record.update(reason="no_sample_rows", message=str(error) or type(error).__name__)
+            return record
+        # The unit declares rows, and they could not be counted: a refusal, never a pass for want of a verdict.
+        record.update(
+            status="refused",
+            reason=ATTRIBUTION_COVERAGE_NOT_COMPUTED,
+            message=(
+                f"The attribution coverage of analysis unit {typed.analysis_unit_id} could not be computed "
+                f"({type(error).__name__}: {error}); refusing to run the unit without it "
+                f"({ATTRIBUTION_COVERAGE_NOT_COMPUTED})."
+            ),
+        )
         return record
     covered = {int(row["sample_row_index"]) for row in built["rows"] if row.get("sample_row_index") is not None}
+    analysed = set(covered)
     excluded_rows = {
         int(item["sample_row_index"])
         for item in built.get("excluded_inputs") or []
         if item.get("sample_row_index") is not None
     }
     covered |= excluded_rows
-    another_unit: list[int] = []
+    another_unit: list[dict[str, Any]] = []
     another_by_joined = 0
     blanks: list[int] = []
     declared: list[int] = []
     types: dict[int, str] = {}
     joined_rows = 0
     joined_refused: list[dict[str, Any]] = []
+    # A sample id's pos/neg token beside a control, ctrl, blank or QC token is a polarity only where the ids name
+    # polarities elsewhere, as the names' readers read one (name_polarities).
+    ids_named = names_state_polarity(str(row.get("sample_id") or "") for row in samples)
+    # A row whose one name states another chromatography is another unit's only where the unit's rows state two
+    # (ST002330's RP unit lists HILIC-RN1-neg.mzXML beside C18-RN1-neg.mzXML); elsewhere "RP" may be a sample's code.
+    chromatography = unit_chromatography(typed)
+    row_chromatographies = {
+        str(index): name_chromatographies(name)
+        for index, row in enumerate(samples)
+        for name in split_names(row)[:1]
+        if len(split_names(row)) == 1
+    }
+    read_chromatography = bool(chromatography) and len(
+        {item for stated in row_chromatographies.values() for item in stated}
+    ) > 1
     for index, row in enumerate(samples):
         reading = sample_raw_file_reading(row, typed)
+        sample_id = str(row.get("sample_id") or "")
+        why = ""
         if reading["joined"]:
             joined_rows += 1
             if reading["reason"] and reading["reason"] != JOINED_NAMES_ANOTHER_UNIT:
                 joined_refused.append(
                     {
                         "sample_row_index": index,
-                        "sample_id": str(row.get("sample_id") or ""),
+                        "sample_id": sample_id,
                         "raw_file": str(row.get("raw_file") or ""),
                         "reason": reading["reason"],
                         "names": list(reading.get("candidates") or []),
+                        **({"read_whole": True} if reading.get("legacy_name") else {}),
                     }
                 )
-            elsewhere = reading["reason"] == JOINED_NAMES_ANOTHER_UNIT
-            another_by_joined += int(elsewhere)
-        else:
-            stated = set(reading["polarities"]) or _sample_id_polarities(str(row.get("sample_id") or ""))
-            elsewhere = bool(polarity and stated and polarity not in stated)
-        if elsewhere:
-            another_unit.append(index)
+            if reading["reason"] == JOINED_NAMES_ANOTHER_UNIT:
+                why = JOINED_NAMES_ANOTHER_UNIT
+                another_by_joined += 1
+        elif polarity:
+            stated = set(reading["polarities"])
+            source = "raw_file_states_another_polarity"
+            real = [name for name in reading["names"] if not name.startswith(".") and ":" not in name]
+            if not stated:
+                # Glued run numbers (b1_neg1) are read only for a row that names no file of its own (".RAW").
+                stated = _sample_id_polarities(sample_id, polarity_named=ids_named, glued=not real)
+                source = "sample_id_states_another_polarity"
+            if stated and polarity not in stated:
+                why = source
+        if not why and not reading["joined"] and read_chromatography:
+            stated_chromatographies = row_chromatographies.get(str(index)) or set()
+            if stated_chromatographies and chromatography not in stated_chromatographies:
+                why = "raw_file_states_another_chromatography"
+        if why:
+            another_unit.append({"sample_row_index": index, "sample_id": sample_id, "reason": why})
             continue
         types[index] = _row_file_type(row, list(reading["names"]) or split_names(row))
         (blanks if types[index] == "Blank" else declared).append(index)
@@ -944,15 +1037,22 @@ def attribution_coverage(
     samples_declared = [index for index in declared if types[index] == "Sample"]
     samples_admitted = [index for index in samples_declared if index in covered]
     # An unattributed input of a unit-scoped archive (the user's decision of 2026-10-07) is an admitted analysis file
-    # with no row: counted by its own name's type, a blank never.
+    # with no row: counted by its own name's type, a blank or QC never.
     unattributed = [
-        file_type_for(Path(str(row["input_path"])).stem)
+        _coverage_file_type(Path(str(row["input_path"])).stem)
         for row in built["rows"]
         if row.get("raw_file_paired_by") == UNATTRIBUTED_MEMBER_PAIRING
     ]
-    unattributed_counted = [kind for kind in unattributed if kind != "Blank"]
+    unattributed_counted = [kind for kind in unattributed if kind not in {"Blank", "QC"}]
+    unattributed_samples = len([kind for kind in unattributed_counted if kind == "Sample"])
     admitted_count = len(admitted) + len(unattributed_counted)
-    ratio = round(min(1.0, admitted_count / len(declared)), 4) if declared else None
+
+    def share(part: int, whole: int) -> float | None:
+        return round(min(1.0, part / whole), 4) if whole else None
+
+    ratio = share(admitted_count, len(declared))
+    row_ratio = share(len(admitted), len(declared))
+    sample_ratio = share(len(samples_admitted) + unattributed_samples, len(samples_declared))
     inputs = [
         {
             "input": Path(str(row["input_path"])).name,
@@ -977,12 +1077,16 @@ def attribution_coverage(
     record.update(
         sample_rows=len(samples),
         rows_of_another_unit=len(another_unit),
+        rows_of_another_unit_listed=another_unit[:_COVERAGE_LISTED],
         blank_rows=len(blanks),
         declared_rows=len(declared),
         admitted_rows=len(admitted),
         ratio=ratio,
+        row_ratio=row_ratio,
+        analysed_ratio=share(len([index for index in declared if index in analysed]), len(declared)),
         sample_rows_declared=len(samples_declared),
         sample_rows_admitted=len(samples_admitted),
+        sample_ratio=sample_ratio,
         rows_admitted_by_an_excluded_input=len([index for index in admitted if index in excluded_rows]),
         unattributed_inputs=len(unattributed),
         unattributed_inputs_counted=len(unattributed_counted),
@@ -1002,6 +1106,18 @@ def attribution_coverage(
         record["reason"] = "no_sample_rows"
         return record
     if not declared:
+        if another_unit and not blanks and built["rows"]:
+            record.update(
+                status="refused",
+                reason=ATTRIBUTION_NO_ROWS_OF_THE_UNIT_POLARITY,
+                message=(
+                    f"Every one of the {len(samples)} sample rows of analysis unit {typed.analysis_unit_id} states "
+                    f"another polarity than its own ({polarity}), yet attribution admitted {len(built['rows'])} "
+                    f"inputs ({ATTRIBUTION_NO_ROWS_OF_THE_UNIT_POLARITY}). Refusing to run the unit on files its rows "
+                    "do not declare; attribution_coverage lists each row and why."
+                ),
+            )
+            return record
         record["reason"] = "no_analytical_rows_of_the_unit_polarity"
         return record
     if ratio is not None and ratio < minimum:
@@ -1015,7 +1131,7 @@ def attribution_coverage(
                 "attribution_coverage lists the rows left without an input and the rule that admitted each input."
             ),
         )
-    elif samples_declared and not samples_admitted and "Sample" not in unattributed_counted:
+    elif samples_declared and not samples_admitted and not unattributed_samples:
         record.update(
             status="refused",
             reason=ATTRIBUTION_ADMITTED_NO_SAMPLE,
@@ -1025,8 +1141,24 @@ def attribution_coverage(
                 f"({ATTRIBUTION_ADMITTED_NO_SAMPLE}). Refusing to run the unit without its samples."
             ),
         )
+    elif sample_ratio is not None and sample_ratio < minimum:
+        record.update(
+            status="refused",
+            reason=ATTRIBUTION_SAMPLE_COVERAGE_BELOW_MINIMUM,
+            message=(
+                f"Attribution gave an input to {len(samples_admitted) + unattributed_samples} of the "
+                f"{len(samples_declared)} biological sample rows of analysis unit {typed.analysis_unit_id} "
+                f"({sample_ratio:.0%}), below the minimum of {minimum:.0%}, however many QC or standard rows it "
+                f"admitted ({ATTRIBUTION_SAMPLE_COVERAGE_BELOW_MINIMUM}). Refusing to run the unit on a fraction of "
+                "its samples."
+            ),
+        )
     else:
         record["status"] = "passed"
+        if row_ratio is not None and row_ratio < minimum:
+            # The 2026-10-07 decision runs unattributed inputs as the unit's own; whether the gate should refuse a unit
+            # whose rows alone fall short is the author's to rule. On record until then, never silent.
+            record["warnings"].append(ATTRIBUTION_ROWS_BELOW_MINIMUM_WARNING)
     return record
 
 

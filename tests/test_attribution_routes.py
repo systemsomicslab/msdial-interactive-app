@@ -21,8 +21,12 @@ _CONFIG = tempfile.TemporaryDirectory()
 with patch.dict(os.environ, {"LOCALAPPDATA": _CONFIG.name}):
     from msdial_app.repository_analysis_rows import build_repository_analysis_rows
     from msdial_app.repository_reanalysis import (
+        CHROMATOGRAPHY_CONTRADICTS_UNIT,
         CONVERTED_MEMBER_STEM_PAIRING,
         JOINED_NAME_OF_ANOTHER_UNIT,
+        JOINED_NAME_STATES_NO_POLARITY,
+        JOINED_NAMES_SHARE_A_BASENAME,
+        MARKER_CONTRADICTS_ION_MODE,
         JOINED_NAMES_ANOTHER_UNIT,
         JOINED_NAMES_SEVERAL_SAMPLES,
         LEADING_IDENTIFIER_TOKEN_PAIRING,
@@ -33,8 +37,10 @@ with patch.dict(os.environ, {"LOCALAPPDATA": _CONFIG.name}):
         _file_key,
         _member_name_pairings,
         _sample_file_names,
+        listing_marks_polarity,
         name_polarities,
         polarity_marker,
+        run_order_split,
         sample_raw_file_reading,
         split_joined_raw_file,
     )
@@ -73,6 +79,7 @@ class _Pairings(_Workspace):
         names = {_file_key(str(data_root / name)): name for name in members}
         return {
             "paired": {names[key]: (item["declared_raw_file"], item["paired_by"]) for key, item in found["paired"].items()},
+            "items": {names[key]: item for key, item in found["paired"].items()},
             "refused": found["refused"],
         }
 
@@ -117,13 +124,17 @@ class AJoinedCellIsSplitAndReadForTheUnit(unittest.TestCase):
         self.assertEqual(["pRPLC_1"], _reading("pRPLC_1; nRPLC_1", "Positive", "Reversed phase")["names"])
         self.assertEqual(["nRPLC_1"], _reading("pRPLC_1; nRPLC_1", "Negative")["names"])
 
-    def test_a_cell_whose_names_for_the_unit_are_two_samples_gives_no_name(self) -> None:
-        """ST002044 states no chromatography: D_10.mzML may be the other column's positive run. Never a guess."""
-        reading = _reading("D_10.mzML D_10NEG.mzML D10_POS.mzML D10_NEG.mzML", "Positive", "Reversed phase")
-        self.assertEqual(([], JOINED_NAMES_SEVERAL_SAMPLES), (reading["names"], reading["reason"]))
+    def test_a_cell_whose_names_for_the_unit_are_two_samples_is_read_whole_as_before(self) -> None:
+        """ST002044 states no chromatography: D_10.mzML may be the other column's positive run. Never a guess: the cell
+        is refused for R1 and read whole, as before 0.5.67, by the inferred rules alone (review of 0.5.67)."""
+        cell = "D_10.mzML D_10NEG.mzML D10_POS.mzML D10_NEG.mzML"
+        reading = _reading(cell, "Positive", "Reversed phase")
+        self.assertEqual(([cell], JOINED_NAMES_SEVERAL_SAMPLES, True),
+                         (reading["names"], reading["reason"], reading["legacy_name"]))
+        self.assertEqual(["D_10.mzML", "D_10NEG.mzML", "D10_POS.mzML"], reading["candidates"])
         # A unit of both polarities keeps both names of its chromatography, two samples, and is refused too.
         both = _reading("X_HILIC_NEG_1; X_HILIC_POS_1; X_RPPOS_1", "Both", "HILIC")
-        self.assertEqual(([], JOINED_NAMES_SEVERAL_SAMPLES), (both["names"], both["reason"]))
+        self.assertEqual(JOINED_NAMES_SEVERAL_SAMPLES, both["reason"])
 
     def test_a_cell_naming_only_the_other_polarity_is_another_units_row(self) -> None:
         reading = _reading("-; Pos_Bk_1.raw; -; Pos_Bk_1.mzML", "Negative")
@@ -223,11 +234,19 @@ class ATrailingMarkerIsAPolarity(_Pairings):
     def test_the_marker_is_read_only_at_the_end_of_the_stem(self) -> None:
         self.assertEqual(("ds1-93-001", "Positive"), polarity_marker("DS1-93-001+.raw"))
         self.assertEqual(("f2-27-01", "Negative"), polarity_marker("raw data/negative raw/F2-27-01-.raw"))
-        self.assertEqual(("ag-88-1", "Negative"), polarity_marker("AG-88-1_r1-.raw"))
+        self.assertEqual(("ag-88-1_r1", "Negative"), polarity_marker("AG-88-1_r1-.raw"))
+        self.assertEqual(("ag-88-1", "_r1"), run_order_split("ag-88-1_r1"))
+        self.assertIsNone(run_order_split("ag-88-1"))
         for name in ("DS1-93-001.raw", "x--.raw", "-.raw", "+.raw", "a-b.raw", "Ctrl1- Fecal.wiff"):
             self.assertIsNone(polarity_marker(name), name)
-        self.assertEqual({"Positive"}, name_polarities("DS1-93-001+.raw", polarity_named=False))
-        self.assertEqual({"Negative"}, name_polarities("x/F2-27-01-.raw", polarity_named=False))
+
+    def test_name_polarities_never_reads_a_marker(self) -> None:
+        """Tcell_CD8+.raw, Lps+.mzML and Apoe-.d name genotypes and cell types (review of 0.5.67)."""
+        for name in ("DS1-93-001+.raw", "x/F2-27-01-.raw", "Tcell_CD8+.raw", "Lps+.mzML", "Apoe-.d"):
+            self.assertEqual(set(), name_polarities(name, polarity_named=True), name)
+        self.assertFalse(listing_marks_polarity(["Tcell_CD8+.raw", "QC-D5-C-.mzML", "WT_1.raw"]))
+        self.assertTrue(listing_marks_polarity(["pos/DS1-93-001+.raw", "neg/DS1-93-001-.raw"]))
+        self.assertTrue(listing_marks_polarity(["AG-88-1_r1-.raw", "AG-88-1_r5+.raw"]))
 
     def test_an_st003328_shaped_negative_unit_takes_the_minus_file(self) -> None:
         members = ["DS1-93 raw files/positive/DS1-93-001+.raw", "DS1-93 raw files/negative/DS1-93-001-.raw",
@@ -307,6 +326,159 @@ class ARowsSampleIdThatIsAMemberStem(_Pairings):
         self.assertEqual([], built["failures"])
         self.assertEqual([("b1_pos1", SAMPLE_ID_MEMBER_STEM_PAIRING), ("b1_pos2", SAMPLE_ID_MEMBER_STEM_PAIRING)],
                          sorted((row["sample_id"], row["raw_file_paired_by"]) for row in built["rows"]))
+
+
+# ---- The review of 0.5.67: what the routes must never do ----------------------------------------------------------
+
+
+class AJoinedCellIsReadWithItsGluedPolarityOrWholeAsBefore(unittest.TestCase):
+    """Units that ran correctly before 0.5.67 (ST003767, ST004204, ST004173) must not lose their rows to R1."""
+
+    def test_two_names_differing_by_a_glued_polarity_keep_the_units(self) -> None:
+        self.assertEqual(["C11-LHneg.mzXML"], _reading("C11-LHPOS.mzXML C11-LHneg.mzXML", "Negative")["names"])
+        self.assertEqual(["C11-LHPOS.mzXML"], _reading("C11-LHPOS.mzXML C11-LHneg.mzXML", "Positive")["names"])
+        self.assertEqual(["CS_1.P.raw"], _reading("CS_1.P.raw CS_1.N.raw", "Positive")["names"])
+        self.assertEqual(["CS_1.N.raw"], _reading("CS_1.P.raw CS_1.N.raw", "Negative")["names"])
+        # A one-letter mark must follow a separator: S1p and S1n are not read so.
+        self.assertEqual(JOINED_NAMES_SEVERAL_SAMPLES, _reading("S1p.raw S1n.raw", "Positive")["reason"])
+
+    def test_a_control_token_states_no_polarity_unless_the_rows_name_files_by_polarity(self) -> None:
+        """A positive unit's Neg_Ctrl_1.raw (PR #58's exemption) is its own row in a joined cell too."""
+        reading = _reading("Neg_Ctrl_1.raw Neg_Ctrl_1.mzML", "Positive")
+        self.assertEqual((["Neg_Ctrl_1.raw", "Neg_Ctrl_1.mzML"], ""), (reading["names"], reading["reason"]))
+
+    def test_a_silent_name_beside_a_stated_one_is_no_reading_of_the_cell(self) -> None:
+        """S1_pos.raw; S1.raw in a negative unit: that S1.raw is the negative run is an inference, never kept as R1's."""
+        reading = _reading("S1_pos.raw; S1.raw", "Negative")
+        self.assertEqual((["S1_pos.raw; S1.raw"], JOINED_NAME_STATES_NO_POLARITY, True),
+                         (reading["names"], reading["reason"], reading["legacy_name"]))
+        self.assertEqual(JOINED_NAMES_SEVERAL_SAMPLES, _reading("S1_pos.raw; S1.raw", "Positive")["reason"])
+
+    def test_folders_are_read_and_a_shared_basename_gives_no_name(self) -> None:
+        reading = _reading("HILIC/S1_pos.raw; RP/S1_pos.raw", "Positive", "Reversed phase")
+        self.assertEqual(([], JOINED_NAMES_SHARE_A_BASENAME), (reading["names"], reading["reason"]))
+        self.assertEqual([{"name": "S1_pos.raw", "path": "HILIC/S1_pos.raw", "reason": "states_another_chromatography"}],
+                         reading["dropped"])
+
+    def test_chromatography_is_read_only_where_the_cell_states_two(self) -> None:
+        """RP_01 may be a sample's code: a cell of one chromatography is the unit's however it is named."""
+        self.assertEqual(["RP_01_neg.raw"], _reading("RP_01_neg.raw; RP_01_pos.raw", "Negative", "HILIC")["names"])
+
+
+class ACellReadWholeIsPairedAsBefore(_Pairings):
+    def test_a_cell_read_whole_is_paired_by_its_leading_identifier_as_before(self) -> None:
+        """ST004173's SAnc_1.raw SAnc_p1.raw states no polarity the reader parses: read whole, as before 0.5.67."""
+        found = self.pairings(
+            ["SAnc_1.raw", "SAnc_p1.raw", "SAnc_2.raw", "SAnc_p2.raw"],
+            [("a1", "SAnc_1.raw SAnc_p1.raw"), ("a2", "SAnc_2.raw SAnc_p2.raw")],
+            ion_mode="Negative",
+        )
+        self.assertEqual(
+            {"SAnc_1.raw": ("SAnc_1.raw SAnc_p1.raw", LEADING_IDENTIFIER_TOKEN_PAIRING),
+             "SAnc_2.raw": ("SAnc_2.raw SAnc_p2.raw", LEADING_IDENTIFIER_TOKEN_PAIRING)},
+            found["paired"],
+        )
+
+
+class AClaimantDroppedForItsPolarityLeavesNoTwinsToPair(_Pairings):
+    """R3 must not turn a refusal into a pairing of two chromatographies or two runs (review of 0.5.67)."""
+
+    MEMBERS = ["RP_neg/x_S1.raw", "HILIC_neg/x_S1.raw", "RP_pos/x_S1.raw", "HILIC_pos/x_S1.raw"]
+
+    def test_with_no_chromatography_stated_two_negative_twins_pair_neither(self) -> None:
+        found = self.pairings(self.MEMBERS, [("S1", "S1.raw")], ion_mode="Negative")
+        self.assertEqual({}, found["paired"])
+        self.assertEqual({("RP_neg/x_S1.raw", "not_one_to_one"), ("HILIC_neg/x_S1.raw", "not_one_to_one")},
+                         {(item["member_name"], item["reason"]) for item in found["refused"]
+                          if item["reason"] == "not_one_to_one"})
+
+    def test_the_units_chromatography_drops_the_other_columns_folder(self) -> None:
+        found = self.pairings(self.MEMBERS, [("S1", "S1.raw")], ion_mode="Negative", separation="Reversed phase")
+        self.assertEqual({"RP_neg/x_S1.raw": ("S1.raw", PREFIXED_MEMBER_PAIRING)}, found["paired"])
+        self.assertIn(("HILIC_neg/x_S1.raw", CHROMATOGRAPHY_CONTRADICTS_UNIT),
+                      {(item["member_name"], item["reason"]) for item in found["refused"]})
+
+    def test_an_old_run_beside_the_new_is_not_the_same_sample(self) -> None:
+        members = ["neg/Proj_S1.mzML", "neg_old/Proj_S1.mzML", "pos/Proj_S1.mzML"]
+        self.assertEqual({}, self.pairings(members, [("S1", "S1.mzML")], ion_mode="Negative")["paired"])
+
+    def test_the_token_rule_asks_the_same(self) -> None:
+        members = ["RP_neg/VV_13_C1_exp344.raw", "HILIC_neg/VV_13_C1_exp344.raw", "RP_pos/VV_13_C1_exp344.raw"]
+        self.assertEqual({}, self.pairings(members, [("c1", "VV_13_C1.raw")], ion_mode="Negative")["paired"])
+
+
+class TheMarkerRuleKeepsRunSuffixesAndChromatography(_Pairings):
+    def test_a_run_suffix_naming_a_row_is_never_stripped(self) -> None:
+        found = self.pairings(["S1_r1+.raw", "S1_r1-.raw"], [("a", "S1"), ("b", "S1_r1")], ion_mode="Positive")
+        self.assertEqual({"S1_r1+.raw": ("S1_r1", MARKED_MEMBER_STEM_PAIRING)}, found["paired"])
+        self.assertNotIn("run_suffix", found["items"]["S1_r1+.raw"])
+
+    def test_a_stripped_run_suffix_is_recorded(self) -> None:
+        found = self.pairings(["P2_r5+.raw", "P25+.raw"], [("p2", "P2")], ion_mode="Positive")
+        self.assertEqual({"P2_r5+.raw": ("P2", MARKED_MEMBER_STEM_PAIRING)}, found["paired"])
+        self.assertEqual("_r5", found["items"]["P2_r5+.raw"]["run_suffix"])
+
+    def test_another_chromatographys_folder_is_refused(self) -> None:
+        found = self.pairings(["HILIC/S1+.raw"], [("1", "S1")], ion_mode="Positive", separation="Reversed phase")
+        self.assertEqual({}, found["paired"])
+        self.assertEqual([CHROMATOGRAPHY_CONTRADICTS_UNIT], [item["reason"] for item in found["refused"]])
+
+    def test_a_unit_of_no_stated_polarity_pairs_nothing_by_a_marker(self) -> None:
+        self.assertEqual({}, self.pairings(["S1+.raw"], [("1", "S1")], ion_mode="Unknown")["paired"])
+
+
+class TheSampleIdRuleIsScoped(_Pairings):
+    def test_rows_sharing_a_file_name_are_each_declared_by_their_sample_id(self) -> None:
+        """ST002823's dated rows name one Ctrl1- Fecal.raw; each pairing must stay its own row's."""
+        members = ["F/12-5-2020Ctrl1- Fecal.raw", "F/12-12-2020Ctrl1- Fecal.raw"]
+        rows = [("12-5-2020Ctrl1- Fecal", "Ctrl1- Fecal.raw"), ("12-12-2020Ctrl1- Fecal", "Ctrl1- Fecal.raw")]
+        found = self.pairings(members, rows)
+        self.assertEqual(
+            {members[0]: ("12-5-2020Ctrl1- Fecal", SAMPLE_ID_MEMBER_STEM_PAIRING),
+             members[1]: ("12-12-2020Ctrl1- Fecal", SAMPLE_ID_MEMBER_STEM_PAIRING)},
+            found["paired"],
+        )
+
+    def test_rows_sharing_a_file_name_each_reach_the_csv(self) -> None:
+        members = ["F/12-5-2020Ctrl1- Fecal.raw", "F/12-12-2020Ctrl1- Fecal.raw"]
+        rows = [("12-5-2020Ctrl1- Fecal", "Ctrl1- Fecal.raw"), ("12-12-2020Ctrl1- Fecal", "Ctrl1- Fecal.raw")]
+        project, payloads = _st001264(members, rows)
+        manifest = self.lease(project, payloads)
+        self.assertEqual(sorted(Path(name).name for name in members),
+                         sorted(Path(item).name for item in manifest["input_candidates"]))
+        built = build_repository_analysis_rows(manifest)
+        self.assertEqual([], built["failures"])
+        self.assertEqual(sorted(sample for sample, _raw in rows), sorted(row["sample_id"] for row in built["rows"]))
+
+    def test_the_units_chromatography_and_one_folder_are_required(self) -> None:
+        members = ["HILIC/S1.mzML", "RP/S1.mzML"]
+        self.assertEqual({}, self.pairings(members, [("S1", ".RAW")])["paired"])
+        found = self.pairings(members, [("S1", ".RAW")], separation="Reversed phase")
+        self.assertEqual({"RP/S1.mzML": ("S1", SAMPLE_ID_MEMBER_STEM_PAIRING)}, found["paired"])
+
+    def test_a_typo_is_never_corrected_through_the_sample_id(self) -> None:
+        """ST002452's 384_SPC-GM.mzXML for 384_SPC_GM.mzXML needs a curated correction, not R6."""
+        self.assertEqual({}, self.pairings(["384_SPC_GM.raw"], [("384_SPC_GM", "384_SPC-GM.raw")])["paired"])
+
+    def test_a_unit_of_no_stated_polarity_pairs_nothing_by_a_sample_id(self) -> None:
+        self.assertEqual({}, self.pairings(["b1_x1.raw"], [("b1_x1", ".RAW")], ion_mode="Both")["paired"])
+
+
+class AMarkedTwinIsLeftOutOnlyWhereTheListingMarksTwins(_Workspace):
+    def test_a_lone_marked_name_stays_an_unattributed_input(self) -> None:
+        """ST004304's QC-D5-C-.mzML in a positive unit is a typo, not a negative run."""
+        project, payloads = _st001264(["S1.raw", "QC-D5-C-.raw"], [("S1", "S1.raw")])
+        project.download_scope = dict(UNIT_SCOPED)
+        manifest = self.lease(project, payloads)
+        self.assertEqual(["QC-D5-C-.raw", "S1.raw"], sorted(Path(item).name for item in manifest["input_candidates"]))
+
+    def test_the_other_polaritys_twin_is_left_out(self) -> None:
+        project, payloads = _st001264(["S1.raw", "x/T1+.raw", "x/T1-.raw"], [("S1", "S1.raw")])
+        project.download_scope = dict(UNIT_SCOPED)
+        manifest = self.lease(project, payloads)
+        self.assertEqual(["S1.raw", "T1+.raw"], sorted(Path(item).name for item in manifest["input_candidates"]))
+        self.assertIn(("T1-.raw", MARKER_CONTRADICTS_ION_MODE),
+                      {(item["member_name"], item["reason"]) for item in manifest["unattributed_members"]["left_out"]})
 
 
 if __name__ == "__main__":
