@@ -578,8 +578,12 @@ class ADeclaredNameBehindAPrefixIsPairedOneToOne(_Workspace):
         self.assertEqual({}, self.pairing(["x_S1.raw"], [("s", "S1.raw")], files=listed))
 
     def test_a_declared_name_two_members_carry_is_paired_with_neither(self) -> None:
-        """A shared study archive with a folder per polarity holds a run of the same name in each."""
-        self.assertEqual({}, self.pairing(["POS/x_S1.raw", "NEG/x_S1.raw"], [("s", "S1.raw")]))
+        """A shared study archive with a folder per polarity holds a run of the same name in each. In a unit of no
+        stated polarity the two are two candidates, and neither is paired; in a positive unit the NEG/ one is no
+        candidate at all (R3, 2026-11-15), and the POS/ one is the name's."""
+        members = ["POS/x_S1.raw", "NEG/x_S1.raw"]
+        self.assertEqual({}, self.pairing(members, [("s", "S1.raw")], ion_mode="Unknown"))
+        self.assertEqual({"POS/x_S1.raw": "S1.raw"}, self.pairing(members, [("s", "S1.raw")]))
 
     def test_a_member_that_ends_in_two_declared_names_is_paired_with_neither(self) -> None:
         self.assertEqual({}, self.pairing(["x_A_B.raw"], [("a", "A_B.raw"), ("b", "B.raw")]))
@@ -641,6 +645,8 @@ class TheLeaseAttributesAPrefixedMember(_Workspace):
 
     def test_without_a_one_to_one_pairing_the_lease_still_refuses_to_fall_back(self) -> None:
         project, payloads = _st001264(["POS/x_S1.raw", "NEG/x_S1.raw"], [("s", "S1.raw")])
+        # A unit of no stated polarity: in a positive one the NEG/ member is no candidate (R3) and POS/ pairs.
+        project.ion_mode = "Unknown"
 
         with self.assertRaisesRegex(ValueError, "Refusing to fall back to accession-level inputs"):
             self.lease(project, payloads)
@@ -978,7 +984,9 @@ class TheMembersNoRowPairsWithAreUnattributedInputs(_Workspace):
         manifest = self.unit(UNIT_SCOPED, members=YOUN, samples=[("Sample1", "Sample1")])
 
         self.assertEqual(sorted(YOUN), sorted(Path(item).name for item in manifest["input_candidates"]))
-        self.assertEqual(["unattributed_members_included"], manifest["warnings"])
+        # It runs (2026-10-07), and the coverage gate says on record that its rows alone are below the minimum (0.5.67).
+        self.assertEqual(["unattributed_members_included", "attribution_rows_below_minimum_unattributed_inputs_counted"],
+                         manifest["warnings"])
 
     def test_unit_scope_is_read_from_the_catalogs_download_scope(self) -> None:
         from msdial_app.repository_reanalysis import unit_scoped_download
@@ -2155,10 +2163,12 @@ class APairingNeverCrossesAPolarityToken(_Workspace):
     def test_a_prefixed_member_of_the_other_polarity_is_refused_and_recorded(self) -> None:
         result = self.pairings(["NEG_S1.raw", "NEG_S2.raw", "POS_S2.raw"], [("1", "S1.raw"), ("2", "S2.raw")])
 
-        self.assertEqual({}, result["paired"])
+        # R3 (2026-11-15): the NEG_ claimant of S2.raw is dropped before the one-to-one test, so POS_S2.raw is S2's.
+        self.assertEqual({"S2.raw"}, {item["declared_raw_file"] for item in result["paired"].values()})
         refused = {(item["member_name"].casefold(), item["reason"]) for item in result["refused"]}
         self.assertIn(("neg_s1.raw", "polarity_token_contradicts_ion_mode"), refused)
-        self.assertIn(("neg_s2.raw", "not_one_to_one"), refused)
+        self.assertIn(("neg_s2.raw", "polarity_token_contradicts_ion_mode"), refused)
+        self.assertNotIn(("neg_s2.raw", "not_one_to_one"), refused)
 
     def test_a_polarity_folder_counts_as_a_token_of_the_members_path(self) -> None:
         result = self.pairings(["NEG/x_S1.raw"], [("1", "S1.raw")])

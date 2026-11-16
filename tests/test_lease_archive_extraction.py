@@ -474,15 +474,16 @@ class PerSampleContainerArchivesAreAttributed(_Workspace):
         self.assertFalse((raw / "x1").exists())
 
     def test_two_archives_with_the_same_bytes_keep_a_listing_each(self) -> None:
-        """The listing is named by the archive's sha256; a second copy must not write over the first's."""
-        blank = self._waters("blank")
-        payloads = {"https://example.org/FILES/pos/Blank.raw.zip": blank,
-                    "https://example.org/FILES/neg/Blank_neg.raw.zip": blank}
+        """The listing is named by the archive's sha256; a second copy must not write over the first's. Sample rows, since
+        the attribution coverage gate refuses a unit that admits blanks alone."""
+        same = self._waters("S1")
+        payloads = {"https://example.org/FILES/pos/S1.raw.zip": same,
+                    "https://example.org/FILES/neg/S1_neg.raw.zip": same}
         project = _unit(
-            [RepositoryFile("FILES/pos/Blank.raw.zip", 10, "https://example.org/FILES/pos/Blank.raw.zip"),
-             RepositoryFile("FILES/neg/Blank_neg.raw.zip", 10,
-                            "https://example.org/FILES/neg/Blank_neg.raw.zip")],
-            {"blank-pos": "Blank.raw.zip", "blank-neg": "Blank_neg.raw.zip"},
+            [RepositoryFile("FILES/pos/S1.raw.zip", 10, "https://example.org/FILES/pos/S1.raw.zip"),
+             RepositoryFile("FILES/neg/S1_neg.raw.zip", 10,
+                            "https://example.org/FILES/neg/S1_neg.raw.zip")],
+            {"s1-pos": "S1.raw.zip", "s1-neg": "S1_neg.raw.zip"},
         )
         lease = create_download_lease(project, self.root, 10_000, client=_Client(payloads))
 
@@ -975,7 +976,11 @@ class AUnitOfFilesRecordsWhatItAlwaysDid(_Workspace):
         )
         lease = create_download_lease(project, self.root, 10_000, client=_Client(payloads))
 
-        self.assertEqual({"lease_stages", "archive_extractions"}, set(lease) - self.LEGACY_KEYS)
+        # And the coverage gate's record (0.5.67), which every lease writes.
+        self.assertEqual({"lease_stages", "archive_extractions", "attribution_coverage"}, set(lease) - self.LEGACY_KEYS)
+        self.assertEqual(("passed", 2, 2), (lease["attribution_coverage"]["status"],
+                                            lease["attribution_coverage"]["declared_rows"],
+                                            lease["attribution_coverage"]["admitted_rows"]))
         self.assertEqual(set(), self.LEGACY_KEYS - set(lease))
         self.assertEqual([], lease["archive_extractions"])
         self.assertEqual(

@@ -27,6 +27,7 @@ with patch.dict(os.environ, {"LOCALAPPDATA": _CONFIG.name}):
         CONVERTED_MEMBER_STEM_PAIRING,
         INFERRED_PAIRING_WARNING,
         LEADING_IDENTIFIER_TOKEN_PAIRING,
+        SAMPLE_ID_MEMBER_STEM_PAIRING,
         RepositoryFile,
         _file_key,
         _member_name_pairings,
@@ -118,12 +119,20 @@ class ADeclaredVendorFileIsItsDepositedMzml(_Pairing):
         )
 
     def test_one_stem_in_two_polarity_folders_is_two_samples_and_pairs_neither(self) -> None:
-        found = self.pairings(["POS/S1.mzML", "NEG/S1.mzML"], [("s", "S1.raw")])
+        found = self.pairings(["POS/S1.mzML", "NEG/S1.mzML"], [("s", "S1.raw")], ion_mode="Unknown")
 
         self.assertEqual({}, found["paired"])
         self.assertEqual(
             {"member_stem_not_one_sample"}, {entry["reason"] for entry in found["refused"]}
         )
+
+    def test_in_a_unit_of_one_polarity_the_other_folders_mzml_is_dropped_first(self) -> None:
+        """R3 (2026-11-15): NEG/S1.mzML is no candidate in a positive unit, so POS/S1.mzML is S1.raw's."""
+        found = self.pairings(["POS/S1.mzML", "NEG/S1.mzML"], [("s", "S1.raw")])
+
+        # Alone under its key once NEG/ is dropped, the own-stem mzML is paired by the key, as it always was.
+        self.assertEqual({"POS/S1.mzML": ("S1.raw", LEADING_IDENTIFIER_TOKEN_PAIRING)}, found["paired"])
+        self.assertEqual(["polarity_token_contradicts_ion_mode"], [entry["reason"] for entry in found["refused"]])
 
     def test_a_stem_two_sample_rows_record_pairs_neither(self) -> None:
         found = self.pairings(["S1.mzML"], [("a", "S1.raw"), ("b", "S1.wiff")])
@@ -155,13 +164,17 @@ class ADeclaredVendorFileIsItsDepositedMzml(_Pairing):
             {"VV_13_HEpG2_C1_pos.mzML": ("VV_13_HEpG2_C1_pos.raw", LEADING_IDENTIFIER_TOKEN_PAIRING)}, found["paired"]
         )
 
-    def test_st004751s_row_that_names_two_files_in_one_field_pairs_nothing(self) -> None:
+    def test_st004751s_row_that_names_two_files_in_one_field_pairs_its_own_polaritys_name(self) -> None:
+        """R1 (2026-11-15): the joined cell gives a positive unit QC1_pos.raw, whose own-stem mzML is the row's."""
         samples = [("QC1", "QC1_neg.raw QC1_pos.raw"), ("C1", "C1_neg.raw C1_pos.raw")]
-        self.assertEqual({}, self.pairings(["QC1_pos.mzML"], samples, ion_mode="Positive")["paired"])
+        self.assertEqual({"QC1_pos.mzML": ("QC1_pos.raw", LEADING_IDENTIFIER_TOKEN_PAIRING)},
+                         self.pairings(["QC1_pos.mzML"], samples, ion_mode="Positive")["paired"])
 
-    def test_st004757s_rows_that_name_only_an_extension_pair_nothing(self) -> None:
+    def test_st004757s_rows_that_name_only_an_extension_pair_nothing_by_stem(self) -> None:
+        """No stem rule pairs ".RAW"; R6 (2026-11-15) pairs the row's sample id with its own polarity's member only."""
         samples = [("b1_neg1", ".RAW"), ("b1_pos1", ".RAW")]
-        self.assertEqual({}, self.pairings(["b1_neg1.mzML", "b1_pos1.mzML"], samples)["paired"])
+        found = self.pairings(["b1_neg1.mzML", "b1_pos1.mzML"], samples)
+        self.assertEqual({"b1_pos1.mzML": ("b1_pos1", SAMPLE_ID_MEMBER_STEM_PAIRING)}, found["paired"])
 
     def test_a_unit_whose_catalog_declared_its_inputs_is_matched_by_path_and_never_by_stem(self) -> None:
         declared = [{"path": "S1.raw", "kind": "file", "sample_id": "s"}]
@@ -254,8 +267,9 @@ class TheLeaseRunsTheDepositedMzml(_Workspace):
         )
 
     def test_without_a_member_of_any_rows_stem_the_lease_still_refuses_to_fall_back(self) -> None:
+        # Since R1 a positive unit's joined cell gives QC1_pos.raw, so only the other polarity's mzML is deposited here.
         samples = [("QC1", "QC1_neg.raw QC1_pos.raw"), ("C1", "C1_neg.raw C1_pos.raw")]
-        project, payloads = _st001264(["QC1_pos.mzML"], samples, {"QC1_pos.mzML": _mzml("QC1_pos.raw")})
+        project, payloads = _st001264(["QC1_neg.mzML"], samples, {"QC1_neg.mzML": _mzml("QC1_neg.raw")})
 
         with self.assertRaisesRegex(ValueError, "Refusing to fall back to accession-level inputs"):
             self.lease(project, payloads)
