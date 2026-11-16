@@ -417,6 +417,14 @@ For an accession-to-mzTab-M workflow, prefer the higher-level repository tools:
   and a `run_order` that keeps units sharing an object together; with a
   campaign approval, `pre_claim=true` records a store claim for each covered
   unit so a shared object is kept until it has run.
+- `curated_selection_path` (0.5.69) on the plan and download tools, and
+  `curated_selection_paths` on the batch plan, hold a Catalog unit to its triage file
+  (msdial-unit-triage.v1): its kept rows only, declared by archive member path. A
+  Both unit needs `curated_selection_child_key`. A triage that does not hold returns
+  its `curated_selection_*` code with `retryable: false`, before any download.
+- `msdial_repository_cross_unit_check`: after every sibling unit's preflight, compare
+  their Sample inputs and refuse a polarity contradiction, a set shared across
+  chromatographies, or an identical set (recorded as `cross_unit_attribution`).
 - `msdial_download_store_status`: read-only view of the accession download
   stores (`<workspace_root>\<repository>\<accession>\_dl`): each object and the
   units whose claims keep it, partial transfers, lock holders, unclaimed

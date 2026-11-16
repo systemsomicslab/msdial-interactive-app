@@ -544,6 +544,32 @@ partial transfer - with the repeats that changed nothing listed in its
 never taken for units. `msdial_download_store_status` shows every store, read
 only.
 
+## A curated selection (0.5.69)
+
+A unit of a multi-unit accession is held to the file list an agent decided before
+download (msdial-unit-triage.v1, checked by `validate-triage.py`, carried by the
+approved campaign manifest). Pass the triage as `curated_selection_path` with the
+unit's handoff; a Both unit also names its single-polarity child
+(`curated_selection_child_key`, unit `<unit_id>-<child_key>`). Interactive then:
+
+1. checks the triage before download: its schema, `status: ready`, the unit and
+   accession, the Catalog handoff sha256 it was made from (the handoff file read,
+   or `original_handoff_sha256` for a rewritten copy), the row count, one
+   polarity, a member for every kept row, and, where the campaign approval names
+   its manifest, that the manifest carries this triage's sha256 for the unit;
+2. cuts the sample rows to the kept rows and declares one input per kept row by
+   its archive member path, so the lease of the whole archive admits only those;
+3. records `repository_metadata.curated_selection`: every hash (triage, decision
+   record, handoff, canonical selection), who decided it, rows kept and dropped
+   with reasons, and whether it is a model inference or an accepted decision;
+4. compares each input's raw header with the triage after the preflight; a
+   disagreement holds the unit for a person (`triage_header_disagreement`);
+5. lets `msdial_repository_cross_unit_check` compare the units of one group once
+   all are preflighted.
+
+Every refusal is final for the triage as written (`retryable: false`): a revised
+triage is planned again; nothing reruns on its own.
+
 ## Reproducible candidate selection
 
 Run commands from the repository root with the Python used for MS-DIAL

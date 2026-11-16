@@ -227,6 +227,8 @@ def apply_class_proposal(workspace: dict[str, Any], proposal: dict[str, Any]) ->
                 # Present when the unit was split by acquisition mode and this run holds only part of
                 # the samples the proposal was made for.
                 **({"split_from": dict(proposal["split_from"])} if proposal.get("split_from") else {}),
+                # Present when the run is held to a curated selection (0.5.69) and holds only its kept rows' samples.
+                **({"curated_from": dict(proposal["curated_from"])} if proposal.get("curated_from") else {}),
             },
             "projected_at": datetime.now(timezone.utc).isoformat(),
         }

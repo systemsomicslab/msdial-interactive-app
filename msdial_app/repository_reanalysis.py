@@ -2413,6 +2413,8 @@ def create_download_lease(
             unattributed_members=unattributed_members,
             encoding_choices=kept_choices,
         )
+        # A unit held to a curated selection (0.5.69): each row says the triage admitted it, and which row it is.
+        tag_curated_lineage(input_lineage, project, data_root)
         if conversion_rows:
             input_lineage["conversion_sources"] = conversion_rows
         # The inputs admitted only because a rule inferred which declared raw file they are; each lineage row
@@ -3738,6 +3740,13 @@ def _verify_object_checksum(
         result["declared_checksum_algorithm"] = "md5"
         return "md5_verified"
     return "not_compared"
+
+
+def tag_curated_lineage(table: dict[str, Any], project: RepositoryProject, data_root: Path) -> None:
+    """curated_selection.tag_curated_lineage: selected_by and triage_row_index on each row a curated selection admitted."""
+    from .curated_selection import tag_curated_lineage as tag
+
+    tag(table, project, data_root)
 
 
 def build_input_lineage(
@@ -6136,6 +6145,14 @@ def finalize_download_lease(manifest_path: Path, run: dict[str, Any] | None = No
         current["retained_artifact_inventory"] = inventory
         current["project_archive"] = str(project_archive) if project_archive else ""
         current["finalized_at"] = finalized_at
+        # What a replay on another machine compares (0.5.69, curated_selection.replay_projection): a whitelist of
+        # this manifest with no timestamps, job ids, hosts or absolute paths, and its sha256.
+        from . import __version__ as interactive_version
+        from .curated_selection import canonical_json, replay_projection, sha256_bytes
+
+        projection = replay_projection(current, interactive_version)
+        current["replay_projection"] = projection
+        current["replay_projection_sha256"] = sha256_bytes(canonical_json(projection))
         if run:
             artifacts = run.get("artifacts") or {}
             current["finalized_run"] = {
@@ -6994,6 +7011,15 @@ def _record_preflight(
         disposition["campaign"] = dict(campaign)
         _apply_disposition(current, disposition, assignments)
     current["campaign_disposition"] = disposition
+    reconciliation = disposition.get("curated_selection_reconciliation")
+    if isinstance(reconciliation, dict):
+        # The unit was held to a triage (0.5.69): what its headers said of it, beside the disposition, and a
+        # disagreement keeps it from running in or out of a campaign. A person decides; nothing retries it.
+        current["curated_selection_reconciliation"] = reconciliation
+        if reconciliation.get("verdict") == "disagree":
+            current["execution_allowed"] = False
+            if campaign is None:
+                current["status"] = "preflight_review_required"
 
 
 def _apply_disposition(

@@ -864,7 +864,10 @@ Core MCP tools:
 - `msdial_inspect_repository_metadata`: inspect public sample metadata and publication provenance
 - `msdial_project_repository_classes`: project a user-selected metadata hierarchy into MS-DIAL `Class`
 - `msdial_save_repository_metadata`: save reviewed JSON/TSV and optional analysis metadata CSV
-- `msdial_repository_batch_plan`: split Catalog handoffs into independent analysis-unit runs
+- `msdial_repository_batch_plan`: split Catalog handoffs into independent analysis-unit runs; with
+  `curated_selection_paths`, hold units to their triage files (0.5.69)
+- `msdial_repository_cross_unit_check`: after sibling units' preflights, refuse a unit whose Sample inputs are another
+  unit's (polarity contradiction, a set shared across chromatographies, an identical set)
 - `msdial_repository_reanalysis_plan`: plan an accession or Catalog analysis unit without downloading data
 - `msdial_download_repository_raw`: start a bounded repository download after explicit confirmation
 - `msdial_repository_raw_metadata_preflight`: cross-check every raw header by default with the local parser
