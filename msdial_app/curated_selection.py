@@ -37,6 +37,7 @@ from __future__ import annotations
 
 import csv
 import hashlib
+import io
 import json
 import re
 from pathlib import Path, PurePosixPath
@@ -47,7 +48,7 @@ PROVENANCE_SCHEMA = "msdial-curated-selection.v1"
 RECONCILIATION_SCHEMA = "msdial-curated-selection-reconciliation.v1"
 CROSS_UNIT_SCHEMA = "msdial-cross-unit-attribution.v1"
 CROSS_UNIT_RULE = "cross_unit_attribution_2026_11_16b"
-SELECTION_CANONICAL_FORM = "msdial-curated-selection-canonical.v1"
+SELECTION_CANONICAL_FORM = "msdial-selection-canonical.v1"
 
 # Refusals before download (CuratedSelectionError.code). Each is final for the triage as it is: the same triage and
 # handoff give the same refusal, so none is retried.
@@ -61,6 +62,7 @@ CURATED_SELECTION_MIXED_POLARITY = "curated_selection_mixed_polarity"
 CURATED_SELECTION_MEMBER_UNRESOLVED = "curated_selection_member_unresolved"
 CURATED_SELECTION_EMPTY = "curated_selection_empty"
 CURATED_SELECTION_CLASS_CONTRAST_LOST = "curated_selection_class_contrast_lost"
+CURATED_SELECTION_SELECTION_MISMATCH = "curated_selection_selection_mismatch"
 # After the preflight: the raw headers say otherwise than the triage. A hold for a person, never a rerun.
 TRIAGE_HEADER_DISAGREEMENT = "triage_header_disagreement"
 # After every sibling's preflight (cross_unit_attribution).
@@ -83,6 +85,7 @@ CURATED_SELECTION_REFUSALS = frozenset(
         CURATED_SELECTION_MEMBER_UNRESOLVED,
         CURATED_SELECTION_EMPTY,
         CURATED_SELECTION_CLASS_CONTRAST_LOST,
+        CURATED_SELECTION_SELECTION_MISMATCH,
     }
 )
 CROSS_UNIT_REFUSALS = frozenset(
@@ -160,38 +163,102 @@ def _member_key(text: Any) -> str:
     return str(text or "").replace("\\", "/").strip().strip("/").casefold()
 
 
-def selection_canonical(triage: Mapping[str, Any], child_key: str = "") -> list[dict[str, Any]]:
-    """The selection as the transparency framework (msdial-public-reanalysis#59, section 3) canonicalises it.
+def _selection_member(path: Any) -> str:
+    return str(path or "").replace("\\", "/").strip().strip("/")
 
-    One entry per kept row, {unit_id, archive_sha256 or archive_name, member_path, crc32, size, sample_row_index,
-    child_key}, sorted. ``unit_id`` is the campaign unit key (``<unit_id>-<child_key>`` for a child). crc32 and size
-    are the triage row's own where it records them (a v2 triage may), else null: the value is what the triage says,
-    never what a download found.
+
+def selection_canonical(
+    triage: Mapping[str, Any],
+    listing: Mapping[str, Mapping[str, Any]] | None = None,
+    child: Mapping[str, Any] | str | None = None,
+) -> list[dict[str, Any]]:
+    """The selection in SELECTION_CANONICAL_FORM (msdial-selection-canonical.v1): the normative definition of
+    msdial-public-reanalysis docs/llm-assisted-curation.md section 3.1, which the plan, the campaign runner and
+    replay-campaign.py import from here (or vendor unchanged) so that all give one value for one unit.
+
+    Every item the triage keeps, its ``rows[]`` and its ``added_members[]`` (whether or not this version admits added
+    members), one entry each: {unit_id (the Catalog unit id, bare, also for a child), child_key (or null), member_path
+    (the triage's, ``\\`` turned into ``/``, leading and trailing ``/`` removed, case kept), archive_name (the item's
+    ``archive``, else the listing's), crc32 (8 upper-case hex digits) and size, both from ``listing`` only, never from
+    the triage or a download (null without a match), sample_row_index (the row's ``row_index``, null for an added
+    member)}. Sorted by unit_id, child_key (null as ''), member_path, sample_row_index (null as -1), then canonical
+    JSON.
+
+    ``listing`` is {case-folded member path: {archive, crc32, size}} parsed from the archive listing(s) the decision
+    record binds (read_decision_record, parse_archive_listing); {} or None when it binds none. ``child`` is one item of
+    ``triage["children"]``, or its child_key (an unknown key raises ValueError), or None for the whole unit.
     """
-    unit_id = str(triage.get("unit_id") or "")
-    key = f"{unit_id}-{child_key}" if child_key else unit_id
-    rows = _kept_rows(triage, _child(triage, child_key) if child_key else None)
-    entries = []
-    for row in rows:
-        archive_sha = str(row.get("archive_sha256") or "").strip().casefold()
-        entry: dict[str, Any] = {
-            "unit_id": key,
-            "member_path": str(row.get("member_path") or "").replace("\\", "/"),
-            "crc32": (str(row["crc32"]).upper() if row.get("crc32") not in (None, "") else None),
-            "size": (int(row["size"]) if row.get("size") not in (None, "") else None),
-            "sample_row_index": int(row.get("row_index")),
-            "child_key": child_key or None,
-        }
-        if archive_sha:
-            entry["archive_sha256"] = archive_sha
+    if isinstance(listing, str):
+        raise TypeError("selection_canonical(triage, listing, child): listing is a mapping, not a child key.")
+    listing = listing or {}
+    if isinstance(child, str):
+        if not child:
+            child = None
         else:
-            entry["archive_name"] = str(row.get("archive") or "") or None
-        entries.append(entry)
-    return sorted(entries, key=lambda item: canonical_json(item))
+            found = _child(triage, child)
+            if found is None:
+                raise ValueError(f"The triage has no child {child!r}.")
+            child = found
+    child_key = None if child is None else str(child["child_key"])
+    allowed = None if child is None else {_selection_member(p).casefold() for p in child.get("member_paths") or []}
+    kept = [(item, item.get("row_index")) for item in triage.get("rows") or []]
+    kept += [(item, None) for item in triage.get("added_members") or []]
+    entries = []
+    for item, row_index in kept:
+        member = _selection_member(item.get("member_path"))
+        if allowed is not None and member.casefold() not in allowed:
+            continue
+        listed = (listing.get(member.casefold()) or {}) if member else {}
+        crc32, size = listed.get("crc32"), listed.get("size")
+        entries.append({
+            "unit_id": str(triage["unit_id"]),
+            "child_key": child_key,
+            "member_path": member or None,
+            "archive_name": item.get("archive") or listed.get("archive") or None,
+            "crc32": None if crc32 in (None, "") else str(crc32).upper().zfill(8),
+            "size": None if size in (None, "") else int(size),
+            "sample_row_index": None if row_index is None else int(row_index),
+        })
+    return sorted(entries, key=lambda e: (e["unit_id"], e["child_key"] or "", e["member_path"] or "",
+                                          -1 if e["sample_row_index"] is None else e["sample_row_index"],
+                                          canonical_json(e)))
 
 
-def selection_sha256(triage: Mapping[str, Any], child_key: str = "") -> str:
-    return sha256_bytes(canonical_json(selection_canonical(triage, child_key)))
+# The name the reference implementation of section 3.1 uses.
+selection_entries = selection_canonical
+
+
+def selection_sha256(
+    triage: Mapping[str, Any],
+    listing: Mapping[str, Mapping[str, Any]] | None = None,
+    child: Mapping[str, Any] | str | None = None,
+) -> str:
+    """sha256 of the canonical JSON of selection_canonical(triage, listing, child): ``selection_sha256``."""
+    return sha256_bytes(canonical_json(selection_canonical(triage, listing, child)))
+
+
+ARCHIVE_LISTING_COLUMNS = ("archive", "path", "size", "crc32")
+
+
+def parse_archive_listing(data: bytes, listing: dict[str, dict[str, Any]] | None = None) -> dict[str, dict[str, Any]]:
+    """An archive listing TSV (columns archive, path, size, crc32; others ignored) as selection_canonical reads it:
+    {case-folded member path: {archive, crc32, size}}. The first row of a path wins; ``listing`` is extended in place
+    when given (a record binding one listing per archive). Raises ValueError for a size that is not a whole number."""
+    found: dict[str, dict[str, Any]] = listing if listing is not None else {}
+    reader = csv.DictReader(io.StringIO(data.decode("utf-8-sig")), delimiter="\t")
+    for record in reader:
+        member = _selection_member(record.get("path"))
+        if not member:
+            continue
+        size = str(record.get("size") or "").strip()
+        if size and not size.isdigit():
+            raise ValueError(f"The archive listing gives size {size!r} for {member}.")
+        found.setdefault(member.casefold(), {
+            "archive": str(record.get("archive") or "").strip() or None,
+            "crc32": str(record.get("crc32") or "").strip() or None,
+            "size": int(size) if size else None,
+        })
+    return found
 
 
 ANALYSIS_CSV_CANONICAL_FORM = "msdial-analysis-csv-canonical.v1"
@@ -345,18 +412,91 @@ def load_triage(path: str | Path) -> tuple[dict[str, Any], str, Path]:
     return triage, sha256_bytes(data), location.resolve()
 
 
-def decision_record(triage_path: Path, triage: Mapping[str, Any], triage_sha256: str) -> dict[str, Any] | None:
-    """The LLM decision record beside a triage (``<unit_id>.record.json``, msdial-llm-decision-record.v1), or None.
+def decision_record_candidates(triage_path: Path, unit_id: str) -> list[Path]:
+    """Where a triage's decision record is looked for when no decision_record_path is given, in order.
 
-    Read only to bind it: its sha256 is recorded, and its payload.sha256 must be the triage's, else the triage and its
-    record describe different decisions (CURATED_SELECTION_RECORD_MISMATCH). Its content is not interpreted further.
+    ``<triage file stem>.record.json`` beside the triage: <unit_id>.json has <unit_id>.record.json, a revision
+    <unit_id>.r<N>.json its own <unit_id>.r<N>.record.json (doc section 2.1), and a campaign runner's copy
+    handoffs/<unit_key>/<unit_id>.json the copy <unit_id>.record.json beside it. Then, for a triage file named
+    otherwise, <unit_id>.record.json; never for a revision, whose record is its own.
+    """
+    location = Path(triage_path)
+    candidates = [location.parent / f"{location.stem}.record.json"]
+    revision = bool(unit_id) and re.fullmatch(rf"{re.escape(unit_id)}\.r\d+", location.stem) is not None
+    if unit_id and location.stem != unit_id and not revision:
+        candidates.append(location.parent / f"{unit_id}.record.json")
+    return candidates
+
+
+def _record_input(record_directory: Path, item: Mapping[str, Any], name: str) -> tuple[Path, bytes]:
+    """One ``inputs[]`` item of a decision record: its file (relative to the record's directory, as doc section 2.1
+    keeps it under ``inputs\\``), read and checked against the sha256 the record names. Raises
+    CuratedSelectionError(CURATED_SELECTION_RECORD_MISMATCH) for a file that is missing or holds other bytes."""
+    text = str(item.get("path") or "").strip()
+    expected = str(item.get("sha256") or "").strip().casefold()
+    role = str(item.get("role") or "")
+    if not text or not expected:
+        raise CuratedSelectionError(
+            CURATED_SELECTION_RECORD_MISMATCH,
+            f"The decision record {name} binds a {role} input without a path and sha256.",
+            role=role,
+        )
+    path = Path(text)
+    location = path if path.is_absolute() else record_directory / path
+    try:
+        data = location.read_bytes()
+    except OSError as error:
+        raise CuratedSelectionError(
+            CURATED_SELECTION_RECORD_MISMATCH,
+            f"The {role} input {text} the decision record {name} binds cannot be read beside it ({error}). Pass "
+            "decision_record_path naming the record where its inputs\\ directory is, or copy that directory with it.",
+            role=role,
+            input_path=text,
+        ) from error
+    found = sha256_bytes(data)
+    if found != expected:
+        raise CuratedSelectionError(
+            CURATED_SELECTION_RECORD_MISMATCH,
+            f"The {role} input {text} hashes to {found}; the decision record {name} names {expected}.",
+            role=role,
+            input_path=text,
+        )
+    return location, data
+
+
+def read_decision_record(
+    triage_path: Path,
+    triage: Mapping[str, Any],
+    triage_sha256: str,
+    record_path: str | Path = "",
+) -> tuple[dict[str, Any] | None, dict[str, dict[str, Any]], Path | None]:
+    """(the record's summary, the archive listing it binds, the Catalog handoff input it binds), or (None, {}, None).
+
+    The record (msdial-llm-decision-record.v1) is ``record_path`` where given (it must exist), else the first of
+    decision_record_candidates that exists. Its payload.sha256 must be the triage's, else the triage and its record
+    describe different decisions (CURATED_SELECTION_RECORD_MISMATCH). Every ``inputs[]`` item with role
+    ``archive_listing`` is read beside the record and must hash to the sha256 the record names (doc section 3.1: a
+    reader holding a listing whose sha256 differs refuses; a listing it cannot read is refused too, since a selection
+    computed without it would differ silently); the listings are merged for selection_canonical. The
+    ``catalog_handoff`` input is resolved but not read here (verify_handoff_copy reads it where a copy needs it).
+
+    The summary {name, path, sha256, decision_id, located (explicit or beside_triage), archive_listings [{path,
+    sha256, entries}], catalog_handoff_input {path, sha256} or null} is what the provenance records.
     """
     unit_id = str(triage.get("unit_id") or "").strip()
-    if not unit_id:
-        return None
-    location = triage_path.parent / f"{unit_id}.record.json"
-    if not location.is_file():
-        return None
+    if str(record_path or "").strip():
+        location = Path(str(record_path)).expanduser()
+        if not location.is_file():
+            raise CuratedSelectionError(
+                CURATED_SELECTION_RECORD_MISMATCH, f"decision_record_path {location} is not a file."
+            )
+        located = "explicit"
+    else:
+        location = next((path for path in decision_record_candidates(triage_path, unit_id) if path.is_file()), None)
+        if location is None:
+            return None, {}, None
+        located = "beside_triage"
+    location = location.resolve()
     data = location.read_bytes()
     try:
         record = json.loads(data.decode("utf-8-sig"))
@@ -364,7 +504,9 @@ def decision_record(triage_path: Path, triage: Mapping[str, Any], triage_sha256:
         raise CuratedSelectionError(
             CURATED_SELECTION_RECORD_MISMATCH, f"The decision record {location.name} is not JSON: {error}."
         ) from error
-    payload = record.get("payload") if isinstance(record, dict) else None
+    if not isinstance(record, dict):
+        raise CuratedSelectionError(CURATED_SELECTION_RECORD_MISMATCH, "The decision record is not one JSON object.")
+    payload = record.get("payload")
     payload_sha = str((payload or {}).get("sha256") or "").strip().casefold() if isinstance(payload, dict) else ""
     if payload_sha != triage_sha256:
         raise CuratedSelectionError(
@@ -372,7 +514,47 @@ def decision_record(triage_path: Path, triage: Mapping[str, Any], triage_sha256:
             f"The decision record {location.name} names payload sha256 {payload_sha or '(none)'}, not the triage's "
             f"{triage_sha256}.",
         )
-    return {"name": location.name, "sha256": sha256_bytes(data), "decision_id": str(record.get("decision_id") or "")}
+    inputs = [item for item in record.get("inputs") or [] if isinstance(item, dict)]
+    listing: dict[str, dict[str, Any]] = {}
+    listings = []
+    for item in inputs:
+        if str(item.get("role") or "") != "archive_listing":
+            continue
+        _path, content = _record_input(location.parent, item, location.name)
+        before = len(listing)
+        try:
+            parse_archive_listing(content, listing)
+        except (UnicodeDecodeError, ValueError) as error:
+            raise CuratedSelectionError(
+                CURATED_SELECTION_RECORD_MISMATCH, f"The archive listing {item.get('path')} cannot be read: {error}."
+            ) from error
+        listings.append({"path": str(item["path"]), "sha256": str(item["sha256"]).casefold(),
+                         "entries": len(listing) - before})
+    handoff_item = next((item for item in inputs if str(item.get("role") or "") == "catalog_handoff"), None)
+    handoff_path: Path | None = None
+    if handoff_item is not None and str(handoff_item.get("path") or "").strip():
+        candidate = Path(str(handoff_item["path"]))
+        handoff_path = candidate if candidate.is_absolute() else location.parent / candidate
+    summary = {
+        "name": location.name,
+        "path": str(location),
+        "sha256": sha256_bytes(data),
+        "decision_id": str(record.get("decision_id") or ""),
+        "located": located,
+        "archive_listings": listings,
+        "catalog_handoff_input": (
+            {"path": str(handoff_item.get("path") or ""), "sha256": str(handoff_item.get("sha256") or "").casefold()}
+            if handoff_item is not None else None
+        ),
+    }
+    return summary, listing, handoff_path
+
+
+def decision_record(
+    triage_path: Path, triage: Mapping[str, Any], triage_sha256: str, record_path: str | Path = ""
+) -> dict[str, Any] | None:
+    """read_decision_record's summary alone."""
+    return read_decision_record(triage_path, triage, triage_sha256, record_path)[0]
 
 
 # The keys a campaign runner's copy of a Catalog handoff rewrites (scripts/campaign/ports.py copy_handoff): each points
@@ -585,9 +767,21 @@ def apply_curated_selection(
     validator: Mapping[str, Any] | None = None,
     campaign: Mapping[str, Any] | None = None,
     record: Mapping[str, Any] | None = None,
+    listing: Mapping[str, Mapping[str, Any]] | None = None,
     interactive_version: str = "",
 ) -> dict[str, Any]:
     """Hold a handoff's unit to its triage. Returns what the projection uses; raises CuratedSelectionError.
+
+    The handoff is tied to the one the triage names (``catalog_handoff_sha256``) in one of two ways, never by
+    assertion alone: the handoff file passed is it (``handoff_file_sha256`` equals it), or ``original_handoff`` is
+    verify_handoff_copy's reading of the triaged original (by original_handoff_path, or the decision record's
+    catalog_handoff input) against the copy passed. An ``original_handoff_sha256`` asserted for a copy whose bytes
+    differ, with no original to compare it with, is refused (CURATED_SELECTION_HANDOFF_MISMATCH): a handoff whose
+    bytes changed is a hold, not a silent pass.
+
+    ``listing`` is the archive listing the decision record binds (read_decision_record), from which
+    ``selection_sha256`` takes crc32 and size. Where an approved campaign manifest names a selection_sha256 for the
+    unit, it must equal this one (CURATED_SELECTION_SELECTION_MISMATCH).
 
     Returns {key, samples (the kept rows, in triage order of row_index), analysis_inputs (one per kept row, by member
     path), ion_mode, acquisition_mode, class_proposal (cut), provenance}.
@@ -625,16 +819,23 @@ def apply_curated_selection(
             CURATED_SELECTION_HANDOFF_MISMATCH,
             f"original_handoff_sha256 {asserted} is not the sha256 of the original handoff read ({verified_original}).",
         )
-    reference = verified_original or asserted or str(handoff_file_sha256 or "").casefold()
+    copy_sha = str(handoff_file_sha256 or "").strip().casefold()
+    if asserted and not verified_original and asserted != copy_sha:
+        # WS0 decision 7: the runner passes the triaged handoff's sha256 with its run-time copy, and the copy is
+        # verified against the triaged bytes; an assertion that nothing here can check is no tie (review of 0.5.69).
+        raise CuratedSelectionError(
+            CURATED_SELECTION_HANDOFF_MISMATCH,
+            f"The handoff passed ({copy_sha or 'inline, no file'}) is not the triaged handoff {asserted} byte for "
+            "byte, and no original was found to compare it with: pass original_handoff_path, or a decision record "
+            "whose catalog_handoff input holds the triaged bytes.",
+            original_handoff_sha256=asserted,
+            handoff_sha256=copy_sha,
+        )
+    reference = verified_original or asserted or copy_sha
     # How the handoff that drives the plan is tied to the one the triage names (review of 0.5.69): the file passed IS
-    # it; or the original was read by path and the copy holds its every value but the rewritten sidecar paths; or a
-    # caller only asserted the original's sha256, and nothing here relates the copy to it.
-    if verified_original:
-        verification = "original_read_and_copy_compared"
-    elif asserted:
-        verification = "runner_asserted"
-    else:
-        verification = "handoff_file"
+    # it; or the original was read (by path, or from the decision record's inputs) and the copy holds its every value
+    # but the rewritten sidecar paths.
+    verification = "original_read_and_copy_compared" if verified_original else "handoff_file"
     if not reference:
         raise CuratedSelectionError(
             CURATED_SELECTION_HANDOFF_MISMATCH,
@@ -748,6 +949,17 @@ def apply_curated_selection(
             "manifest_selection_sha256": str((selection or {}).get("selection_sha256") or ""),
         }
 
+    selection_hash = selection_sha256(triage, listing or {}, child)
+    planned_selection = str(approval.get("manifest_selection_sha256") or "").strip().casefold()
+    if planned_selection and planned_selection != selection_hash:
+        raise CuratedSelectionError(
+            CURATED_SELECTION_SELECTION_MISMATCH,
+            f"The approved manifest names selection_sha256 {planned_selection} for {key}; this triage and the archive "
+            f"listing its decision record binds give {selection_hash} ({SELECTION_CANONICAL_FORM}).",
+            manifest_selection_sha256=planned_selection,
+            selection_sha256=selection_hash,
+        )
+
     acquisition = str((child or {}).get("acquisition_mode") or technical.get("acquisition_mode") or "")
     kept_samples: list[dict[str, Any]] = []
     analysis_inputs: list[dict[str, Any]] = []
@@ -844,8 +1056,10 @@ def apply_curated_selection(
         "applied_technical": {"ion_mode": ion, "acquisition_mode": acquisition},
         "validator": dict(validator) if validator else None,
         **approval,
-        "selection_sha256": selection_sha256(triage, child_key),
+        "selection_sha256": selection_hash,
         "selection_canonical_form": SELECTION_CANONICAL_FORM,
+        "selection_listing_entries": len(listing or {}),
+        "selection_sha256_matches_manifest": (planned_selection == selection_hash) if planned_selection else None,
         "rows_kept": rows_kept,
         "rows_dropped": rows_dropped,
         "rows_kept_count": len(rows_kept),
@@ -1057,7 +1271,8 @@ def reconcile_curated_selection(manifest: Mapping[str, Any]) -> dict[str, Any] |
             member = member_for(sources[_file_key(path)], data_root, by_member)
         relative = _portable_path(path, data_root, raw_directory)
         if not member:
-            item = {"file": relative, "member_path": None, "result": "disagree", "reason": "not_in_selection"}
+            item = {"file": relative, "member_path": None, "result": "disagree", "reason": "not_in_selection",
+                    "reasons": ["not_in_selection"]}
             files.append(item)
             disagreements.append(item)
             continue
@@ -1170,8 +1385,9 @@ def cross_unit_refusal(manifest: Mapping[str, Any]) -> dict[str, Any] | None:
     """The cross-unit check's refusal this unit's manifest records, or None.
 
     msdial_repository_cross_unit_check writes cross_unit_attribution on each manifest; a refused verdict stands until
-    a fresh check of the group passes the unit (and so rewrites the block). Nothing else lifts it: a recheck of the
-    unit's own headers says nothing about whose files they are.
+    a fresh check passes the unit over a group holding every unit it was refused against (merge_prior_refusals), and a
+    new lease of the same workspace carries it (repository_reanalysis.create_download_lease). Nothing else lifts it: a
+    recheck of the unit's own headers says nothing about whose files they are.
     """
     block = manifest.get("cross_unit_attribution") if isinstance(manifest.get("cross_unit_attribution"), dict) else None
     if not block or str(block.get("verdict") or "") != "refused":
@@ -1301,6 +1517,40 @@ def _polarity_of(manifest: Mapping[str, Any]) -> str:
     return ""
 
 
+# Names of injections shared on purpose that the coverage gate's reading (repository_analysis_rows._coverage_file_type)
+# takes for samples: pooled and long-term references (LTR, SR, PoolQC, QCpool, PBQC, MQC, LQC, batchQC) and solvent
+# blanks (Solvent, Water, MeOH). Counting them as Sample inputs refused two units sharing four LTRs at rule S (review
+# of 0.5.69); they are left out of the cross-unit comparison, as the blanks and QCs the gate knows are.
+_SHARED_REFERENCE_TOKENS = frozenset({
+    "ltr", "sr", "pool", "pooled", "blank", "blk", "solvent", "water", "meoh", "methanol", "acn", "wash",
+})
+_CAMEL_BOUNDARY = re.compile(r"(?<=[a-z])(?=[A-Z])")
+
+
+def shared_reference_name(name: str) -> bool:
+    """Whether a file or sample name reads as a QC, reference or blank injection shared across units on purpose.
+
+    By whole tokens (split on anything not a letter, and at a lower-to-upper case change): a token in
+    _SHARED_REFERENCE_TOKENS, one holding 'pool', or one that starts or ends with 'qc' (PBQC, MQC, LQC, QCpool,
+    batchQC). 'LTR_1', 'SR_1', 'PooledQC_1', 'QCpool1', 'PBQC_01', 'Solvent_01' and 'MeOH_01' do; 'liver_1',
+    'seawater_2' and 'S1' do not.
+    """
+    stem = PurePosixPath(str(name or "").replace("\\", "/")).name
+    stem = stem.split(".", 1)[0]
+    if "meoh" in stem.casefold():
+        return True
+    tokens = {
+        token.casefold()
+        for part in re.split(r"[^A-Za-z]+", stem)
+        for token in [part, *_CAMEL_BOUNDARY.split(part)]
+        if token
+    }
+    return any(
+        token in _SHARED_REFERENCE_TOKENS or token.startswith("qc") or token.endswith("qc") or "pool" in token
+        for token in tokens
+    )
+
+
 def _unit_view(
     manifest: Mapping[str, Any], index: int, label: str, cache: dict[str, dict[str, str]]
 ) -> dict[str, Any]:
@@ -1335,10 +1585,10 @@ def _unit_view(
         member = member_for(path, data_root, kept) if kept else ""
         role = str((kept.get(member) or {}).get("role") or "").casefold() if member else ""
         name = PurePosixPath(relative).name
-        if role not in _SAMPLE_ROLES or _coverage_file_type(name) != "Sample":
+        if role not in _SAMPLE_ROLES or _coverage_file_type(name) != "Sample" or shared_reference_name(name):
             continue
         sample_id = str(row.get("sample_id") or "")
-        if sample_id and _coverage_file_type(sample_id) != "Sample":
+        if sample_id and (_coverage_file_type(sample_id) != "Sample" or shared_reference_name(sample_id)):
             continue
         identity, basis = _input_identity(row, data_root)
         inputs[identity] = {
@@ -1388,8 +1638,9 @@ def cross_unit_attribution(manifests: list[Mapping[str, Any]], labels: list[str]
     """Whether sibling units' Sample inputs are their own: rules P, C, S and D over their recorded lineage. Pure but for
     reading the archives' member listings the lineage names.
 
-    Only Sample inputs are compared (blanks, QCs and standards by the coverage gate's reading, and a curated row whose
-    role is not sample), so blanks and QCs shared on purpose never refuse a unit. A file is identified by
+    Only Sample inputs are compared (blanks, QCs and standards by the coverage gate's reading or by
+    shared_reference_name, and a curated row whose role is not sample), so blanks and QCs shared on purpose never
+    refuse a unit. A file is identified by
     _input_identity, never by its bare name; byte copies under other names are found by the CRC32 and size the
     archive's member listing records (_listed_content).
 
@@ -1422,15 +1673,21 @@ def cross_unit_attribution(manifests: list[Mapping[str, Any]], labels: list[str]
         for index, manifest in enumerate(manifests)
     ]
     verdicts: dict[int, dict[str, Any]] = {
-        unit["index"]: {"reasons": [], "warnings": [], "details": []} for unit in units
+        unit["index"]: {"reasons": [], "warnings": [], "details": [], "against": []} for unit in units
     }
     overlaps: list[dict[str, Any]] = []
 
-    def refuse(unit: dict[str, Any], code: str, detail: str) -> None:
+    def refuse(unit: dict[str, Any], code: str, detail: str, others: Iterable[dict[str, Any]] = ()) -> None:
         record = verdicts[unit["index"]]
         if code not in record["reasons"]:
             record["reasons"].append(code)
         record["details"].append(detail)
+        for other in others:
+            # Whom the refusal is against: a later check lifts it only over a group that holds every one of them
+            # (msdial_repository_cross_unit_check), so a check that leaves the sibling out cannot pass the unit.
+            identity = other["analysis_unit_id"] or name(other)
+            if identity not in record["against"]:
+                record["against"].append(identity)
 
     def warn(unit: dict[str, Any], code: str, detail: str) -> None:
         record = verdicts[unit["index"]]
@@ -1467,6 +1724,7 @@ def cross_unit_attribution(manifests: list[Mapping[str, Any]], labels: list[str]
                 "polarity"
                 + (f", and {', '.join(name(other) for other in siblings)} hold(s) the same files" if siblings else "")
                 + ".",
+                siblings,
             )
         else:
             warn(
@@ -1493,6 +1751,7 @@ def cross_unit_attribution(manifests: list[Mapping[str, Any]], labels: list[str]
                         f"{name(unit)} ({unit['polarity']}) and {name(other)} ({other['polarity']}) share "
                         f"{found['shared']} Sample input(s) ({found['basis']}) whose headers state no polarity; one file "
                         "is not two polarities.",
+                        [other],
                     )
 
     # C: one polarity, different chromatographies. Every pair, whatever P decided: a sibling refused for its polarity
@@ -1542,6 +1801,7 @@ def cross_unit_attribution(manifests: list[Mapping[str, Any]], labels: list[str]
                         if found["basis"] == "identity"
                         else "; byte copies under other names are never settled by name."
                     ),
+                    [other],
                 )
 
     # S: one polarity, chromatographies that do not tell the units apart, different sets, one mostly inside the other.
@@ -1580,6 +1840,7 @@ def cross_unit_attribution(manifests: list[Mapping[str, Any]], labels: list[str]
                         f"({len(other['inputs'])}) share {found['shared']} ({found['basis']}), containment "
                         f"{ratio:.2f}, at one polarity and a chromatography that does not tell them apart: one holds "
                         "files the other claims, and nothing on record says which.",
+                        [other],
                     )
 
     # D: an identical set.
@@ -1611,6 +1872,7 @@ def cross_unit_attribution(manifests: list[Mapping[str, Any]], labels: list[str]
                 CROSS_UNIT_DUPLICATE_INPUTS,
                 f"{name(b)} has the same {len(b['inputs'])} Sample input(s) as {name(first)} ({basis}), which keeps "
                 "them.",
+                [first],
             )
 
     results = []
@@ -1631,9 +1893,11 @@ def cross_unit_attribution(manifests: list[Mapping[str, Any]], labels: list[str]
                 "verdict": "refused" if record["reasons"] else "passed",
                 "reason": record["reasons"][0] if record["reasons"] else "",
                 "reasons": list(record["reasons"]),
+                "refused_against": list(record["against"]),
                 "warnings": list(record["warnings"]),
                 "details": list(record["details"]),
                 "retryable": False,
+                "prior_refusal_stands": False,
             }
         )
     return {
@@ -1659,6 +1923,7 @@ def cross_unit_unit_record(result: Mapping[str, Any], index: int) -> dict[str, A
         "verdict": own["verdict"],
         "reason_code": own["reason"],
         "reasons": own["reasons"],
+        "refused_against": list(own.get("refused_against") or []),
         "warnings": own["warnings"],
         "details": own["details"],
         "retryable": False,
@@ -1667,4 +1932,54 @@ def cross_unit_unit_record(result: Mapping[str, Any], index: int) -> dict[str, A
             for item in result["units"]
         ],
         "overlaps": [dict(item) for item in result["overlaps"]],
+        "prior_refusal_stands": bool(own.get("prior_refusal_stands")),
+        **({"prior_refusal": dict(own["prior_refusal"])} if own.get("prior_refusal") else {}),
     }
+
+
+def merge_prior_refusals(result: dict[str, Any], manifests: list[Mapping[str, Any]]) -> dict[str, Any]:
+    """cross_unit_attribution's result with each unit's recorded refusal kept where this check cannot lift it.
+
+    A unit refused before (cross_unit_refusal) and passed now keeps its refusal unless this group holds every unit the
+    refusal was against: its ``refused_against``, else, for a block written before that was recorded, every other
+    unit of its recorded group. A check that leaves out the sibling the unit collided with says nothing about the
+    files they share (review of 0.5.69). The unit is then refused with the earlier codes, ``prior_refusal_stands``
+    true and ``prior_refusal`` {rule, reason_code, reasons, refused_against}; the group's verdict follows. Changes and
+    returns ``result``.
+    """
+    present = {str(item.get("analysis_unit_id") or "") for item in result.get("units") or []}
+    for item, manifest in zip(result.get("units") or [], manifests):
+        prior = cross_unit_refusal(manifest)
+        if prior is None or item.get("verdict") != "passed":
+            continue
+        own = str(item.get("analysis_unit_id") or "")
+        against = [str(value) for value in prior.get("refused_against") or [] if str(value or "")]
+        if not against and "refused_against" not in prior:
+            against = [
+                str(member.get("analysis_unit_id") or "") for member in prior.get("group") or []
+                if isinstance(member, dict) and str(member.get("analysis_unit_id") or "") not in {"", own}
+            ]
+        missing = [value for value in against if value not in present]
+        if not missing:
+            continue
+        codes = [str(code) for code in prior.get("reasons") or [prior.get("reason_code")] if str(code or "").strip()]
+        item.update(
+            verdict="refused",
+            reason=codes[0] if codes else "",
+            reasons=codes,
+            refused_against=against,
+            prior_refusal_stands=True,
+            prior_refusal={
+                "rule": prior.get("rule"),
+                "reason_code": prior.get("reason_code"),
+                "reasons": codes,
+                "refused_against": against,
+            },
+        )
+        item["details"] = [
+            *list(item.get("details") or []),
+            f"The earlier refusal of {own} ({', '.join(codes)}) stands: it was against {', '.join(against)}, and this "
+            f"check leaves out {', '.join(missing)}.",
+        ]
+    result["verdict"] = "refused" if any(unit.get("verdict") == "refused" for unit in result.get("units") or []) else "passed"
+    return result

@@ -1882,7 +1882,8 @@ def create_download_lease(
             project.warnings.append(f"Detailed repository sample metadata was unavailable: {error}")
     root = workspace_root.resolve() / project.repository / project.accession
     if project.analysis_unit_id:
-        root = root / project.analysis_unit_id
+        # A child or a reopened unit may have a folder of its own (workspace_unit_key), so an earlier run is kept.
+        root = root / unit_workspace_name(project)
     raw_root = root / "raw"
     download_root = raw_root / "downloads"
     data_root = raw_root / "data"
@@ -1937,7 +1938,12 @@ def create_download_lease(
         # Under the manifest's lock, so nothing is written between the look at what is there and the
         # write that replaces it.
         with manifest_lock(manifest_path):
+            carried = _carried_cross_unit_refusal(manifest_path)
             previous, superseded = _supersede_previous_manifest(manifest_path)
+            if carried:
+                # A new lease of a refused unit fetches the same files the cross-unit check found are not its own
+                # alone: the refusal comes with it, and only a passing check of its group lifts it (review of 0.5.69).
+                lease_record["cross_unit_attribution"] = carried
             if previous:
                 # A lease into a workspace that already holds a manifest replaces it, as it always has.
                 # What it replaced is said, so a retry is visibly a retry and not a first attempt, and a
@@ -2671,9 +2677,15 @@ def create_download_lease(
             # Only where the store was used, so every other lease records what it always did.
             manifest["download_cache"] = store_lease.cache_record()
             manifest["raw_storage"] = store_lease.raw_storage
-        for key in ("previous_manifest", "superseded_manifests", "campaign_authorizations", "lease_owner"):
+        for key in (
+            "previous_manifest", "superseded_manifests", "campaign_authorizations", "lease_owner",
+            "cross_unit_attribution",
+        ):
             if key in lease_record:
                 manifest[key] = lease_record[key]
+        if "cross_unit_attribution" in lease_record:
+            # A carried refusal: the unit stays stopped until a passing check of its group lifts it.
+            manifest["execution_allowed"] = False
         repository_metadata_path = provenance / "repository-metadata.json"
         sample_metadata_path = provenance / "sample-metadata-extracted.json"
         from .repository_metadata import metadata_workspace
@@ -2845,6 +2857,31 @@ def _viewing_restore_refusal(manifest: dict[str, Any], what: str) -> str:
         f"and {what} would replace the record its undo reads. Take the restore back first with "
         "msdial_undo_project_restore."
     )
+
+
+def _carried_cross_unit_refusal(manifest_path: Path) -> dict[str, Any] | None:
+    """The refused cross_unit_attribution of the manifest a new lease replaces, marked as carried, or None.
+
+    Read under the manifest's writer lock, before _supersede_previous_manifest. An unreadable manifest carries nothing
+    here (_supersede_previous_manifest raises for it)."""
+    from .curated_selection import cross_unit_refusal
+
+    try:
+        previous = json.loads(_read_manifest_bytes(manifest_path).decode("utf-8-sig"))
+    except (OSError, ValueError):
+        return None
+    if not isinstance(previous, dict):
+        return None
+    block = cross_unit_refusal(previous)
+    if block is None:
+        return None
+    carried = copy.deepcopy(block)
+    carried["carried_from"] = {
+        "manifest_path": str(manifest_path),
+        "status": str(previous.get("status") or "") or None,
+        "carried_at": datetime.now(timezone.utc).isoformat(),
+    }
+    return carried
 
 
 def _supersede_previous_manifest(manifest_path: Path) -> tuple[dict[str, Any], list[dict[str, Any]]]:
@@ -3147,6 +3184,44 @@ STORE_WAIT_POLL_SECONDS = 15.0
 
 def is_reserved_workspace_name(name: Any) -> bool:
     return str(name or "").strip().casefold() in {item.casefold() for item in RESERVED_WORKSPACE_NAMES}
+
+
+_WORKSPACE_UNIT_KEY = re.compile(r"[A-Za-z0-9][A-Za-z0-9._@+-]{0,127}")
+_WORKSPACE_UNIT_KEY_SEPARATORS = "-_.@+"
+
+
+def validate_workspace_unit_key(value: Any, catalog_unit_id: str) -> str:
+    """A unit's workspace folder name as a caller chose it (msdial_download_repository_raw workspace_unit_key), or
+    ValueError. One path segment of letters, digits and ``. _ - @ +`` (at most 128, no '..', not ending in '.'), not a
+    name the workspace keeps for itself, and starting with the Catalog unit id, followed by nothing or by one of
+    ``- _ . @ +`` (``AN1``, ``AN1-pos``, ``AN1@campaign-2``), so a folder always says whose unit it is."""
+    text = str(value or "").strip()
+    unit = str(catalog_unit_id or "").strip()
+    if not _WORKSPACE_UNIT_KEY.fullmatch(text) or ".." in text or text.endswith("."):
+        raise ValueError(
+            f"workspace_unit_key {text!r} is not one folder name of letters, digits and '. _ - @ +' (at most 128)."
+        )
+    if is_reserved_workspace_name(text):
+        raise ValueError(f"workspace_unit_key {text!r} is a name the workspace keeps for itself.")
+    if not unit or not (
+        text == unit or (text.startswith(unit) and text[len(unit)] in _WORKSPACE_UNIT_KEY_SEPARATORS)
+    ):
+        raise ValueError(
+            f"workspace_unit_key {text!r} does not start with the Catalog unit id {unit!r} and a separator."
+        )
+    return text
+
+
+def unit_workspace_name(project: RepositoryProject) -> str:
+    """The folder of a unit's workspace under <repository>/<accession>: repository_metadata.workspace_unit_key where a
+    caller chose one (validated again here, the process that writes the manifest), else the analysis unit id."""
+    metadata = project.repository_metadata if isinstance(project.repository_metadata, dict) else {}
+    chosen = str(metadata.get("workspace_unit_key") or "").strip()
+    if not chosen:
+        return project.analysis_unit_id
+    handoff = metadata.get("catalog_handoff") if isinstance(metadata.get("catalog_handoff"), dict) else {}
+    catalog_unit = str(handoff.get("analysis_unit_id") or "").strip() or project.analysis_unit_id
+    return validate_workspace_unit_key(chosen, catalog_unit)
 
 
 def _lease_store(
@@ -8807,6 +8882,16 @@ def _split_unit_locked(manifest_path: Path) -> dict[str, Any]:
                 per_file[_file_key(item)] for item in part["input_candidates"] if _file_key(item) in per_file
             ],
         }
+        from .curated_selection import cross_unit_refusal
+
+        parent_refusal = cross_unit_refusal(parent)
+        if parent_refusal is not None:
+            # A part reads its parent's files in place: a parent the cross-unit check refused hands the refusal on
+            # (review of 0.5.69), and only a passing check of the group lifts it.
+            part_manifest["cross_unit_attribution"] = {
+                **copy.deepcopy(parent_refusal),
+                "carried_from": {"manifest_path": str(manifest_path), "status": "split_parent"},
+            }
         # The polarity the parent's disposition read from a file name for an input whose header could not be read
         # (raw_metadata_preflight.FILE_NAME_POLARITY_RULE): the part's ion mode rests on it, so it stays on record.
         part_keys_for_polarity = {_file_key(item) for item in part["input_candidates"]}

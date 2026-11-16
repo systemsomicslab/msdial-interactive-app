@@ -261,13 +261,14 @@ class TheCutKeepsOnlyTheTriagedRows(_Files):
         triage = _triage(sha, [0, 1, 2], unit_id="AN-SYN-POS")
         project, _workspace, _path = self.project(triage, handoff, path)
 
+        # msdial-selection-canonical.v1 (doc #59 section 3.1): sorted by unit, child, member path, row index.
         expected = sorted(
             (
                 {"unit_id": "AN-SYN-POS", "archive_name": ARCHIVE, "member_path": MEMBERS[i][0], "crc32": None,
                  "size": None, "sample_row_index": i, "child_key": None}
                 for i in (0, 1, 2)
             ),
-            key=lambda item: json.dumps(item, sort_keys=True, separators=(",", ":")),
+            key=lambda item: (item["member_path"], item["sample_row_index"]),
         )
         digest = hashlib.sha256(
             json.dumps(expected, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
@@ -281,12 +282,15 @@ class TheCutKeepsOnlyTheTriagedRows(_Files):
 
     def test_a_rewritten_copy_is_verified_by_the_original_sha_the_runner_passes(self) -> None:
         handoff, path, sha = self.handoff_file(unit_id="AN-SYN-POS", ion_mode="Positive")
-        copy = dict(handoff, runner_note="rewritten by copy_handoff")
+        copy = dict(handoff, sample_table_path="")
         copy_path = self.write("handoffs/copy.json", copy)
         triage = _triage(sha, [0, 1, 2], unit_id="AN-SYN-POS")
 
         self.refused(cs.CURATED_SELECTION_HANDOFF_MISMATCH, triage, copy, copy_path)
-        project, _workspace, _path = self.project(triage, copy, copy_path, original_handoff_sha256=sha)
+        # An asserted sha256 alone ties nothing (WS0 decision 7): the copy is compared with the triaged bytes.
+        self.refused(cs.CURATED_SELECTION_HANDOFF_MISMATCH, triage, copy, copy_path, original_handoff_sha256=sha)
+        project, _workspace, _path = self.project(triage, copy, copy_path, original_handoff_sha256=sha,
+                                                  original_handoff_path=str(path))
         record = project["repository_metadata"]["curated_selection"]
         self.assertEqual(sha, record["original_handoff_sha256"])
         self.assertEqual(hashlib.sha256(copy_path.read_bytes()).hexdigest(), record["copy_handoff_sha256"])
@@ -360,7 +364,8 @@ class ABothUnitNeedsASinglePolarityChild(_Files):
         self.assertEqual("pos", record["child_key"])
         self.assertEqual({"other_child"}, {row["reason"] for row in record["rows_dropped"]})
         self.assertEqual({"AN-SYN-BOTH-neg"}, {row["belongs_to_unit"] for row in record["rows_dropped"]})
-        self.assertEqual(cs.selection_sha256(self.triage(sha), "pos"), record["selection_sha256"])
+        self.assertEqual(cs.selection_sha256(self.triage(sha), {}, "pos"), record["selection_sha256"])
+        self.assertEqual(cs.selection_sha256(self.triage(sha), {}, self.CHILDREN[0]), record["selection_sha256"])
 
     def test_an_unknown_child_is_refused(self) -> None:
         handoff, path, sha = self.handoff_file()
@@ -1122,6 +1127,11 @@ class TheHandoffThatDrivesThePlanIsBound(_Files):
 
     def test_a_copy_that_changes_files_or_settings_is_refused_against_the_original(self) -> None:
         copy = json.loads(json.dumps(self.handoff))
+        copy["runner_note"] = "rewritten"
+        copy_path = self.write("handoffs/copy.json", copy)
+        with self.assertRaises(cs.CuratedSelectionError):
+            self.project(self.triage, copy, copy_path, original_handoff_path=str(self.path))
+        copy = json.loads(json.dumps(self.handoff))
         copy["files"][0]["download_url"] = "https://elsewhere.invalid/other.zip"
         copy["technical_settings"]["chromatography"] = "HILIC"
         copy_path = self.write("handoffs/copy.json", copy)
@@ -1151,11 +1161,16 @@ class TheHandoffThatDrivesThePlanIsBound(_Files):
         project, _workspace, _path = self.project(self.triage, self.handoff, self.path)
         self.assertEqual("handoff_file",
                          project["repository_metadata"]["curated_selection"]["catalog_handoff_verification"])
-        copy = dict(self.handoff, runner_note="rewritten")
+        copy = dict(self.handoff, file_manifest_path="")
         copy_path = self.write("handoffs/copy.json", copy)
-        project, _workspace, _path = self.project(self.triage, copy, copy_path, original_handoff_sha256=self.sha)
-        self.assertEqual("runner_asserted",
-                         project["repository_metadata"]["curated_selection"]["catalog_handoff_verification"])
+        project, _workspace, _path = self.project(self.triage, copy, copy_path, original_handoff_sha256=self.sha,
+                                                  original_handoff_path=str(self.path))
+        record = project["repository_metadata"]["curated_selection"]
+        self.assertEqual("original_read_and_copy_compared", record["catalog_handoff_verification"])
+        self.assertEqual("original_handoff_path", record["original_handoff"]["source"])
+        # runner_asserted is gone: an assertion nothing can check refuses (WS0 decision 7).
+        self.refused(cs.CURATED_SELECTION_HANDOFF_MISMATCH, self.triage, copy, copy_path,
+                     original_handoff_sha256=self.sha)
 
     def test_a_triage_counting_other_rows_or_naming_another_sample_is_refused(self) -> None:
         self.refused(cs.CURATED_SELECTION_HANDOFF_MISMATCH,
