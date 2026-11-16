@@ -1363,9 +1363,13 @@ def decide_disposition(
     disagrees, the disposition is a skip that holds, with the reason triage_header_disagreement and no assignments
     (curated_selection.apply_reconciliation): neither the triage nor the header wins silently, and every caller that
     decides a disposition - the preflight, a recheck, a split - decides it so. Without a curated selection the
-    disposition is exactly the header decision's. Never raises; changes nothing.
+    disposition is exactly the header decision's.
+
+    A unit the cross-unit check refused (cross_unit_attribution verdict refused) is held the same way, with the
+    refusal's codes (curated_selection.apply_cross_unit_hold), until a fresh cross-unit check passes it. Never raises;
+    changes nothing.
     """
-    from .curated_selection import apply_reconciliation
+    from .curated_selection import apply_cross_unit_hold, apply_reconciliation
 
     disposition = _decide_disposition_from_headers(
         manifest,
@@ -1375,7 +1379,7 @@ def decide_disposition(
         parent_declared=parent_declared,
         multi_energy_aif_console=multi_energy_aif_console,
     )
-    return apply_reconciliation(manifest, disposition)
+    return apply_cross_unit_hold(manifest, apply_reconciliation(manifest, disposition))
 
 
 def _decide_disposition_from_headers(

@@ -26,6 +26,7 @@ import csv
 import hashlib
 import io
 import json
+import shutil
 import tempfile
 import unittest
 import zipfile
@@ -783,6 +784,451 @@ class TheCanonicalHashes(unittest.TestCase):
         self.assertNotIn("2026-11-16", text)
         moved = _manifest("AN-1", "Positive", "RP", ["S1.mzML"], root="E:/elsewhere")
         self.assertEqual(cs.replay_projection_sha256(manifest, "0.5.69"), cs.replay_projection_sha256(moved, "0.5.69"))
+
+
+# --------------------------------------------------------------------------------------------------------------------
+# Review of 0.5.69 (findings applied before merge). Each test below failed on c87b04a, or pins a guard a mutant of
+# c87b04a removed without any test noticing.
+
+
+def _members_tsv(path: Path, pairs: list[tuple[str, str]]) -> str:
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.writer(handle, delimiter="\t")
+        writer.writerow(["path", "type", "size", "crc32"])
+        for i, (first, second) in enumerate(pairs, start=1):
+            writer.writerow([first, "file", 1000 + i, f"{i:08X}"])
+            writer.writerow([second, "file", 1000 + i, f"{i:08X}"])
+    return str(path)
+
+
+class RuleCRefusesEveryUnitHoldingFilesItCannotClaim(_Files):
+    """Rule C kept a unit when half of its shared files named its own chromatography; the other half could be the
+    sibling's. ST002283 as stage3b ran it (unit 88f5a6, which the coverage gate missed): both units hold all 80 files,
+    40 Hilic-named and 40 Lipid-named (a name that states no chromatography)."""
+
+    def test_st002283_as_stage3b_ran_it_refuses_both_units(self) -> None:
+        hilic = [f"Human_Hilic_Neg/D{i}_Hilic_Neg.mzML" for i in range(1, 9)]
+        lipid = [f"Human_Lipid_Neg/D{i}_Lipid_Neg.mzML" for i in range(1, 9)]
+        tsv = _members_tsv(self.root / "members.tsv", list(zip(hilic, lipid)))
+        for options in ({}, {"tsv": tsv}):
+            with self.subTest(members_tsv=bool(options)):
+                result = cs.cross_unit_attribution([
+                    _manifest("AN-HILIC-NEG", "Negative", "HILIC", hilic + lipid, **options),
+                    _manifest("AN-RP-NEG", "Negative", "RP", hilic + lipid, **options),
+                ])
+                self.assertEqual(
+                    [("refused", cs.CROSS_UNIT_INDISTINGUISHABLE_CHROMATOGRAPHY)] * 2,
+                    [(item["verdict"], item["reason"]) for item in result["units"]],
+                )
+
+    def test_a_whole_archive_named_half_and_half_or_six_to_four_refuses_both(self) -> None:
+        for hilic_count, rp_count in ((4, 4), (6, 4)):
+            files = [f"HILIC_neg/S{i}.mzML" for i in range(hilic_count)]
+            files += [f"C18_neg/S{i}.mzML" for i in range(rp_count)]
+            with self.subTest(split=(hilic_count, rp_count)):
+                result = cs.cross_unit_attribution([
+                    _manifest("AN-HILIC", "Negative", "HILIC", files), _manifest("AN-RP", "Negative", "RP", files),
+                ])
+                self.assertEqual(
+                    [cs.CROSS_UNIT_INDISTINGUISHABLE_CHROMATOGRAPHY] * 2, [item["reason"] for item in result["units"]]
+                )
+
+    def test_files_that_all_name_one_chromatography_stay_with_that_unit(self) -> None:
+        files = [f"HILIC_neg/S{i}.mzML" for i in range(4)]
+        result = cs.cross_unit_attribution([
+            _manifest("AN-HILIC", "Negative", "HILIC", files), _manifest("AN-RP", "Negative", "RP", files),
+        ])
+        self.assertEqual(
+            [("passed", ""), ("refused", cs.CROSS_UNIT_INDISTINGUISHABLE_CHROMATOGRAPHY)],
+            [(item["verdict"], item["reason"]) for item in result["units"]],
+        )
+
+    def test_half_of_the_smaller_set_shared_is_the_minimum(self) -> None:
+        result = cs.cross_unit_attribution([
+            _manifest("AN-1", "Positive", "HILIC", ["S1.mzML", "S2.mzML", "S3.mzML", "S4.mzML"]),
+            _manifest("AN-2", "Positive", "RP", ["S1.mzML", "S2.mzML", "T3.mzML", "T4.mzML"]),
+        ])
+        self.assertEqual([cs.CROSS_UNIT_INDISTINGUISHABLE_CHROMATOGRAPHY] * 2,
+                         [item["reason"] for item in result["units"]])
+        self.assertEqual(0.5, result["overlaps"][0]["containment"])
+
+
+class RuleSRefusesASetMostlyInsideAnother(unittest.TestCase):
+    LIVER = [f"liver_{i}.mzML" for i in range(5)]
+    PLASMA = [f"plasma_{i}.mzML" for i in range(5)]
+
+    def test_a_liver_unit_holding_the_plasma_units_files_refuses_both(self) -> None:
+        result = cs.cross_unit_attribution([
+            _manifest("AN-LIVER", "Positive", "RP", self.LIVER + self.PLASMA),
+            _manifest("AN-PLASMA", "Positive", "RP", self.PLASMA),
+        ])
+        self.assertEqual([cs.CROSS_UNIT_CONTAINED_INPUTS] * 2, [item["reason"] for item in result["units"]])
+        self.assertEqual([("S", 5, 1.0)],
+                         [(item["rule"], item["shared"], item["containment"]) for item in result["overlaps"]])
+        self.assertIn(cs.CROSS_UNIT_CONTAINED_INPUTS, ATTRIBUTION_COVERAGE_REFUSALS)
+
+    def test_a_third_unit_cannot_escape_through_a_refused_sibling(self) -> None:
+        result = cs.cross_unit_attribution([
+            _manifest("AN-A", "Positive", "RP", self.LIVER + self.PLASMA),
+            _manifest("AN-B", "Positive", "RP", self.LIVER + self.PLASMA),
+            _manifest("AN-C", "Positive", "RP", self.PLASMA),
+        ])
+        self.assertEqual(["refused"] * 3, [item["verdict"] for item in result["units"]])
+        self.assertIn(cs.CROSS_UNIT_CONTAINED_INPUTS, result["units"][1]["reasons"])
+
+    def test_a_small_share_warns_both_and_is_recorded(self) -> None:
+        result = cs.cross_unit_attribution([
+            _manifest("AN-1", "Positive", "RP", ["S1.mzML", "S2.mzML", "S3.mzML", "S4.mzML"]),
+            _manifest("AN-2", "Positive", "RP", ["S1.mzML", "T2.mzML", "T3.mzML", "T4.mzML"]),
+        ])
+        self.assertEqual("passed", result["verdict"])
+        self.assertEqual([[cs.CROSS_UNIT_PARTLY_SHARED_WARNING]] * 2, [item["warnings"] for item in result["units"]])
+        self.assertEqual(["S"], [item["rule"] for item in result["overlaps"]])
+
+    def test_units_of_two_polarities_sharing_files_no_header_settles_are_refused_both(self) -> None:
+        files = ["S1.mzML", "S2.mzML"]
+        result = cs.cross_unit_attribution([
+            _manifest("AN-POS", "Positive", "RP", files), _manifest("AN-NEG", "Negative", "RP", files),
+        ])
+        self.assertEqual([cs.CROSS_UNIT_POLARITY_CONTRADICTION] * 2, [item["reason"] for item in result["units"]])
+
+
+def _preflight(manifest: dict, polarities: dict[str, str] | None = None,
+               acquisitions: dict[str, str] | None = None, *, extra: tuple[str, ...] = ()) -> dict:
+    files = [*manifest["input_candidates"], *extra]
+    manifest["raw_metadata_preflight"] = {
+        "declared": {"separation": "LC-MS", "ion_mode": "Positive", "acquisition_mode": "DDA", "untargeted": True},
+        "extractor": {"sha256": "ab" * 32, "pinned": True},
+        "summary": {
+            "acquisition_mode": "DDA",
+            "per_file": [
+                {
+                    "file": path, "outcome": "ok",
+                    "acquisition_mode": (acquisitions or {}).get(Path(path).name, "DDA"),
+                    "polarity": (polarities or {}).get(Path(path).name, "Positive"),
+                    "ms_levels": [1, 2], "has_ms1": True, "has_ms2": True, "has_ion_mobility": False,
+                    "format": "mzML", "separation": "LC",
+                }
+                for path in files
+            ],
+            "coverage": {"inspected": len(files)},
+        },
+    }
+    return manifest
+
+
+class _Leased(_Files):
+    def setUp(self) -> None:
+        super().setUp()
+        limits = patch.object(repository_reanalysis, "LEASE_EXTRACTION_LIMITS", ExtractionLimits(reserve_bytes=0))
+        limits.start()
+        self.addCleanup(limits.stop)
+
+    def leased(self, keep=(0, 1, 2), row_ion: str | None = None, row_acquisition: str | None = None) -> dict:
+        handoff, path, sha = self.handoff_file(unit_id="AN-SYN-POS", ion_mode="Positive")
+        triage = _triage(sha, list(keep), unit_id="AN-SYN-POS")
+        for row in triage["rows"]:
+            if row_ion is not None:
+                row["ion_mode"] = row_ion
+            if row_acquisition is not None:
+                row["acquisition_mode"] = row_acquisition
+        project, _workspace, _path = self.project(triage, handoff, path)
+        typed = project_from_dict(project)
+        typed.eligible, typed.selection_status, typed.blocking_reasons = True, "eligible", []
+        lease = create_download_lease(typed, self.root / "analysis", 10**9,
+                                      client=_Client({ARCHIVE_URL: ARCHIVE_BYTES}))
+        manifest = read_manifest(lease["manifest_path"])
+        manifest["manifest_path"] = lease["manifest_path"]
+        return manifest
+
+    def record_preflight(self, manifest: dict, campaign=None) -> None:
+        execution = {"outcomes": {}, "records": [], "counts": {}, "chunks": [], "command_template": [], "exit_code": 0}
+        per_file = manifest["raw_metadata_preflight"]["summary"]["per_file"]
+        with patch.object(repository_reanalysis, "_summarize_raw_metadata",
+                          return_value={"per_file": per_file, "acquisition_mode": "DDA"}), \
+                patch.object(repository_reanalysis, "_per_input_entries", side_effect=lambda entries, *_: entries):
+            repository_reanalysis._record_preflight(
+                manifest, execution=execution, extractor={"sha256": "ab" * 32}, inputs=[], output=self.root / "o.json",
+                declared=manifest["raw_metadata_preflight"]["declared"], confirm_untargeted=False, capped=False,
+                campaign=campaign, started_at="2026-11-16T00:00:00+00:00",
+            )
+
+
+class ACrossUnitRefusalSurvivesARecheck(_Leased):
+    REFUSED = {"schema": cs.CROSS_UNIT_SCHEMA, "rule": cs.CROSS_UNIT_RULE, "verdict": "refused",
+               "reason_code": cs.CROSS_UNIT_DUPLICATE_INPUTS, "reasons": [cs.CROSS_UNIT_DUPLICATE_INPUTS],
+               "retryable": False}
+
+    def test_a_recheck_outside_a_campaign_keeps_the_unit_from_running(self) -> None:
+        manifest = _preflight(self.leased())
+        manifest["cross_unit_attribution"] = dict(self.REFUSED)
+        manifest["execution_allowed"] = False
+
+        self.record_preflight(manifest)
+
+        self.assertFalse(manifest["execution_allowed"])
+        self.assertEqual("preflight_review_required", manifest["status"])
+
+    def test_a_recheck_in_a_campaign_holds_the_unit_with_the_refusals_code(self) -> None:
+        manifest = _preflight(self.leased())
+        manifest["cross_unit_attribution"] = dict(self.REFUSED)
+
+        self.record_preflight(manifest, campaign={"approval_id": "approval-syn", "campaign_id": "synthetic"})
+
+        disposition = manifest["campaign_disposition"]
+        self.assertEqual("skip", disposition["disposition"])
+        self.assertTrue(disposition["hold"])
+        self.assertIn(cs.CROSS_UNIT_DUPLICATE_INPUTS, disposition["reasons"])
+        self.assertFalse(manifest["execution_allowed"])
+        self.assertTrue(repository_reanalysis.held_by_disposition(manifest))
+
+    def test_a_fresh_check_that_passes_lifts_it(self) -> None:
+        manifest = _preflight(self.leased())
+        manifest["cross_unit_attribution"] = dict(self.REFUSED, verdict="passed", reason_code="", reasons=[])
+        self.assertEqual("run", decide_disposition(manifest)["disposition"])
+
+    def test_the_execution_gate_reads_the_refusal_and_the_disagreement_again(self) -> None:
+        for field, value, phrase in (
+            ("cross_unit_attribution", dict(self.REFUSED), "cross-unit check refused"),
+            ("curated_selection_reconciliation", {"verdict": "disagree", "triage_sha256": "t"},
+             "triage_header_disagreement"),
+        ):
+            with self.subTest(field=field):
+                manifest = self.leased()
+                manifest_path = Path(manifest.pop("manifest_path"))
+                manifest["execution_allowed"] = True
+                manifest[field] = value
+                repository_reanalysis._write_json(manifest_path, manifest)
+                gate = repository_reanalysis.evaluate_repository_execution_gate(
+                    {"repository_run_manifest": str(manifest_path)}
+                )
+                self.assertFalse(gate["allowed"])
+                self.assertTrue(any(phrase in item for item in gate["blockers"]), gate["blockers"])
+                shutil.rmtree(self.root / "analysis", ignore_errors=True)
+
+
+class ATriageLeftUnknownIsComparedAtTheUnitsValue(_Leased):
+    """A row whose triage polarity or acquisition is unknown is compared with the unit's as applied, never skipped."""
+
+    def test_negative_headers_in_a_positive_unit_of_unknown_rows_hold_it(self) -> None:
+        manifest = self.leased(keep=(0, 1, 3, 4), row_ion="unknown")
+        names = [Path(item).name for item in manifest["input_candidates"]]
+        self.assertEqual(4, len(names))
+
+        held = decide_disposition(_preflight(manifest, {name: "Negative" for name in names}))
+        self.assertEqual(("skip", True), (held["disposition"], held.get("hold")))
+        self.assertIn(cs.TRIAGE_HEADER_DISAGREEMENT, held["reasons"])
+        item = held["curated_selection_reconciliation"]["files"][0]
+        self.assertEqual(("positive", "unit", "disagree"),
+                         (item["ion_mode"]["triage"], item["ion_mode"]["triage_basis"], item["ion_mode"]["result"]))
+
+        mixed = decide_disposition(
+            _preflight(manifest, {name: "Negative" if "neg" in name else "Positive" for name in names})
+        )
+        self.assertEqual("skip", mixed["disposition"], "a split would run the negative files of a positive triage")
+        self.assertTrue(mixed["hold"])
+
+    def test_an_acquisition_left_unknown_is_compared_with_the_units(self) -> None:
+        manifest = self.leased(row_acquisition="unknown")
+        held = decide_disposition(_preflight(manifest, acquisitions={"SA_01_C18pos.mzML": "DIA"}))
+        self.assertTrue(held.get("hold"))
+        self.assertEqual("disagree", held["curated_selection_reconciliation"]["verdict"])
+
+
+class TheReconciliationGuards(_Leased):
+    def test_a_header_of_another_acquisition_holds_the_unit(self) -> None:
+        held = decide_disposition(_preflight(self.leased(), acquisitions={"SB_01_C18pos.mzML": "DIA"}))
+        self.assertTrue(held.get("hold"))
+        files = held["curated_selection_reconciliation"]["files"]
+        self.assertEqual([["acquisition_mode"]], [item["reasons"] for item in files if item["result"] == "disagree"])
+
+    def test_a_dia_family_header_agrees_with_a_swath_row(self) -> None:
+        manifest = self.leased(row_acquisition="SWATH")
+        names = {Path(item).name: "AIF" for item in manifest["input_candidates"]}
+        self.assertEqual("agree", cs.reconcile_curated_selection(_preflight(manifest, acquisitions=names))["verdict"])
+
+    def test_a_polarity_switching_header_holds_the_unit(self) -> None:
+        held = decide_disposition(_preflight(self.leased(), {"SA_01_C18pos.mzML": "PolaritySwitching"}))
+        self.assertTrue(held.get("hold"))
+
+    def test_an_input_that_is_no_kept_row_holds_the_unit(self) -> None:
+        manifest = self.leased()
+        other = str(Path(manifest["input_directory"]) / "RPLC_NEGATIVE" / "SA_01_C18neg.mzML")
+        block = cs.reconcile_curated_selection(_preflight(manifest, extra=(other,)))
+        self.assertEqual("disagree", block["verdict"])
+        self.assertEqual([("RPLC_NEGATIVE/SA_01_C18neg.mzML", "not_in_selection")],
+                         [(item["file"], item["reason"]) for item in block["files"] if item["result"] == "disagree"])
+
+    def test_an_exclusion_stays_an_exclusion(self) -> None:
+        manifest = _preflight(self.leased(), {"SA_01_C18pos.mzML": "Negative"})
+        disposition = cs.apply_reconciliation(
+            manifest, {"disposition": "exclude", "reasons": ["gc_ms"], "assignments": {}}
+        )
+        self.assertEqual("exclude", disposition["disposition"])
+        self.assertEqual("disagree", disposition["curated_selection_reconciliation"]["verdict"])
+
+
+class AConvertedMzxmlIsItsSourcesRow(unittest.TestCase):
+    def manifest(self, root: str = "D:/ws/AN/raw") -> dict:
+        return {
+            "input_directory": root + "/data",
+            "raw_directory": root,
+            "project": {"repository_metadata": {"curated_selection": {
+                "triage_sha256": "t", "analysis_unit_key": "AN",
+                "applied_technical": {"ion_mode": "positive", "acquisition_mode": "DDA"},
+                "rows_kept": [{"member_path": "POS/S1.mzXML", "row_index": 0, "ion_mode": "positive",
+                               "acquisition_mode": "DDA", "basis": "declared"}],
+            }}},
+            "input_lineage": {"rows": [{
+                "path": root + "/converted/POS/S1.mzML", "kind": "converted", "sample_id": "S1",
+                "source": {"conversion": {"path": root + "/data/POS/S1.mzXML",
+                                          "source_row": {"path": root + "/data/POS/S1.mzXML", "kind": "file",
+                                                         "checksums": {"sha256": "ab" * 32}}}},
+            }]},
+            "raw_metadata_preflight": {"summary": {"per_file": [
+                {"file": root + "/converted/POS/S1.mzML", "outcome": "ok", "polarity": "Positive",
+                 "acquisition_mode": "DDA"},
+            ]}},
+        }
+
+    def test_the_converted_mzml_reconciles_against_its_mzxml_row(self) -> None:
+        block = cs.reconcile_curated_selection(self.manifest())
+        self.assertEqual("agree", block["verdict"], block["files"])
+        self.assertEqual("POS/S1.mzXML", block["files"][0]["member_path"])
+
+    def test_an_input_outside_the_selection_is_recorded_without_an_absolute_path(self) -> None:
+        manifest = self.manifest()
+        manifest["input_lineage"]["rows"] = []
+        block = cs.reconcile_curated_selection(manifest)
+        self.assertEqual("raw:/converted/POS/S1.mzML", block["files"][0]["file"])
+
+    def test_the_replay_projection_names_the_source_member_on_any_machine(self) -> None:
+        first = self.manifest("D:/ws1/raw")
+        second = self.manifest("E:/other/ws2/raw")
+        for manifest in (first, second):
+            del manifest["project"]["repository_metadata"]["curated_selection"]
+        projection = cs.replay_projection(first, "0.5.69")
+        self.assertEqual("POS/S1.mzXML", projection["inputs"][0]["member"])
+        self.assertEqual("mzML", projection["inputs"][0]["converted_to"])
+        self.assertNotIn("ws1", json.dumps(projection))
+        self.assertEqual(cs.replay_projection_sha256(first, "0.5.69"), cs.replay_projection_sha256(second, "0.5.69"))
+
+
+class TheHandoffThatDrivesThePlanIsBound(_Files):
+    def setUp(self) -> None:
+        super().setUp()
+        self.handoff, self.path, self.sha = self.handoff_file(unit_id="AN-SYN-POS", ion_mode="Positive")
+        self.triage = _triage(self.sha, [0, 1, 2], unit_id="AN-SYN-POS")
+
+    def test_a_copy_that_changes_files_or_settings_is_refused_against_the_original(self) -> None:
+        copy = json.loads(json.dumps(self.handoff))
+        copy["files"][0]["download_url"] = "https://elsewhere.invalid/other.zip"
+        copy["technical_settings"]["chromatography"] = "HILIC"
+        copy_path = self.write("handoffs/copy.json", copy)
+        error = self.refused(cs.CURATED_SELECTION_HANDOFF_MISMATCH, self.triage, copy, copy_path,
+                             original_handoff_path=str(self.path))
+        self.assertEqual(["files", "technical_settings"], error.detail["differing_keys"])
+
+    def test_a_faithful_copy_with_rewritten_sidecar_paths_is_verified(self) -> None:
+        original_sidecar = self.write("catalog/samples.json", [{"sample_id": "x"}])
+        original = dict(self.handoff, sample_table_path=str(original_sidecar))
+        original_path = self.write("handoffs/original.json", original)
+        triage = _triage(hashlib.sha256(original_path.read_bytes()).hexdigest(), [0, 1, 2], unit_id="AN-SYN-POS")
+        copy_sidecar = self.write("campaign/samples.json", [{"sample_id": "x"}])
+        copy = dict(self.handoff, sample_table_path=str(copy_sidecar))
+        copy_path = self.write("handoffs/copy.json", copy)
+
+        project, _workspace, _path = self.project(triage, copy, copy_path, original_handoff_path=str(original_path))
+        record = project["repository_metadata"]["curated_selection"]
+        self.assertEqual("original_read_and_copy_compared", record["catalog_handoff_verification"])
+        self.assertEqual(["sample_table_path"], sorted(record["original_handoff"]["sidecars"]))
+
+        self.write("campaign/samples.json", [{"sample_id": "y"}])
+        self.refused(cs.CURATED_SELECTION_HANDOFF_MISMATCH, triage, copy, copy_path,
+                     original_handoff_path=str(original_path))
+
+    def test_each_way_of_tying_the_handoff_is_named(self) -> None:
+        project, _workspace, _path = self.project(self.triage, self.handoff, self.path)
+        self.assertEqual("handoff_file",
+                         project["repository_metadata"]["curated_selection"]["catalog_handoff_verification"])
+        copy = dict(self.handoff, runner_note="rewritten")
+        copy_path = self.write("handoffs/copy.json", copy)
+        project, _workspace, _path = self.project(self.triage, copy, copy_path, original_handoff_sha256=self.sha)
+        self.assertEqual("runner_asserted",
+                         project["repository_metadata"]["curated_selection"]["catalog_handoff_verification"])
+
+    def test_a_triage_counting_other_rows_or_naming_another_sample_is_refused(self) -> None:
+        self.refused(cs.CURATED_SELECTION_HANDOFF_MISMATCH,
+                     _triage(self.sha, [0, 1, 2], unit_id="AN-SYN-POS", catalog_row_count=5), self.handoff, self.path)
+        renamed = _triage(self.sha, [0, 1, 2], unit_id="AN-SYN-POS")
+        renamed["rows"][0]["sample_id"] = "SOMEONE_ELSE"
+        self.refused(cs.CURATED_SELECTION_HANDOFF_MISMATCH, renamed, self.handoff, self.path)
+
+
+class AnApprovalMustNameItsManifest(_Files):
+    def setUp(self) -> None:
+        super().setUp()
+        self.handoff, self.path, sha = self.handoff_file(unit_id="AN-SYN-POS", ion_mode="Positive")
+        self.triage = _triage(sha, [0, 1, 2], unit_id="AN-SYN-POS")
+        self.triage_sha = hashlib.sha256(self.write("triage/AN-SYN-POS.json", self.triage).read_bytes()).hexdigest()
+
+    def test_an_approval_without_a_manifest_approves_no_selection(self) -> None:
+        approval = self.write("campaign/approval-no-manifest.json", {
+            "schema": "msdial-campaign-authorization.v1", "approval_id": "approval-syn", "campaign_id": "synthetic",
+            "manifest_digest": "sha256:" + "0" * 64, "approved_by": "A. Person",
+            "approved_at": "2026-11-16T10:00:00+09:00", "statement": "Run the listed units as planned.",
+            "covers": [1], "units": ["AN-SYN-POS"], "raw_retention_policy": "keep", "libraries": [],
+            "revoked_at": None,
+        })
+        error = self.refused(cs.CURATED_SELECTION_NOT_APPROVED, self.triage, self.handoff, self.path,
+                             campaign_authorization_path=str(approval))
+        self.assertIn("names no campaign manifest", str(error))
+        self.assertEqual("approval-syn", error.detail["approval_id"])
+
+    def test_an_approved_decision_record_must_be_the_one_beside_the_triage(self) -> None:
+        self.write("triage/AN-SYN-POS.record.json", {"payload": {"sha256": self.triage_sha}})
+        approval = AnApprovedManifestMustCarryTheTriage.approval(self, {"unit_id": "AN-SYN-POS", "curated_selection": {
+            "triage_sha256": self.triage_sha, "triage_record_sha256": "33" * 32}})
+        self.refused(cs.CURATED_SELECTION_RECORD_MISMATCH, self.triage, self.handoff, self.path,
+                     campaign_authorization_path=str(approval))
+
+
+class ABatchPlansBothChildrenOfABothUnit(_Files):
+    def test_one_handoff_plans_one_run_per_child(self) -> None:
+        handoff, path, sha = self.handoff_file()
+        triage = _triage(sha, list(range(6)), ion_mode="both", children=ABothUnitNeedsASinglePolarityChild.CHILDREN)
+        triage["excluded_rows"] = []
+        triage_path = self.write("triage/AN-SYN-BOTH.json", triage)
+
+        plan = mcp_server.msdial_repository_batch_plan(
+            workspace_root=str(self.root / "analysis"),
+            analysis_unit_handoff_paths=[str(path)],
+            analysis_purpose="Synthetic purpose.",
+            curated_selection_paths={"AN-SYN-BOTH": [{"path": str(triage_path), "child_key": "pos"},
+                                                     {"path": str(triage_path), "child_key": "neg"}]},
+        )
+
+        runs = {run["analysis_unit_id"]: run for run in plan["runs"]}
+        self.assertEqual(["AN-SYN-BOTH-neg", "AN-SYN-BOTH-pos"], sorted(runs))
+        self.assertEqual("Negative", runs["AN-SYN-BOTH-neg"]["project"]["ion_mode"])
+        self.assertEqual(3, runs["AN-SYN-BOTH-pos"]["project"]["sample_count"])
+
+
+class TheCanonicalAnalysisCsvIsExact(unittest.TestCase):
+    def test_the_canonical_bytes_of_a_small_csv(self) -> None:
+        data = (
+            "\ufeffFile path,File name,Type\r\n"
+            "C:\\w\\U1\\raw\\data\\S1.mzML,S1,Sample\r\n"
+            "C:\\w\\U1\\output\\x.txt,x,Sample\r\n"
+            "D:\\elsewhere\\lib.msp,lib,Sample\r\n"
+        ).encode("utf-8")
+        self.assertEqual(
+            b"File path,File name,Type\n"
+            b"data/S1.mzML,S1,Sample\n"
+            b"../output/x.txt,x,Sample\n"
+            b"<external>/lib.msp,lib,Sample\n",
+            cs.canonical_analysis_csv(data, "C:\\w\\U1\\raw"),
+        )
 
 
 if __name__ == "__main__":

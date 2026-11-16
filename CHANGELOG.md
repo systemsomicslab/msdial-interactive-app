@@ -11,13 +11,15 @@ accessions ran every unit on the whole study's files (79 done unit/parts over 29
 triage before download: an agent writes one msdial-unit-triage.v1 file per Catalog unit, validate-triage.py checks
 them as a set, and a person approves the campaign manifest digest that carries their sha256 (msdial-public-reanalysis
 #58). This version makes a unit's lease, preflight and siblings answer to that file. Built from origin/main (0.5.67):
-0.5.68 is reserved by #101 (remote zip listing), which this version does not need.
+0.5.68 is reserved by #101 (remote zip listing), which this version does not need. If this version merges first,
+#101 takes the next free patch version at its merge (0.5.70) rather than land a 0.5.68 section below this one.
 
 ### Added
 - **`curated_selection_path` on `msdial_repository_reanalysis_plan` and `msdial_download_repository_raw`**, with
-  `curated_selection_child_key`, `original_handoff_sha256` and `curated_selection_validator`, and
-  **`curated_selection_paths` on `msdial_repository_batch_plan`** (keyed by Catalog unit id; a path, or {path,
-  child_key, original_handoff_sha256, validator}) (`msdial_app.curated_selection`).
+  `curated_selection_child_key`, `original_handoff_sha256`, `original_handoff_path` and
+  `curated_selection_validator`, and **`curated_selection_paths` on `msdial_repository_batch_plan`** (keyed by Catalog
+  unit id; a path, or {path, child_key, original_handoff_sha256, original_handoff_path, validator}, or a list of those,
+  which plans each child of a Both unit as its own run from the one handoff) (`msdial_app.curated_selection`).
   - The Catalog handoff's sample rows are cut to the triage's kept rows, and one analysis input is declared per kept
     row by its archive member path (`selected_by: curated_selection`, `triage_row_index`). The lease's exact path
     match then admits only those members; the whole-study archive is still the one download object.
@@ -31,7 +33,11 @@ them as a set, and a person approves the campaign manifest digest that carries t
 - **`repository_metadata.curated_selection`** (`msdial-curated-selection.v1`) in the project and the run manifest:
   the triage's path and sha256 (`triage_sha256`), the sha256 of its decision record where `<unit_id>.record.json`
   sits beside it (`triage_record_sha256`; its `payload.sha256` must be the triage's), `catalog_handoff_sha256`,
-  `original_handoff_sha256` and `copy_handoff_sha256`, `decided_by` (agent, model, skill, skill version) and
+  `original_handoff_sha256` and `copy_handoff_sha256`, `catalog_handoff_verification` (how the handoff that drives
+  the plan is tied to the one the triage names: `handoff_file`, the file passed is it;
+  `original_read_and_copy_compared`, the original was read by `original_handoff_path` and the copy holds its every
+  value but the rewritten sidecar paths, sidecar contents included; `runner_asserted`, only its sha256 was passed),
+  `decided_by` (agent, model, skill, skill version) and
   `decided_at` as the triage records them, `validator` as the caller passes it, `approval_id` and `manifest_digest`
   where an approval covers it, `selection_sha256` over the canonical selection of the transparency framework
   (msdial-public-reanalysis#59, section 3; `curated_selection.selection_canonical`, recomputable from the triage
@@ -40,11 +46,17 @@ them as a set, and a person approves the campaign manifest digest that carries t
   manifest names this triage's sha256 for the unit, else `model_inference`.
 - **Header reconciliation.** `decide_disposition` now applies the curated selection's reconciliation after the header
   decision, so the preflight, a recheck and a split decide alike. Each inspected input's header polarity and
-  acquisition are compared with its kept row (DIA, SWATH and AIF are one family; MS1 is FullScan). A disagreement, an
+  acquisition are compared with its kept row, or with the unit's as applied where the row's is unknown or not
+  comparable (`triage_basis` row or unit), so a row the triage left unknown is never skipped (DIA, SWATH and AIF are
+  one family; MS1 is FullScan). An mzML converted from an mzXML member is matched to its source's row through the
+  lineage's conversion source. A disagreement, an
   input that is no kept row's, or an unread header for a row the triage only inferred holds the unit: disposition
   `skip`, `hold: true`, reason `triage_header_disagreement`, no assignments, and `curated_selection_reconciliation`
   {per-file triage against header, verdict} on the disposition and the manifest. `execution_allowed` is false in or
-  out of a campaign. No retry and no automatic rerun: the hold stands until a revised triage is planned again.
+  out of a campaign, and `evaluate_repository_execution_gate` reads the reconciliation again, so no later write of
+  `execution_allowed` lets the unit run. No retry and no automatic rerun: the hold stands until a revised triage is
+  planned again. A file that is no kept row's is recorded by a portable path (relative to the data root, else
+  `raw:/<path under the raw directory>`, else `<external>/<name>`), never an absolute one.
 - **`msdial_repository_cross_unit_check(manifest_paths)`** and the pure `cross_unit_attribution(manifests)`, after
   every sibling's preflight. Only Sample inputs are compared (blanks, QCs and standards by the coverage gate's
   reading, and curated rows whose role is not sample). A file is a declared checksum, else the sha256 of a file
@@ -54,24 +66,41 @@ them as a set, and a person approves the campaign manifest digest that carries t
     declared, refuses the unit (`cross_unit_polarity_contradiction`); an inferred polarity no sibling contests is
     overridden by the header, on record.
   - C: one polarity, different chromatographies, containment of at least 0.5: refused
-    (`cross_unit_inputs_indistinguishable_chromatography`). The same files keep for the member whose names state its
-    chromatography for at least half of them; byte copies under other names refuse both sides, since ST002283's copies
-    were named HILIC and were reversed phase. Containment below 0.5 warns (`cross_unit_inputs_partly_shared`).
+    (`cross_unit_inputs_indistinguishable_chromatography`). The same files keep only for a member every one of whose
+    shared files states its chromatography, and only it, by name (the other member is then refused); any other share
+    refuses both, so ST002283 as stage3b ran it (both units holding 40 Hilic-named and 40 Lipid-named files) refuses
+    both units. Byte copies under other names refuse both sides, since ST002283's copies were named HILIC and were
+    reversed phase. Containment below 0.5 warns (`cross_unit_inputs_partly_shared`). Every pair is compared, whatever
+    P decided.
+  - S: one polarity, chromatographies that do not tell the units apart (the same, or one unknown), sets that differ
+    with the smaller contained at 0.5 or more in the larger: both refused (`cross_unit_inputs_contained`), since one
+    holds files the other claims and nothing on record says which (a liver unit holding the plasma unit's files).
+    Below 0.5 warns both; the overlap is recorded either way. Every pair is compared, so a third unit cannot escape
+    through a sibling already refused.
   - D: a set identical to an earlier standing unit's, as files or as listed content, is refused for every unit after
     the first (`cross_unit_duplicate_inputs`).
   - With `record` (the default) each manifest gets `cross_unit_attribution`, and a refused unit `execution_allowed`
     false with `reason_code` and `retryable: false`.
+  - The refusal is sticky: `decide_disposition` holds a refused unit (skip, `hold: true`, the refusal's codes among
+    the reasons, `cross_unit_attribution_hold`), `_record_preflight` keeps `execution_allowed` false in or out of a
+    campaign, and `evaluate_repository_execution_gate` blocks while the verdict is refused. Only a fresh cross-unit
+    check that passes the unit (and so rewrites the block) lifts it. The rule set is
+    `cross_unit_attribution_2026_11_16b`.
 - **Canonical hashes for a third-party replay.** `analysis_csv.canonical_sha256` (paths relative to the unit's raw
   directory, forward slashes, LF, UTF-8 without a byte-order mark; `msdial-analysis-csv-canonical.v1`), and at
   finalisation `replay_projection` with `replay_projection_sha256` (`msdial-replay-projection.v1`: a whitelist of the
-  run manifest with no timestamps, job ids, hosts or absolute paths).
+  run manifest with no timestamps, job ids, hosts or absolute paths; a converted input is named by its source member,
+  with `converted_to: mzML`).
 
 ### Changed
 - Every refusal above is a `CuratedSelectionError` (a ValueError) raised before download, so no byte moves, and a tool
   returns it as {ok false, reason and reason_code the code, retryable false}. The codes `curated_selection_invalid`,
   `_not_ready`, `_handoff_mismatch`, `_not_approved`, `_record_mismatch`, `_child_unknown`, `_mixed_polarity`,
-  `_member_unresolved`, `_empty`, `_class_contrast_lost`, `triage_header_disagreement` and the three cross-unit codes
+  `_member_unresolved`, `_empty`, `_class_contrast_lost`, `triage_header_disagreement` and the four cross-unit codes
   are in `ATTRIBUTION_COVERAGE_REFUSALS`, which the campaign runner mirrors as terminal.
+- Under a campaign approval, a curated selection is applied only where the approval names its campaign manifest and
+  the manifest's entry for the unit carries this triage's sha256; an approval that names no manifest approved no
+  selection (`curated_selection_not_approved`), whatever its unit coverage says.
 - A batch plan records one unit's refused triage for that unit (`blocking_reasons: curated_selection:<code>`,
   `refusal`) and plans the others.
 

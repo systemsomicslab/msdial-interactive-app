@@ -420,11 +420,16 @@ For an accession-to-mzTab-M workflow, prefer the higher-level repository tools:
 - `curated_selection_path` (0.5.69) on the plan and download tools, and
   `curated_selection_paths` on the batch plan, hold a Catalog unit to its triage file
   (msdial-unit-triage.v1): its kept rows only, declared by archive member path. A
-  Both unit needs `curated_selection_child_key`. A triage that does not hold returns
-  its `curated_selection_*` code with `retryable: false`, before any download.
+  Both unit needs `curated_selection_child_key` (a list of entries in the batch plan
+  plans both children). A rewritten handoff copy is tied to the Catalog original by
+  `original_handoff_path` (compared) or `original_handoff_sha256` (recorded as
+  runner-asserted). A triage that does not hold returns its `curated_selection_*`
+  code with `retryable: false`, before any download.
 - `msdial_repository_cross_unit_check`: after every sibling unit's preflight, compare
   their Sample inputs and refuse a polarity contradiction, a set shared across
-  chromatographies, or an identical set (recorded as `cross_unit_attribution`).
+  chromatographies, a set mostly inside another at one polarity and chromatography,
+  or an identical set (recorded as `cross_unit_attribution`). A refusal holds the
+  unit through every recheck until a fresh check passes it.
 - `msdial_download_store_status`: read-only view of the accession download
   stores (`<workspace_root>\<repository>\<accession>\_dl`): each object and the
   units whose claims keep it, partial transfers, lock holders, unclaimed

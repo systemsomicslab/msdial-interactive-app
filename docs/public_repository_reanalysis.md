@@ -553,19 +553,28 @@ unit's handoff; a Both unit also names its single-polarity child
 (`curated_selection_child_key`, unit `<unit_id>-<child_key>`). Interactive then:
 
 1. checks the triage before download: its schema, `status: ready`, the unit and
-   accession, the Catalog handoff sha256 it was made from (the handoff file read,
-   or `original_handoff_sha256` for a rewritten copy), the row count, one
-   polarity, a member for every kept row, and, where the campaign approval names
-   its manifest, that the manifest carries this triage's sha256 for the unit;
+   accession, the Catalog handoff sha256 it was made from (the handoff file read;
+   for a rewritten copy, `original_handoff_path`, a byte snapshot of the original
+   that is hashed and compared with the copy, or only `original_handoff_sha256`,
+   recorded as `runner_asserted`), the row count, one polarity, a member for
+   every kept row, and, under a campaign approval, that the approval names its
+   manifest and the manifest carries this triage's sha256 for the unit;
 2. cuts the sample rows to the kept rows and declares one input per kept row by
    its archive member path, so the lease of the whole archive admits only those;
 3. records `repository_metadata.curated_selection`: every hash (triage, decision
    record, handoff, canonical selection), who decided it, rows kept and dropped
    with reasons, and whether it is a model inference or an accepted decision;
-4. compares each input's raw header with the triage after the preflight; a
-   disagreement holds the unit for a person (`triage_header_disagreement`);
+4. compares each input's raw header with the triage after the preflight (the
+   row's value, or the unit's where the row's is unknown; a converted mzML by its
+   mzXML's row); a disagreement holds the unit for a person
+   (`triage_header_disagreement`);
 5. lets `msdial_repository_cross_unit_check` compare the units of one group once
-   all are preflighted.
+   all are preflighted (rules P, C, S and D). A refusal is sticky: the unit's
+   disposition holds it and the execution gate blocks it through every recheck,
+   until a fresh cross-unit check passes it.
+
+A batch plan names both children of a Both unit with a list under its Catalog
+unit id in `curated_selection_paths`.
 
 Every refusal is final for the triage as written (`retryable: false`): a revised
 triage is planned again; nothing reruns on its own.

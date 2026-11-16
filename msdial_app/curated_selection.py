@@ -17,7 +17,8 @@ This module is what makes Interactive hold a unit to that file list, and nothing
 - ``reconcile_curated_selection`` compares each admitted input's raw header (polarity, acquisition) with what the
   triage said of it. A disagreement holds the unit for a person (``triage_header_disagreement``); nothing reruns it.
 - ``cross_unit_attribution`` compares the Sample inputs of sibling units after their preflights: one polarity
-  contradiction (P), a set shared across chromatographies (C) or an identical set (D) is refused.
+  contradiction (P), a set shared across chromatographies (C), a set mostly inside another's at one polarity and
+  chromatography (S) or an identical set (D) is refused.
 
 WHAT IT RECORDS, AND WHY IT IS ALL HASHES. The author's requirement of 2026-11-16 is that LLM use in data management
 must not leave a black box in the paper. The triage is a model inference until a person approves the digest that
@@ -45,7 +46,7 @@ TRIAGE_SCHEMAS = ("msdial-unit-triage.v1", "msdial-unit-triage.v2")
 PROVENANCE_SCHEMA = "msdial-curated-selection.v1"
 RECONCILIATION_SCHEMA = "msdial-curated-selection-reconciliation.v1"
 CROSS_UNIT_SCHEMA = "msdial-cross-unit-attribution.v1"
-CROSS_UNIT_RULE = "cross_unit_attribution_2026_11_16"
+CROSS_UNIT_RULE = "cross_unit_attribution_2026_11_16b"
 SELECTION_CANONICAL_FORM = "msdial-curated-selection-canonical.v1"
 
 # Refusals before download (CuratedSelectionError.code). Each is final for the triage as it is: the same triage and
@@ -66,6 +67,7 @@ TRIAGE_HEADER_DISAGREEMENT = "triage_header_disagreement"
 CROSS_UNIT_POLARITY_CONTRADICTION = "cross_unit_polarity_contradiction"
 CROSS_UNIT_INDISTINGUISHABLE_CHROMATOGRAPHY = "cross_unit_inputs_indistinguishable_chromatography"
 CROSS_UNIT_DUPLICATE_INPUTS = "cross_unit_duplicate_inputs"
+CROSS_UNIT_CONTAINED_INPUTS = "cross_unit_inputs_contained"
 CROSS_UNIT_PARTLY_SHARED_WARNING = "cross_unit_inputs_partly_shared"
 CROSS_UNIT_HEADER_OVERRIDES_INFERENCE_WARNING = "cross_unit_header_polarity_overrides_inferred_polarity"
 
@@ -84,7 +86,12 @@ CURATED_SELECTION_REFUSALS = frozenset(
     }
 )
 CROSS_UNIT_REFUSALS = frozenset(
-    {CROSS_UNIT_POLARITY_CONTRADICTION, CROSS_UNIT_INDISTINGUISHABLE_CHROMATOGRAPHY, CROSS_UNIT_DUPLICATE_INPUTS}
+    {
+        CROSS_UNIT_POLARITY_CONTRADICTION,
+        CROSS_UNIT_INDISTINGUISHABLE_CHROMATOGRAPHY,
+        CROSS_UNIT_CONTAINED_INPUTS,
+        CROSS_UNIT_DUPLICATE_INPUTS,
+    }
 )
 # Containment at or above which two units' Sample inputs are one set (the coverage gate's minimum, 2026-11-15).
 CROSS_UNIT_CONTAINMENT_MINIMUM = 0.5
@@ -230,7 +237,8 @@ def canonical_analysis_csv_sha256(csv_path: str | Path, raw_directory: str) -> s
 
 def replay_projection(manifest: Mapping[str, Any], interactive_version: str = "") -> dict[str, Any]:
     """The whitelist of a run manifest a replay compares (REPLAY_PROJECTION_SCHEMA). Pure; no timestamps, job ids,
-    host names or absolute paths, by construction: every value is copied from a named field or made relative.
+    host names or absolute paths, by construction: every value is copied from a named field or made portable
+    (_portable_path: relative to the data root, else raw:/<path under the raw directory>, else <external>/<name>).
 
     Fields: repository, accession, analysis unit id; the Catalog handoff sha256 (the curated selection's, else the
     canonical JSON of the handoff the manifest carries); the curated selection's hashes; ion mode, acquisition mode and
@@ -250,15 +258,28 @@ def replay_projection(manifest: Mapping[str, Any], interactive_version: str = ""
         if isinstance(item, dict)
     }
     inputs = []
+    raw_directory = _raw_directory(manifest)
     lineage = manifest.get("input_lineage") if isinstance(manifest.get("input_lineage"), dict) else {}
     for row in lineage.get("rows") or []:
         if not isinstance(row, dict) or not str(row.get("path") or "").strip():
             continue
         path = str(row["path"])
         identity, basis = _input_identity(row, data_root)
+        source = row.get("source") if isinstance(row.get("source"), dict) else {}
+        conversion = source.get("conversion") if isinstance(source.get("conversion"), dict) else {}
+        origin = str(conversion.get("path") or "")
+        # The member the input is: the triage's, else (for an mzML converted from an mzXML member) its source's, else
+        # its path made portable (_portable_path). Never absolute (review of 0.5.69: a converted input under
+        # raw/converted kept its absolute path).
+        member = str(
+            row.get("triage_member_path")
+            or (_portable_path(origin, data_root, raw_directory) if origin else "")
+            or _portable_path(path, data_root, raw_directory)
+        ).replace("\\", "/")
         inputs.append(
             {
-                "member": str(row.get("triage_member_path") or _relative(path, data_root)).replace("\\", "/"),
+                "member": member,
+                **({"converted_to": "mzML"} if origin else {}),
                 "identity": identity,
                 "identity_basis": basis,
                 "sample_id": str(row.get("sample_id") or ""),
@@ -354,11 +375,76 @@ def decision_record(triage_path: Path, triage: Mapping[str, Any], triage_sha256:
     return {"name": location.name, "sha256": sha256_bytes(data), "decision_id": str(record.get("decision_id") or "")}
 
 
+# The keys a campaign runner's copy of a Catalog handoff rewrites (scripts/campaign/ports.py copy_handoff): each points
+# at the copy of a sidecar. Everything else in the copy must be the original's.
+HANDOFF_COPY_REWRITTEN_KEYS = ("file_manifest_path", "sample_table_path", "analysis_input_manifest_path")
+
+
+def verify_handoff_copy(original_path: str | Path, copy: Mapping[str, Any]) -> dict[str, Any]:
+    """Bind a rewritten handoff copy to the Catalog original it was copied from. Raises CuratedSelectionError.
+
+    The original is read by path and hashed (its sha256 is what a triage names); the copy must hold the same value
+    for every key but HANDOFF_COPY_REWRITTEN_KEYS (compared as canonical JSON): the sample rows, the files with their
+    URLs, sizes and checksums, the technical settings, the unit and accession. The sidecars the rewritten keys name
+    (the external file manifest, sample table and input manifest a large handoff carries its rows in) must exist on
+    both sides and hold the same JSON value: a copy pointing at other rows is no copy. Returns {sha256, name,
+    compared_keys, sidecars (each side's sha256)}.
+    """
+    location = Path(str(original_path)).expanduser()
+    try:
+        data = location.read_bytes()
+        original = json.loads(data.decode("utf-8-sig"))
+    except (OSError, UnicodeDecodeError, ValueError) as error:
+        raise CuratedSelectionError(
+            CURATED_SELECTION_HANDOFF_MISMATCH, f"The Catalog's original handoff could not be read: {error}."
+        ) from error
+    if not isinstance(original, dict):
+        raise CuratedSelectionError(CURATED_SELECTION_HANDOFF_MISMATCH, "The original handoff is not one JSON object.")
+    keys = sorted((set(original) | set(copy)) - set(HANDOFF_COPY_REWRITTEN_KEYS))
+    differing = [key for key in keys if canonical_json(original.get(key)) != canonical_json(copy.get(key))]
+    if differing:
+        raise CuratedSelectionError(
+            CURATED_SELECTION_HANDOFF_MISMATCH,
+            f"The handoff passed is not a copy of the Catalog's original {location.name}: it differs in "
+            f"{', '.join(differing[:20])}. Only {', '.join(HANDOFF_COPY_REWRITTEN_KEYS)} may be rewritten.",
+            differing_keys=differing[:50],
+        )
+
+    def sidecar(value: Any) -> tuple[str | None, bytes | None]:
+        text = str(value or "").strip()
+        path = Path(text).expanduser() if text else None
+        if path is None or not path.is_file():
+            return None, None
+        content = path.read_bytes()
+        try:
+            return sha256_bytes(content), canonical_json(json.loads(content.decode("utf-8-sig")))
+        except (UnicodeDecodeError, ValueError):
+            return sha256_bytes(content), content
+
+    sidecars: dict[str, Any] = {}
+    for key in HANDOFF_COPY_REWRITTEN_KEYS:
+        if not (original.get(key) or copy.get(key)):
+            continue
+        original_sha, original_value = sidecar(original.get(key))
+        copy_sha, copy_value = sidecar(copy.get(key))
+        if original_value is None or copy_value is None or original_value != copy_value:
+            raise CuratedSelectionError(
+                CURATED_SELECTION_HANDOFF_MISMATCH,
+                f"The {key} sidecar of the handoff passed is not the original's: "
+                + ("one side's file is missing." if original_value is None or copy_value is None else
+                   "their contents differ."),
+                sidecar=key,
+            )
+        sidecars[key] = {"original_sha256": original_sha, "copy_sha256": copy_sha}
+    return {"sha256": sha256_bytes(data), "name": location.name, "compared_keys": keys, "sidecars": sidecars}
+
+
 def campaign_selection(authorization_path: str | Path | None, unit_key: str) -> dict[str, Any] | None:
-    """What an approved campaign manifest says of this unit's curated selection, or None when no manifest is named.
+    """What an approved campaign manifest says of this unit's curated selection, or None without an approval.
 
     The approval is of a manifest digest; CampaignAuthorization.load already refuses a named manifest that no longer
-    hashes to it. Returns {approval_id, manifest_digest, entry (the unit's manifest entry, or None)}.
+    hashes to it. Returns {approval_id, manifest_digest, manifest_named, entry (the unit's manifest entry, or None)};
+    an approval that names no campaign manifest returns manifest_named false, which apply_curated_selection refuses.
     """
     from .campaign_authorization import load_campaign_authorization
 
@@ -367,7 +453,14 @@ def campaign_selection(authorization_path: str | Path | None, unit_key: str) -> 
         return None
     manifest_path = str(authorization.record.get("campaign_manifest_path") or "").strip()
     if not manifest_path:
-        return None
+        # An approval that names no manifest approved no selection: apply_curated_selection refuses the triage rather
+        # than let it move bytes under a coverage given by unit id alone (review of 0.5.69).
+        return {
+            "approval_id": authorization.approval_id,
+            "manifest_digest": authorization.manifest_digest,
+            "manifest_named": False,
+            "entry": None,
+        }
     manifest = json.loads(Path(manifest_path).expanduser().read_text(encoding="utf-8-sig"))
     units = manifest.get("units") if isinstance(manifest, dict) else None
     entry = next(
@@ -377,7 +470,12 @@ def campaign_selection(authorization_path: str | Path | None, unit_key: str) -> 
         ),
         None,
     )
-    return {"approval_id": authorization.approval_id, "manifest_digest": authorization.manifest_digest, "entry": entry}
+    return {
+        "approval_id": authorization.approval_id,
+        "manifest_digest": authorization.manifest_digest,
+        "manifest_named": True,
+        "entry": entry,
+    }
 
 
 def _child(triage: Mapping[str, Any], child_key: str) -> dict[str, Any] | None:
@@ -482,6 +580,7 @@ def apply_curated_selection(
     triage_path: str | Path,
     handoff_file_sha256: str = "",
     original_handoff_sha256: str = "",
+    original_handoff: Mapping[str, Any] | None = None,
     child_key: str = "",
     validator: Mapping[str, Any] | None = None,
     campaign: Mapping[str, Any] | None = None,
@@ -519,7 +618,23 @@ def apply_curated_selection(
             status=status,
         )
     declared_handoff = str(triage.get("catalog_handoff_sha256") or "").strip().casefold()
-    reference = str(original_handoff_sha256 or "").strip().casefold() or str(handoff_file_sha256 or "").casefold()
+    asserted = str(original_handoff_sha256 or "").strip().casefold()
+    verified_original = str((original_handoff or {}).get("sha256") or "").casefold()
+    if verified_original and asserted and asserted != verified_original:
+        raise CuratedSelectionError(
+            CURATED_SELECTION_HANDOFF_MISMATCH,
+            f"original_handoff_sha256 {asserted} is not the sha256 of the original handoff read ({verified_original}).",
+        )
+    reference = verified_original or asserted or str(handoff_file_sha256 or "").casefold()
+    # How the handoff that drives the plan is tied to the one the triage names (review of 0.5.69): the file passed IS
+    # it; or the original was read by path and the copy holds its every value but the rewritten sidecar paths; or a
+    # caller only asserted the original's sha256, and nothing here relates the copy to it.
+    if verified_original:
+        verification = "original_read_and_copy_compared"
+    elif asserted:
+        verification = "runner_asserted"
+    else:
+        verification = "handoff_file"
     if not reference:
         raise CuratedSelectionError(
             CURATED_SELECTION_HANDOFF_MISMATCH,
@@ -597,6 +712,14 @@ def apply_curated_selection(
     approved = False
     approval: dict[str, Any] = {}
     if campaign is not None:
+        if campaign.get("manifest_named") is False:
+            raise CuratedSelectionError(
+                CURATED_SELECTION_NOT_APPROVED,
+                f"The campaign approval {campaign.get('approval_id') or ''} names no campaign manifest, so no curated "
+                f"selection of {key} was approved under it; a triage moves bytes under a campaign only where the "
+                "approved manifest names its sha256.",
+                approval_id=str(campaign.get("approval_id") or ""),
+            )
         entry = campaign.get("entry")
         selection = entry.get("curated_selection") if isinstance(entry, dict) else None
         approved_sha = ""
@@ -706,7 +829,9 @@ def apply_curated_selection(
         "triage_record_sha256": str((record or {}).get("sha256") or ""),
         "triage_record": dict(record) if record else None,
         "catalog_handoff_sha256": declared_handoff,
-        "original_handoff_sha256": str(original_handoff_sha256 or "").casefold(),
+        "catalog_handoff_verification": verification,
+        **({"original_handoff": dict(original_handoff)} if original_handoff else {}),
+        "original_handoff_sha256": verified_original or asserted,
         "copy_handoff_sha256": str(handoff_file_sha256 or "").casefold(),
         "analysis_unit_key": key,
         "catalog_analysis_unit_id": unit_id,
@@ -810,6 +935,71 @@ def tag_curated_lineage(table: dict[str, Any], project: Any, data_root: Path) ->
 # Header reconciliation.
 
 
+def _polarity_comparable(value: Any) -> bool:
+    return str(value or "").casefold() in _POLARITY
+
+
+def _acquisition_comparable(value: Any) -> bool:
+    return str(value or "").upper() in {"DDA", "DIA", "SWATH", "AIF", "MS1"}
+
+
+def _triage_value(row_value: Any, unit_value: Any, comparable: Any) -> tuple[str, str]:
+    """(the value the triage states for an input, and whether it is the row's or the unit's): the row's where it can
+    be compared, else the unit's as applied, else the row's as it is (not compared)."""
+    if comparable(row_value):
+        return str(row_value), "row"
+    if comparable(unit_value):
+        return str(unit_value), "unit"
+    return str(row_value or ""), "row"
+
+
+def _raw_directory(manifest: Mapping[str, Any]) -> str:
+    """The unit's raw directory: the manifest's raw_directory, else the data root's parent."""
+    raw = str(manifest.get("raw_directory") or "").replace("\\", "/").rstrip("/")
+    if raw:
+        return raw
+    data_root = str(manifest.get("input_directory") or "").replace("\\", "/").rstrip("/")
+    return data_root.rsplit("/", 1)[0] if "/" in data_root else ""
+
+
+def _portable_path(path_text: str, data_root: str, raw_directory: str) -> str:
+    """A path as it reads on any machine: under the data root, relative to it; else under the unit's raw directory,
+    relative to that and prefixed raw:/ (raw:/converted/POS/S1.mzML); else <external>/<name>. Never absolute."""
+    path = str(path_text or "").replace("\\", "/")
+    root = str(data_root or "").replace("\\", "/").rstrip("/")
+    if root and path.casefold().startswith(root.casefold() + "/"):
+        return path[len(root) + 1:].strip("/")
+    raw = str(raw_directory or "").replace("\\", "/").rstrip("/")
+    if raw and path.casefold().startswith(raw.casefold() + "/"):
+        return "raw:/" + path[len(raw) + 1:].strip("/")
+    if _ABSOLUTE.match(path):
+        return "<external>/" + path.rsplit("/", 1)[-1]
+    return path.strip("/")
+
+
+def _conversion_sources(manifest: Mapping[str, Any]) -> dict[str, str]:
+    """{converted input path (file key): its source's path}, from the lineage rows and the recorded conversions."""
+    found: dict[str, str] = {}
+    lineage = manifest.get("input_lineage") if isinstance(manifest.get("input_lineage"), dict) else {}
+    for row in [*(lineage.get("rows") or []), *(lineage.get("excluded") or [])]:
+        if not isinstance(row, dict):
+            continue
+        source = row.get("source") if isinstance(row.get("source"), dict) else {}
+        conversion = source.get("conversion") if isinstance(source.get("conversion"), dict) else {}
+        origin = str(conversion.get("path") or "")
+        if origin and str(row.get("path") or "").strip():
+            found[_file_key(str(row["path"]))] = origin
+    block = manifest.get("input_conversions") if isinstance(manifest.get("input_conversions"), dict) else {}
+    for record in block.get("records") or []:
+        if not isinstance(record, dict) or record.get("status") != "converted":
+            continue
+        target = str((record.get("output") or {}).get("path") or "") if isinstance(record.get("output"), dict) else ""
+        origin = str((record.get("source") or {}).get("path") or "") if isinstance(record.get("source"), dict) else ""
+        if target and origin:
+            found.setdefault(_file_key(target), origin)
+    return found
+
+
 def _acquisition_result(triage_value: str, header_value: str) -> str:
     triage = str(triage_value or "").upper()
     header = str(header_value or "")
@@ -852,14 +1042,20 @@ def reconcile_curated_selection(manifest: Mapping[str, Any]) -> dict[str, Any] |
     summary = preflight.get("summary") if isinstance(preflight.get("summary"), dict) else {}
     per_file = [item for item in summary.get("per_file") or [] if isinstance(item, dict) and item.get("file")]
     by_member = {_member_key(row.get("member_path")): row for row in block.get("rows_kept") or []}
+    applied = block.get("applied_technical") if isinstance(block.get("applied_technical"), dict) else {}
     data_root = str(manifest.get("input_directory") or "")
+    raw_directory = _raw_directory(manifest)
+    sources = _conversion_sources(manifest)
     files: list[dict[str, Any]] = []
     disagreements: list[dict[str, Any]] = []
     seen: set[str] = set()
     for entry in per_file:
         path = str(entry["file"])
         member = member_for(path, data_root, by_member)
-        relative = _relative(path, data_root)
+        if not member and _file_key(path) in sources:
+            # An mzXML member converted to mzML under raw/converted: the kept row is its source's (review of 0.5.69).
+            member = member_for(sources[_file_key(path)], data_root, by_member)
+        relative = _portable_path(path, data_root, raw_directory)
         if not member:
             item = {"file": relative, "member_path": None, "result": "disagree", "reason": "not_in_selection"}
             files.append(item)
@@ -869,8 +1065,15 @@ def reconcile_curated_selection(manifest: Mapping[str, Any]) -> dict[str, Any] |
         row = by_member[member]
         outcome = str(entry.get("outcome") or "ok")
         read = outcome in _READ_OUTCOMES
-        polarity = _polarity_result(row.get("ion_mode"), entry.get("polarity")) if read else "not_read"
-        acquisition = _acquisition_result(row.get("acquisition_mode"), entry.get("acquisition_mode")) if read else "not_read"
+        # What the triage said of this input: its row's own value where the row states one that can be compared, else
+        # the unit's as applied (the child's, or unit_technical's). A row the triage left unknown is still in a unit of
+        # one polarity and one acquisition, and the header is compared with that, never skipped (review of 0.5.69).
+        triage_ion, ion_basis = _triage_value(row.get("ion_mode"), applied.get("ion_mode"), _polarity_comparable)
+        triage_acquisition, acquisition_basis = _triage_value(
+            row.get("acquisition_mode"), applied.get("acquisition_mode"), _acquisition_comparable
+        )
+        polarity = _polarity_result(triage_ion, entry.get("polarity")) if read else "not_read"
+        acquisition = _acquisition_result(triage_acquisition, entry.get("acquisition_mode")) if read else "not_read"
         reasons = []
         if polarity == "disagree":
             reasons.append("polarity")
@@ -884,9 +1087,15 @@ def reconcile_curated_selection(manifest: Mapping[str, Any]) -> dict[str, Any] |
             "row_index": row.get("row_index"),
             "basis": row.get("basis"),
             "outcome": outcome,
-            "ion_mode": {"triage": row.get("ion_mode"), "header": entry.get("polarity") or "", "result": polarity},
+            "ion_mode": {
+                "triage": triage_ion,
+                "triage_basis": ion_basis,
+                "header": entry.get("polarity") or "",
+                "result": polarity,
+            },
             "acquisition_mode": {
-                "triage": row.get("acquisition_mode"),
+                "triage": triage_acquisition,
+                "triage_basis": acquisition_basis,
                 "header": entry.get("acquisition_mode") or "",
                 "result": acquisition,
             },
@@ -952,6 +1161,62 @@ def apply_reconciliation(manifest: Mapping[str, Any], disposition: dict[str, Any
         f"The raw headers of {block['disagree']} input(s) disagree with the curated selection "
         f"(triage {block['triage_sha256']}): {shown[:600]}. Neither side wins: the unit is held for a person, and runs "
         "only after a revised triage is planned again."
+    )
+    disposition["detail"] = detail
+    return disposition
+
+
+def cross_unit_refusal(manifest: Mapping[str, Any]) -> dict[str, Any] | None:
+    """The cross-unit check's refusal this unit's manifest records, or None.
+
+    msdial_repository_cross_unit_check writes cross_unit_attribution on each manifest; a refused verdict stands until
+    a fresh check of the group passes the unit (and so rewrites the block). Nothing else lifts it: a recheck of the
+    unit's own headers says nothing about whose files they are.
+    """
+    block = manifest.get("cross_unit_attribution") if isinstance(manifest.get("cross_unit_attribution"), dict) else None
+    if not block or str(block.get("verdict") or "") != "refused":
+        return None
+    return block
+
+
+def apply_cross_unit_hold(manifest: Mapping[str, Any], disposition: dict[str, Any]) -> dict[str, Any]:
+    """decide_disposition's record with a recorded cross-unit refusal applied. Changes the record in place.
+
+    A unit the cross-unit check refused is held as a header disagreement is: a skip with hold true, the refusal's
+    codes among the reasons and no assignments, so a recheck, a resume or a split decides it held again and never
+    runs it on another unit's files (review of 0.5.69: the refusal lived only in execution_allowed, which the next
+    preflight rewrote). An exclusion stays an exclusion, with the refusal beside it.
+    """
+    block = cross_unit_refusal(manifest)
+    if block is None:
+        return disposition
+    codes = [str(code) for code in block.get("reasons") or [block.get("reason_code")] if str(code or "").strip()]
+    disposition["cross_unit_attribution_hold"] = {
+        "rule": block.get("rule"),
+        "reason_code": block.get("reason_code"),
+        "reasons": codes,
+        "retryable": False,
+    }
+    if disposition.get("disposition") == "exclude":
+        return disposition
+    for stale in ("console_acquisition_type", "ion_mode", "aif_run_as_swath", "aif_multi_ce_run"):
+        disposition.pop(stale, None)
+    disposition["disposition"] = "skip"
+    disposition["hold"] = True
+    disposition["split_key"] = None
+    reasons = list(disposition.get("reasons") or [])
+    for code in codes:
+        if code not in reasons:
+            reasons.append(code)
+    disposition["reasons"] = reasons
+    if isinstance(disposition.get("assignments"), dict):
+        disposition["assignments"].clear()
+    detail = list(disposition.get("detail") or [])
+    detail.append(
+        "The cross-unit check refused this unit ("
+        + ", ".join(codes)
+        + "): its Sample inputs are not its own alone. It is held for a person, and runs only after a fresh "
+        "cross-unit check of its group passes it."
     )
     disposition["detail"] = detail
     return disposition
@@ -1120,7 +1385,7 @@ def _overlap(a: dict[str, Any], b: dict[str, Any]) -> dict[str, Any]:
 
 
 def cross_unit_attribution(manifests: list[Mapping[str, Any]], labels: list[str] | None = None) -> dict[str, Any]:
-    """Whether sibling units' Sample inputs are their own: rules P, C and D over their recorded lineage. Pure but for
+    """Whether sibling units' Sample inputs are their own: rules P, C, S and D over their recorded lineage. Pure but for
     reading the archives' member listings the lineage names.
 
     Only Sample inputs are compared (blanks, QCs and standards by the coverage gate's reading, and a curated row whose
@@ -1133,10 +1398,16 @@ def cross_unit_attribution(manifests: list[Mapping[str, Any]], labels: list[str]
       polarity with no sibling claiming the file is overridden by the header, on record. Units of different
       polarities sharing at least half of their inputs, none with a header to settle it, are refused both.
     - C: of the units P leaves, a pair of one polarity and different chromatographies sharing at least
-      CROSS_UNIT_CONTAINMENT_MINIMUM of the smaller set is refused. Where they share the same files, a member at least
-      half of whose shared inputs state its own chromatography by name keeps them; where they share byte copies under
-      other names, the names prove nothing (ST002283's copies were named HILIC and were reversed phase) and both are
-      refused. Above 0 and below the minimum is a warning on both.
+      CROSS_UNIT_CONTAINMENT_MINIMUM of the smaller set is refused. Where they share the same files, a member every
+      one of whose shared inputs states its own chromatography, and only it, by name keeps them (the other is then
+      refused); any other share refuses both. Where they share byte copies under other names, the names prove nothing
+      (ST002283's copies were named HILIC and were reversed phase) and both are refused. Above 0 and below the
+      minimum is a warning on both.
+    - S: units of one polarity whose chromatographies do not tell them apart (the same, or one unknown) and whose
+      Sample inputs differ, the smaller set contained at CROSS_UNIT_CONTAINMENT_MINIMUM or more in the larger, are
+      refused both (CROSS_UNIT_CONTAINED_INPUTS): one holds files the other claims, and nothing on record says
+      which (a liver unit holding the plasma unit's files). Above 0 and below the minimum is a warning on both.
+      Applied to every pair whatever P or C decided, so a third unit cannot escape it through a refused sibling.
     - D: of the units left, every unit whose Sample inputs are identical to an earlier unit's, as files or as listed
       content, is refused; the earlier keeps them.
 
@@ -1224,11 +1495,10 @@ def cross_unit_attribution(manifests: list[Mapping[str, Any]], labels: list[str]
                         "is not two polarities.",
                     )
 
-    # C: one polarity, different chromatographies.
+    # C: one polarity, different chromatographies. Every pair, whatever P decided: a sibling refused for its polarity
+    # still holds the files it holds, and the unit sharing them across a chromatography is no more right for it.
     for position, a in enumerate(units):
         for b in units[position + 1:]:
-            if not (standing(a) and standing(b)):
-                continue
             if a["polarity"] and b["polarity"] and a["polarity"] != b["polarity"]:
                 continue
             if not (a["chromatography"] and b["chromatography"]) or a["chromatography"] == b["chromatography"]:
@@ -1250,11 +1520,16 @@ def cross_unit_attribution(manifests: list[Mapping[str, Any]], labels: list[str]
             for unit, other, own_shared in ((a, b, found["a"]), (b, a, found["b"])):
                 own = 0
                 if found["basis"] == "identity":
+                    # A unit keeps shared files only where EVERY one of them states its own chromatography, and only
+                    # its own, by name: then they are its files, and the other unit is the one holding what is not
+                    # its own. A shared file that names nothing, or names the other chromatography, is one this unit
+                    # cannot claim, so it is refused (review of 0.5.69: ST002283's HILIC-Neg unit held 40 Hilic-named
+                    # and 40 Lipid-named files, and half named its own was let through).
                     own = sum(
                         1 for identity in own_shared
                         if name_chromatographies(unit["inputs"][identity]["path"]) == {unit["chromatography"]}
                     )
-                    if own and own * 2 >= len(own_shared):
+                    if own_shared and own == len(own_shared):
                         continue
                 refuse(
                     unit,
@@ -1262,12 +1537,50 @@ def cross_unit_attribution(manifests: list[Mapping[str, Any]], labels: list[str]
                     f"{name(unit)} ({unit['chromatography']}) and {name(other)} ({other['chromatography']}) share "
                     f"{found['shared']} Sample input(s) ({found['basis']}), containment {ratio:.2f}"
                     + (
-                        f", and the shared files do not state {unit['chromatography']} by their own names "
-                        f"({own} of {len(own_shared)})."
+                        f", and not every shared file states {unit['chromatography']} alone by its own name "
+                        f"({own} of {len(own_shared)} do)."
                         if found["basis"] == "identity"
                         else "; byte copies under other names are never settled by name."
                     ),
                 )
+
+    # S: one polarity, chromatographies that do not tell the units apart, different sets, one mostly inside the other.
+    for position, a in enumerate(units):
+        for b in units[position + 1:]:
+            if a["polarity"] and b["polarity"] and a["polarity"] != b["polarity"]:
+                continue
+            if a["chromatography"] and b["chromatography"] and a["chromatography"] != b["chromatography"]:
+                continue
+            if not (a["inputs"] and b["inputs"]):
+                continue
+            if set(a["inputs"]) == set(b["inputs"]) or (
+                len(a["contents"]) == len(a["inputs"]) and len(b["contents"]) == len(b["inputs"])
+                and set(a["contents"]) == set(b["contents"])
+            ):
+                continue  # identical: D's
+            found = _overlap(a, b)
+            if not found["shared"]:
+                continue
+            overlaps.append({"units": [name(a), name(b)], "rule": "S", **_overlap_record(found)})
+            ratio = found["containment"]
+            for unit, other in ((a, b), (b, a)):
+                if ratio < CROSS_UNIT_CONTAINMENT_MINIMUM:
+                    warn(
+                        unit,
+                        CROSS_UNIT_PARTLY_SHARED_WARNING,
+                        f"{name(unit)} shares {found['shared']} Sample input(s) with {name(other)} (one polarity, "
+                        f"chromatography {other['chromatography'] or 'unknown'}), containment {ratio:.2f} "
+                        f"({found['basis']}).",
+                    )
+                else:
+                    refuse(
+                        unit,
+                        CROSS_UNIT_CONTAINED_INPUTS,
+                        f"{name(unit)} ({len(unit['inputs'])} Sample inputs) and {name(other)} "
+                        f"({len(other['inputs'])}) share {found['shared']} ({found['basis']}), containment "
+                        f"{ratio:.2f}, at one polarity and a chromatography that does not tell them apart: one holds "
+                        "files the other claims, and nothing on record says which.",
+                    )
 
     # D: an identical set.
     for position, b in enumerate(units):

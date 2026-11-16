@@ -7020,6 +7020,12 @@ def _record_preflight(
             current["execution_allowed"] = False
             if campaign is None:
                 current["status"] = "preflight_review_required"
+    if isinstance(disposition.get("cross_unit_attribution_hold"), dict):
+        # The cross-unit check refused this unit (0.5.69): its inputs are not its own alone, whatever its headers say
+        # now. The refusal stands through every recheck until a fresh cross-unit check of its group passes it.
+        current["execution_allowed"] = False
+        if campaign is None:
+            current["status"] = "preflight_review_required"
 
 
 def _apply_disposition(
@@ -8968,6 +8974,25 @@ def evaluate_repository_execution_gate(state: dict[str, Any], *, production: boo
             f"(status {manifest.get('status', 'unknown')!r}, selection "
             f"{project.get('selection_status', 'unknown')!r}). Resolve the unit's technical conditions "
             "with a raw-header preflight before running MS-DIAL."
+        )
+    # A unit held to a curated selection whose headers disagree with it, or one the cross-unit check refused (0.5.69),
+    # never runs on execution_allowed alone: each verdict is read here again, so no later write of that field - a
+    # recheck, a resume, a hand edit - lets the unit run on files that are not its own.
+    reconciliation = manifest.get("curated_selection_reconciliation")
+    if isinstance(reconciliation, dict) and reconciliation.get("verdict") == "disagree":
+        blockers.append(
+            "The raw headers disagree with the curated selection this unit is held to (triage_header_disagreement, "
+            f"triage {reconciliation.get('triage_sha256') or 'unknown'}); it runs only after a revised triage is "
+            "planned again."
+        )
+    from .curated_selection import cross_unit_refusal
+
+    cross_unit = cross_unit_refusal(manifest)
+    if cross_unit is not None:
+        blockers.append(
+            "The cross-unit check refused this unit ("
+            + ", ".join(str(item) for item in cross_unit.get("reasons") or [cross_unit.get("reason_code")])
+            + "): its Sample inputs are not its own alone. It runs only after a fresh cross-unit check passes it."
         )
     # A unit whose raw data were deleted never runs again: its inputs are gone, and a run against what is left
     # - a re-created folder, a file that one deletion pass kept - would record a result for data that are not
