@@ -16,6 +16,7 @@ from typing import Annotated, Any
 
 from . import __version__
 from .campaign_authorization import CampaignAuthorizationError
+from .curated_selection import CuratedSelectionError
 
 ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_HOST = "127.0.0.1"
@@ -494,6 +495,9 @@ def _mapped_failures(function):
             if error.trace:
                 failure["trace"] = error.trace
             return failure
+        except CuratedSelectionError as error:
+            # A triage the unit was to be held to does not hold (0.5.69): its code, never retried.
+            return error.failure()
         except CampaignAuthorizationError as error:
             return {
                 "ok": False,
@@ -952,13 +956,24 @@ def _handoff_analysis_inputs(
 
 
 def _project_from_analysis_unit_handoff(
-    handoff: dict[str, Any], repository: str = "", accession: str = "", *, convert_mzxml: bool = False
+    handoff: dict[str, Any],
+    repository: str = "",
+    accession: str = "",
+    *,
+    convert_mzxml: bool = False,
+    curated_selection: dict[str, Any] | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """A Catalog handoff as the project the download tools judge.
 
     ``convert_mzxml`` is set only where a campaign approval covers the unit (_campaign_converts_mzxml): its
     mzXML then plans a conversion the lease makes. Otherwise an mzXML or mzData excludes the unit before
     download, as it always did.
+
+    ``curated_selection`` (0.5.69) is _curated_selection_context's: a triage file the unit is held to. Its kept rows
+    replace the handoff's sample rows, one analysis input per kept row is declared by its archive member path, the
+    triage's polarity and acquisition replace the Catalog's, and repository_metadata.curated_selection records it
+    (msdial_app.curated_selection). A triage that does not hold raises CuratedSelectionError here, before download.
+    Without it nothing changes.
     """
     from .repository_reanalysis import requires_msdial_conversion
 
@@ -1054,7 +1069,35 @@ def _project_from_analysis_unit_handoff(
         raise ValueError(
             f"Analysis unit {unit_id} declares {declared_sample_count} sample rows but provides {len(samples)}."
         )
-    analysis_inputs, input_check = _handoff_analysis_inputs(handoff, unit_id, files, samples)
+    catalog_row_count = len(samples)
+    curated: dict[str, Any] | None = None
+    if curated_selection is not None:
+        from .curated_selection import apply_curated_selection
+
+        curated = apply_curated_selection(handoff=handoff, samples=samples, **curated_selection)
+    if curated is None:
+        analysis_inputs, input_check = _handoff_analysis_inputs(handoff, unit_id, files, samples)
+    else:
+        # THE TRIAGE'S ROWS AND INPUTS, NOT THE CATALOG'S. The Catalog's whole-study attribution is what the triage
+        # replaces (stage3b, 2026-11-15), so its count check is recorded and judges nothing: the inputs are the kept
+        # rows' archive members, declared by path, and the lease's exact path match admits only them.
+        try:
+            _catalog_inputs, catalog_check = _handoff_analysis_inputs(handoff, unit_id, files, samples)
+        except (OSError, ValueError) as error:
+            catalog_check = {"status": "unread", "problems": [str(error)]}
+        samples = curated["samples"]
+        analysis_inputs = curated["analysis_inputs"]
+        input_check = {
+            "status": "superseded_by_curated_selection",
+            "analysis_inputs": len(analysis_inputs),
+            "catalog": catalog_check,
+        }
+        scope = {**scope, "analysis_file_count": len(analysis_inputs)}
+        settings = {
+            **settings,
+            "ion_mode": curated["ion_mode"],
+            **({"acquisition_mode": curated["acquisition_mode"]} if curated["acquisition_mode"] else {}),
+        }
     untargeted = _optional_bool(settings.get("untargeted"))
     project = {
         "repository": handoff_repository,
@@ -1069,11 +1112,16 @@ def _project_from_analysis_unit_handoff(
         "ion_mode": str(settings.get("ion_mode") or "Unknown"),
         "untargeted": untargeted,
         # The rows, not the distinct ids, where the Catalog counted no input: replicate rows share an id, and
-        # each is an injection (MetaboLights MTBLS291 lists 40 mzML in the rows of 8 samples).
-        "sample_count": int(
-            handoff.get("analytical_sample_count")
-            or scope.get("analysis_file_count")
-            or sum(1 for item in samples if item["sample_id"])
+        # each is an injection (MetaboLights MTBLS291 lists 40 mzML in the rows of 8 samples). A curated selection's
+        # count is its kept rows'.
+        "sample_count": (
+            len(samples)
+            if curated is not None
+            else int(
+                handoff.get("analytical_sample_count")
+                or scope.get("analysis_file_count")
+                or sum(1 for item in samples if item["sample_id"])
+            )
         ),
         "files": files,
         "publications": list(handoff.get("publications") or []),
@@ -1086,7 +1134,7 @@ def _project_from_analysis_unit_handoff(
         "eligible": False,
         "exclusion_reasons": [],
         "download_scope": scope,
-        "class_proposal": handoff.get("class_proposal"),
+        "class_proposal": curated["class_proposal"] if curated is not None else handoff.get("class_proposal"),
         "blocking_reasons": [],
         "pending_decisions": [],
         "repository_metadata": {"catalog_handoff": handoff},
@@ -1099,6 +1147,11 @@ def _project_from_analysis_unit_handoff(
     }
     if input_check:
         project["repository_metadata"]["analysis_input_check"] = input_check
+    if curated is not None:
+        # A child of a Both unit is a campaign unit of its own, keyed as split parts are (<unit_id>-<child_key>), with
+        # a workspace of its own; the Catalog's unit id stays in catalog_handoff and in the record.
+        project["analysis_unit_id"] = curated["key"]
+        project["repository_metadata"]["curated_selection"] = curated["provenance"]
     from .repository_reanalysis import EligibilityPolicy, evaluate_eligibility, project_from_dict
 
     typed = evaluate_eligibility(
@@ -1133,12 +1186,126 @@ def _project_from_analysis_unit_handoff(
     typed.pending_decisions = [
         "class_proposal" for item in decision_blocks if item == "class_proposal:missing"
     ]
+    if curated is not None:
+        record = curated["provenance"]
+        typed.evidence.append(
+            f"Inputs fixed by the curated selection {record['triage_sha256']} ({record['standing']}): "
+            f"{record['rows_kept_count']} of the Catalog unit's {catalog_row_count} rows kept, "
+            f"{record['rows_dropped_count']} dropped with reasons; decided by "
+            f"{record['decided_by'].get('model') or 'an agent'} with skill {record['decided_by'].get('skill')} "
+            f"{record['decided_by'].get('skill_version')}."
+        )
     project = typed.as_dict()
     from .repository_metadata import metadata_workspace
 
     workspace = metadata_workspace(project)
     workspace["target_omics"] = str(settings.get("target_omics") or "Unknown")
     return project, workspace
+
+
+def _curated_selection_context(
+    curated_selection_path: str,
+    handoff: dict[str, Any],
+    handoff_path: str = "",
+    *,
+    child_key: str = "",
+    original_handoff_sha256: str = "",
+    original_handoff_path: str = "",
+    validator: dict[str, Any] | None = None,
+    campaign_authorization_path: str = "",
+    decision_record_path: str = "",
+) -> dict[str, Any] | None:
+    """What _project_from_analysis_unit_handoff holds a unit to: the triage read and hashed, or None without one.
+
+    THE DECISION RECORD (msdial-llm-decision-record.v1) is ``decision_record_path`` where given, else
+    ``<triage file stem>.record.json`` beside the triage (curated_selection.decision_record_candidates). Its
+    payload.sha256 must be the triage's, its sha256 is bound, and the archive listing(s) it binds (inputs[] role
+    archive_listing, read relative to the record and checked against their sha256) give crc32 and size to
+    ``selection_sha256`` (msdial-selection-canonical.v1).
+
+    THE HANDOFF is tied to the triage's catalog_handoff_sha256: the handoff file read here is it; or
+    ``original_handoff_path`` names the triaged original; or ``original_handoff_sha256`` is asserted for a copy and the
+    decision record's catalog_handoff input holds those bytes. In the last two the original is hashed (it must be the
+    triaged sha256) and the copy must hold its every value but the rewritten sidecar paths and what the Class decides
+    (curated_selection.verify_handoff_copy, HANDOFF_CLASS_KEYS, WS0 decision F: the triage binds the evidence it read,
+    the Class binds through its own ratification; both sides' Class is recorded in original_handoff.class, and the
+    copy's own blocking_reasons hold the unit as any handoff's do). An asserted sha256 for a copy whose bytes differ,
+    with no original to compare it with, is refused (curated_selection_handoff_mismatch). Where the campaign approval names its manifest,
+    the manifest's entry for the unit (``<unit_id>`` or ``<unit_id>-<child_key>``) must carry this triage's sha256,
+    the record's where it names one, and the selection_sha256 where it names one.
+    """
+    if not str(curated_selection_path or "").strip():
+        if str(child_key or "").strip():
+            raise ValueError("curated_selection_child_key names a child of a triage, and needs curated_selection_path.")
+        if str(decision_record_path or "").strip():
+            raise ValueError("decision_record_path binds a triage's record, and needs curated_selection_path.")
+        return None
+    from .curated_selection import (
+        CURATED_SELECTION_HANDOFF_MISMATCH,
+        CuratedSelectionError,
+        campaign_selection,
+        load_triage,
+        read_decision_record,
+        sha256_file,
+        verify_handoff_copy,
+    )
+
+    triage, triage_sha, triage_location = load_triage(curated_selection_path)
+    record, listing, record_handoff = read_decision_record(triage_location, triage, triage_sha, decision_record_path)
+    handoff_sha = ""
+    if str(handoff_path or "").strip():
+        handoff_sha = sha256_file(Path(handoff_path).expanduser())
+    asserted = str(original_handoff_sha256 or "").strip().casefold()
+    original = None
+    if str(original_handoff_path or "").strip():
+        original = {**verify_handoff_copy(original_handoff_path, handoff), "source": "original_handoff_path"}
+    elif asserted and asserted != handoff_sha and record_handoff is not None:
+        # WS0 decision 7: the copy is verified against the triaged bytes the decision record kept.
+        named = str(((record or {}).get("catalog_handoff_input") or {}).get("sha256") or "")
+        if named != asserted:
+            raise CuratedSelectionError(
+                CURATED_SELECTION_HANDOFF_MISMATCH,
+                f"The decision record's catalog_handoff input is {named or '(no sha256)'}, not the triaged handoff "
+                f"{asserted} the caller names.",
+            )
+        original = {**verify_handoff_copy(record_handoff, handoff), "source": "decision_record_input"}
+    key = str(handoff.get("analysis_unit_id") or "").strip()
+    child = str(child_key or "").strip()
+    return {
+        "triage": triage,
+        "triage_sha256": triage_sha,
+        "triage_path": str(triage_location),
+        "handoff_file_sha256": handoff_sha,
+        "original_handoff_sha256": asserted,
+        "original_handoff": original,
+        "child_key": child,
+        "validator": dict(validator) if validator else None,
+        "campaign": campaign_selection(campaign_authorization_path, f"{key}-{child}" if child else key),
+        "record": record,
+        "listing": listing,
+    }
+
+
+def _apply_workspace_unit_key(project: dict[str, Any], workspace_unit_key: str, catalog_unit_id: str) -> None:
+    """Record the workspace folder name a caller chose for this run (WS0 decision 5): a child or a reopened unit gets
+    a workspace of its own, so an earlier run's artifacts are never overwritten. Validated by
+    repository_reanalysis.validate_workspace_unit_key (safe characters; starts with the Catalog unit id). The unit's
+    analysis_unit_id, its campaign coverage and its store claims are unchanged; only the folder differs."""
+    text = str(workspace_unit_key or "").strip()
+    if not text:
+        return
+    from .repository_reanalysis import validate_workspace_unit_key
+
+    metadata = dict(project.get("repository_metadata") or {})
+    metadata["workspace_unit_key"] = validate_workspace_unit_key(text, catalog_unit_id)
+    project["repository_metadata"] = metadata
+
+
+def _curated_unit_key(handoff: dict[str, Any], curated: dict[str, Any] | None) -> str:
+    """The campaign unit key of a handoff's unit: its id, or <id>-<child_key> for a triage child."""
+    key = str(handoff.get("analysis_unit_id") or "").strip()
+    child = str((curated or {}).get("child_key") or "")
+    return f"{key}-{child}" if child else key
 
 
 def _repository_inspection(
@@ -1150,26 +1317,54 @@ def _repository_inspection(
     port: int,
     campaign_authorization_path: str = "",
     raw_retention_policy: str | None = None,
+    curated_selection_path: str = "",
+    curated_selection_child_key: str = "",
+    original_handoff_sha256: str = "",
+    curated_selection_validator: dict[str, Any] | None = None,
+    original_handoff_path: str = "",
+    decision_record_path: str = "",
+    workspace_unit_key: str = "",
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """The project and sample workspace of one unit's handoff, or of an accession inspected by the backend.
 
     A unit's mzXML plans a conversion only where ``campaign_authorization_path`` covers its download
     (_campaign_converts_mzxml); an accession inspected without a handoff is no campaign unit.
+
+    ``curated_selection_path`` holds the unit to a triage file (_curated_selection_context); it needs a handoff, as
+    does ``workspace_unit_key`` (_apply_workspace_unit_key).
     """
     analysis_unit_handoff = _load_analysis_unit_handoff(
         analysis_unit_handoff, analysis_unit_handoff_path
     )
+    if str(curated_selection_path or "").strip() and not analysis_unit_handoff:
+        raise ValueError("curated_selection_path holds a Catalog unit to its triage, and needs its handoff.")
+    if str(workspace_unit_key or "").strip() and not analysis_unit_handoff:
+        raise ValueError("workspace_unit_key names a Catalog unit's workspace, and needs its handoff.")
     if analysis_unit_handoff:
-        return _project_from_analysis_unit_handoff(
+        curated = _curated_selection_context(
+            curated_selection_path,
+            analysis_unit_handoff,
+            analysis_unit_handoff_path,
+            child_key=curated_selection_child_key,
+            original_handoff_sha256=original_handoff_sha256,
+            original_handoff_path=original_handoff_path,
+            validator=curated_selection_validator,
+            campaign_authorization_path=campaign_authorization_path,
+            decision_record_path=decision_record_path,
+        )
+        project, workspace = _project_from_analysis_unit_handoff(
             analysis_unit_handoff,
             repository,
             accession,
             convert_mzxml=_campaign_converts_mzxml(
-                campaign_authorization_path,
-                str(analysis_unit_handoff.get("analysis_unit_id") or "").strip(),
-                raw_retention_policy,
+                campaign_authorization_path, _curated_unit_key(analysis_unit_handoff, curated), raw_retention_policy
             ),
+            curated_selection=curated,
         )
+        _apply_workspace_unit_key(
+            project, workspace_unit_key, str(analysis_unit_handoff.get("analysis_unit_id") or "").strip()
+        )
+        return project, workspace
     response = _request_json(
         "POST",
         "/api/repository/metadata/inspect",
@@ -1676,12 +1871,39 @@ def msdial_repository_reanalysis_plan(
     port: int = DEFAULT_PORT,
     analysis_purpose: str = "",
     campaign_authorization_path: str = "",
+    curated_selection_path: str = "",
+    curated_selection_child_key: str = "",
+    original_handoff_sha256: str = "",
+    curated_selection_validator: dict[str, Any] | None = None,
+    original_handoff_path: str = "",
+    decision_record_path: str = "",
+    workspace_unit_key: str = "",
 ) -> dict[str, Any]:
     """Inspect one public accession and return metadata, QA evidence, and download decisions.
 
     ``maximum_gb`` is decimal GB (1e9 bytes), matching how repositories report size.
     ``campaign_authorization_path`` reports whether a campaign approval covers this unit's download; it
     changes no limit and starts nothing.
+
+    ``curated_selection_path`` (0.5.69) holds the handoff's unit to a triage file (msdial-unit-triage.v1 or v2): its
+    kept rows only, declared by archive member path. ``curated_selection_child_key`` names the single-polarity child
+    of a Both unit (the unit is then <unit_id>-<child_key>). ``decision_record_path`` names the triage's decision
+    record (msdial-llm-decision-record.v1); without it ``<triage file stem>.record.json`` beside the triage is read
+    where it exists. The record's archive listing(s) (inputs[] role archive_listing, relative to the record, sha256
+    checked) give crc32 and size to selection_sha256 (msdial-selection-canonical.v1, doc #59 section 3.1).
+    ``original_handoff_sha256`` is the triaged handoff's sha256 (the triage's catalog_handoff_sha256) where the
+    handoff passed is a rewritten copy: the copy is then compared with the triaged bytes, read by
+    ``original_handoff_path`` or from the decision record's catalog_handoff input (every value but the rewritten
+    sidecar paths and what the Class decides must match, curated_selection.HANDOFF_CLASS_KEYS; recorded as
+    original_read_and_copy_compared, both sides' Class in original_handoff.class). A copy whose bytes differ with no
+    original to compare is refused. ``curated_selection_validator`` is what the caller's validate-triage.py run said
+    ({script_sha256, verdict, ...}), recorded as given. A triage that does not hold returns its refusal code
+    (curated_selection_*), retryable false.
+
+    ``workspace_unit_key`` names the unit's workspace folder where it is not the analysis unit id: a reopened unit
+    (``<unit key>@<campaign>``) so the earlier run's artifacts are kept. Letters, digits and ``. _ - @ +``, at most
+    128 characters, starting with the Catalog unit id followed by one of ``- _ . @ +`` or nothing; recorded as
+    repository_metadata.workspace_unit_key. The analysis unit id, campaign coverage and store claims are unchanged.
     """
     workspace_root = _validated_workspace_root(workspace_root)
     project, workspace = _repository_inspection(
@@ -1693,6 +1915,13 @@ def msdial_repository_reanalysis_plan(
         port,
         campaign_authorization_path=campaign_authorization_path,
         raw_retention_policy=raw_retention_policy,
+        curated_selection_path=curated_selection_path,
+        curated_selection_child_key=curated_selection_child_key,
+        original_handoff_sha256=original_handoff_sha256,
+        curated_selection_validator=curated_selection_validator,
+        original_handoff_path=original_handoff_path,
+        decision_record_path=decision_record_path,
+        workspace_unit_key=workspace_unit_key,
     )
     from .repository_qa import repository_internal_standard_evidence
 
@@ -1768,8 +1997,22 @@ def msdial_download_repository_raw(
     port: int = DEFAULT_PORT,
     analysis_purpose: str = "",
     campaign_authorization_path: str = "",
+    curated_selection_path: str = "",
+    curated_selection_child_key: str = "",
+    original_handoff_sha256: str = "",
+    curated_selection_validator: dict[str, Any] | None = None,
+    original_handoff_path: str = "",
+    decision_record_path: str = "",
+    workspace_unit_key: str = "",
 ) -> dict[str, Any]:
     """Download and recognize repository raw data only after explicit user confirmation.
+
+    ``curated_selection_path`` and its companions (``curated_selection_child_key``, ``decision_record_path``,
+    ``original_handoff_sha256``, ``original_handoff_path``, ``curated_selection_validator``) hold the unit to a triage
+    file, as msdial_repository_reanalysis_plan describes; the unit's manifest then carries
+    project.repository_metadata.curated_selection, and its lease admits the kept rows' members only.
+    ``workspace_unit_key`` puts the unit in <workspace_root>/<repository>/<accession>/<workspace_unit_key> instead
+    of its analysis unit id's folder (msdial_repository_reanalysis_plan).
 
     ``maximum_gb`` is decimal GB (1e9 bytes), matching how repositories report size.
 
@@ -1788,6 +2031,13 @@ def msdial_download_repository_raw(
         port,
         campaign_authorization_path=campaign_authorization_path,
         raw_retention_policy=raw_retention_policy,
+        curated_selection_path=curated_selection_path,
+        curated_selection_child_key=curated_selection_child_key,
+        original_handoff_sha256=original_handoff_sha256,
+        curated_selection_validator=curated_selection_validator,
+        original_handoff_path=original_handoff_path,
+        decision_record_path=decision_record_path,
+        workspace_unit_key=workspace_unit_key,
     )
     if float(maximum_gb) <= 0:
         raise ValueError("maximum_gb must be greater than zero.")
@@ -1907,8 +2157,22 @@ def msdial_repository_batch_plan(
     analysis_purpose: str = "",
     campaign_authorization_path: str = "",
     pre_claim: bool = False,
+    curated_selection_paths: dict[str, Any] | None = None,
+    workspace_unit_keys: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """Expand a mixed repository accession into independent analysis-unit run plans.
+
+    ``curated_selection_paths`` (0.5.69) holds units to triage files, keyed by Catalog analysis unit id: a path, or
+    {path, child_key, decision_record_path, original_handoff_sha256, original_handoff_path, validator,
+    workspace_unit_key}, or a list of those to plan several children of one Both unit from its one handoff (one run
+    each, <unit_id>-<child_key>); each key means what the same argument of msdial_repository_reanalysis_plan means. A
+    unit whose triage does not hold is planned as refused (blocking reason curated_selection:<code>, refusal), and the
+    others are planned as before.
+
+    ``workspace_unit_keys`` maps a run's analysis unit id (``<unit_id>`` or ``<unit_id>-<child_key>``) to its
+    workspace folder name, for a unit without a curated selection entry; an entry's own workspace_unit_key wins. The
+    run's ``workspace`` is that folder and ``workspace_unit_key`` says so; an invalid name blocks that run
+    (``workspace_unit_key:invalid``) and no other.
 
     ``maximum_gb_per_unit`` is decimal GB (1e9 bytes), matching how repositories
     report size. ``campaign_authorization_path`` reports, per unit, whether a campaign approval covers
@@ -1946,15 +2210,60 @@ def msdial_repository_batch_plan(
     seen: set[str] = set()
     runs = []
     download_units = []
-    for handoff in handoffs:
-        project, workspace = _project_from_analysis_unit_handoff(
-            handoff,
-            convert_mzxml=_campaign_converts_mzxml(
-                campaign_authorization_path,
-                str(handoff.get("analysis_unit_id") or "").strip(),
-                raw_retention_policy,
-            ),
-        )
+    handoff_paths = list(analysis_unit_handoff_paths or [])
+    inline_count = len(list(analysis_unit_handoffs or []))
+    selections = dict(curated_selection_paths or {})
+    planned_pairs = []
+    for position, handoff in enumerate(handoffs):
+        catalog_unit = str(handoff.get("analysis_unit_id") or "").strip()
+        chosen = selections.get(catalog_unit)
+        # One entry, or a list of them: each child of a Both unit (ST002798's pos and neg) is its own run planned
+        # from the one handoff, so the children share the batch's download group (review of 0.5.69).
+        entries = chosen if isinstance(chosen, list) else [chosen]
+        for entry in entries:
+            planned_pairs.append((position, handoff, {"path": entry} if isinstance(entry, str) else entry))
+    for position, handoff, chosen in planned_pairs:
+        catalog_unit = str(handoff.get("analysis_unit_id") or "").strip()
+        try:
+            curated = (
+                _curated_selection_context(
+                    str((chosen or {}).get("path") or ""),
+                    handoff,
+                    handoff_paths[position - inline_count] if position >= inline_count else "",
+                    child_key=str((chosen or {}).get("child_key") or ""),
+                    original_handoff_sha256=str((chosen or {}).get("original_handoff_sha256") or ""),
+                    original_handoff_path=str((chosen or {}).get("original_handoff_path") or ""),
+                    validator=(chosen or {}).get("validator"),
+                    campaign_authorization_path=campaign_authorization_path,
+                    decision_record_path=str((chosen or {}).get("decision_record_path") or ""),
+                )
+                if chosen
+                else None
+            )
+            project, workspace = _project_from_analysis_unit_handoff(
+                handoff,
+                convert_mzxml=_campaign_converts_mzxml(
+                    campaign_authorization_path, _curated_unit_key(handoff, curated), raw_retention_policy
+                ),
+                curated_selection=curated,
+            )
+        except CuratedSelectionError as error:
+            # One unit's triage refused: recorded for that unit, and the batch goes on (a failure in one unit must not
+            # touch another's plan).
+            child = str((chosen or {}).get("child_key") or "").strip()
+            runs.append(
+                {
+                    "analysis_unit_id": f"{catalog_unit}-{child}" if child else catalog_unit,
+                    "catalog_analysis_unit_id": catalog_unit,
+                    "repository": str(handoff.get("repository") or ""),
+                    "accession": str(handoff.get("accession") or ""),
+                    "blocking_reasons": [f"curated_selection:{error.code}"],
+                    "refusal": error.failure(),
+                    "ready": False,
+                    "next_tool": None,
+                }
+            )
+            continue
         unit_id = str(project["analysis_unit_id"])
         if unit_id in seen:
             raise ValueError(f"Duplicate analysis_unit_id in batch: {unit_id}")
@@ -1968,6 +2277,14 @@ def msdial_repository_batch_plan(
                 ]
             )
         )
+        chosen_key = str((chosen or {}).get("workspace_unit_key") or (workspace_unit_keys or {}).get(unit_id) or "")
+        workspace_problem = ""
+        try:
+            _apply_workspace_unit_key(project, chosen_key, catalog_unit)
+        except ValueError as error:
+            workspace_problem = str(error)
+            blocking.append("workspace_unit_key:invalid")
+        workspace_name = str((project.get("repository_metadata") or {}).get("workspace_unit_key") or unit_id)
         if not intent["confirmed"]:
             blocking.append("analysis_purpose:missing")
         if any(is_reserved_workspace_name(project[key]) for key in ("repository", "accession", "analysis_unit_id")):
@@ -1993,8 +2310,10 @@ def msdial_repository_batch_plan(
                     Path(workspace_root)
                     / project["repository"]
                     / project["accession"]
-                    / unit_id
+                    / workspace_name
                 ),
+                **({"workspace_unit_key": workspace_name} if workspace_name != unit_id else {}),
+                **({"workspace_unit_key_problem": workspace_problem} if workspace_problem else {}),
                 "blocking_reasons": list(dict.fromkeys(blocking)),
                 "required_download_bytes": required_bytes,
                 "unit_file_bytes": size["unit_file_bytes"],
@@ -2017,6 +2336,8 @@ def msdial_repository_batch_plan(
     download_plan = plan_batch_downloads(download_units, workspace_root)
     by_unit = {item["analysis_unit_id"]: item for item in download_plan["units"]}
     for run in runs:
+        if run.get("refusal"):
+            continue
         unit = by_unit[run["analysis_unit_id"]]
         run.update(
             download_object_count=unit["object_count"],
@@ -2058,6 +2379,72 @@ def msdial_repository_batch_plan(
             if run["analysis_unit_id"] not in covered
         ]
     return plan
+
+
+@_mcp_tool()
+@_structured_validation_errors
+def msdial_repository_cross_unit_check(manifest_paths: list[str], record: bool = True) -> dict[str, Any]:
+    """Whether sibling units' Sample inputs are their own, after every one of them was preflighted (0.5.69).
+
+    ``manifest_paths`` are the units' run manifests: the units of one sharing group, or of one accession. Each unit's
+    admitted Sample inputs (blanks, QCs and standards left out) are identified by a declared checksum, else by the store
+    object and the archive member path, never by a bare name, and four rules are applied in order
+    (curated_selection.cross_unit_attribution): P, a header polarity that contradicts the unit's; C, a set shared at
+    a containment of 0.5 or more across different chromatographies; S, at one polarity and a chromatography that does
+    not tell them apart, a set contained at 0.5 or more in a different one (both refused); D, a set identical to an
+    earlier unit's, which keeps it. A curated row's stated role decides (sample is compared whatever its name, any
+    other role is not); only a row whose role is unknown, or an input no curated row names, is read by its names: QC,
+    reference and blank injections are then left out by the coverage gate's reading and by
+    curated_selection.shared_reference_name (LTR, SR, PoolQC, PBQC, Solvent, MeOH and the like).
+
+    With ``record`` each manifest gets cross_unit_attribution (its own verdict, the group and the overlaps), and a
+    refused unit execution_allowed false, with reason_code and retryable false: the same manifests give the same
+    verdict, so a campaign records a refusal as terminal. The refusal is sticky: the unit's disposition holds it
+    (curated_selection.apply_cross_unit_hold), the execution gate blocks it through every recheck, a new lease of the
+    same workspace carries it, and a later check lifts it only when it passes the unit over a group holding every unit
+    the refusal was against (``refused_against``); a passing check over a group that leaves one out keeps the refusal
+    (``prior_refusal_stands``). Reads no raw data and starts nothing. Two or more manifests: a caller with a single
+    surviving unit has nothing to compare and does not call this.
+
+    THE RESULT, exactly (a campaign runner reads these keys and no others):
+    {ok: true, recorded: bool, schema: "msdial-cross-unit-attribution.v1", rule: "cross_unit_attribution_2026_11_16b",
+    containment_minimum: 0.5, verdict: "passed" | "refused" (refused when any unit is), units: [...], overlaps: [...]}.
+    Each ``units[i]``, in the order of ``manifest_paths``: {index, manifest_path (as resolved), label, analysis_unit_id,
+    accession, polarity, polarity_basis, chromatography, sample_inputs, identity_bases, listed_contents,
+    verdict: "passed" | "refused", reason (the first refusal code, "" when passed), reasons (every refusal code, [] when
+    passed), refused_against (analysis unit ids), warnings (codes), details (sentences), retryable: false,
+    prior_refusal_stands: bool, and with it prior_refusal {rule, reason_code, reasons, refused_against}}. The refusal
+    codes are cross_unit_polarity_contradiction, cross_unit_inputs_indistinguishable_chromatography,
+    cross_unit_inputs_contained and cross_unit_duplicate_inputs; the warnings cross_unit_inputs_partly_shared and
+    cross_unit_header_polarity_overrides_inferred_polarity. Each ``overlaps[j]``: {units: [two names], rule: "P" | "C" |
+    "S" | "D", basis: "identity" | "listed_content_crc32_size", shared, containment}. The manifest block
+    (cross_unit_unit_record) is {schema, rule, verdict, reason_code, reasons, refused_against, warnings, details,
+    retryable, group [{analysis_unit_id, polarity, chromatography, sample_inputs, verdict}], overlaps,
+    prior_refusal_stands, and prior_refusal where it stands}; a block a new lease carried also has carried_from.
+    """
+    from .curated_selection import cross_unit_attribution, cross_unit_unit_record, merge_prior_refusals
+    from .repository_reanalysis import load_unit_manifest, update_manifest
+
+    paths = [str(Path(str(item)).expanduser().resolve()) for item in manifest_paths or [] if str(item).strip()]
+    if len(paths) < 2:
+        raise ValueError("A cross-unit check compares two or more unit manifests.")
+    if len(set(path.casefold() for path in paths)) != len(paths):
+        raise ValueError("A manifest is named twice.")
+    manifests = [load_unit_manifest(path) for path in paths]
+    result = merge_prior_refusals(cross_unit_attribution(manifests), manifests)
+    for item, path in zip(result["units"], paths):
+        item["manifest_path"] = path
+    if record:
+        for index, path in enumerate(paths):
+            block = cross_unit_unit_record(result, index)
+
+            def change(current: dict[str, Any], block: dict[str, Any] = block) -> None:
+                current["cross_unit_attribution"] = block
+                if block["verdict"] == "refused":
+                    current["execution_allowed"] = False
+
+            update_manifest(path, change)
+    return {"ok": True, "recorded": bool(record), **result}
 
 
 @_mcp_tool()
@@ -2135,6 +2522,17 @@ def msdial_repository_raw_metadata_preflight(
     energy_sets_differ, and aif_collision_energy_sets here (each distinct set with its file count). A unit held
     earlier for that (aif_collision_energies_differ_between_inputs, 0.5.34-0.5.35) is released by the same recheck.
     Single-energy AIF still runs as SWATH, and AIF with an unrecorded energy is still held.
+
+    A unit held to a curated selection (0.5.69) gets ``curated_selection_reconciliation`` on its manifest and on the
+    campaign disposition, exactly (curated_selection.reconcile_curated_selection): {schema
+    "msdial-curated-selection-reconciliation.v1", triage_sha256, analysis_unit_key, verdict "agree" | "disagree" |
+    "not_evaluated", reason ("triage_header_disagreement" or ""), inspected, agree, disagree, kept_rows_not_inspected
+    [member paths], files [...], retryable false}. Each ``files[i]`` of a kept row is {file (portable path),
+    member_path, row_index, basis, outcome, ion_mode {triage, triage_basis "row" | "unit", header, result},
+    acquisition_mode {triage, triage_basis, header, result}, result "agree" | "disagree", reasons (only when it
+    disagrees: "polarity", "acquisition_mode", "header_unread_for_inferred_row")}; each per-field result is "agree",
+    "disagree", "unresolved", "not_compared" or "not_read". An input that is no kept row's is {file, member_path null,
+    result "disagree", reason "not_in_selection", reasons ["not_in_selection"]}.
     """
     _, manifest = _repository_unit(download_job_id, manifest_path, host, port)
     from .raw_metadata_extractor import select_raw_metadata_extractor

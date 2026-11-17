@@ -110,6 +110,13 @@ from .repository_reanalysis import (
     with_order_source,
 )
 from . import wiff_fallback
+from .curated_selection import (
+    ANALYSIS_CSV_CANONICAL_FORM,
+    CROSS_UNIT_REFUSALS,
+    CURATED_SELECTION_REFUSALS,
+    TRIAGE_HEADER_DISAGREEMENT,
+    canonical_analysis_csv_sha256,
+)
 from .sample_grouping import file_type_for, propose_injection_order
 from .workflow import console_safe_text
 
@@ -863,6 +870,8 @@ ATTRIBUTION_ADMITTED_ANOTHER_UNITS_INPUTS = "attribution_admitted_another_units_
 ATTRIBUTION_COVERAGE_NOT_COMPUTED = "attribution_coverage_not_computed"
 ATTRIBUTION_COVERAGE_NOT_EVALUATED = "not_evaluated"
 # Every reason the gate refuses a unit for (a campaign runner records each as a terminal failure, not a retry).
+# 0.5.69 adds the curated selection's refusals before download, its header reconciliation's hold, and the cross-unit
+# check's refusals (msdial_app.curated_selection): each is final for the inputs as they are, never a retry.
 ATTRIBUTION_COVERAGE_REFUSALS = frozenset(
     {
         ATTRIBUTION_COVERAGE_BELOW_MINIMUM,
@@ -871,6 +880,9 @@ ATTRIBUTION_COVERAGE_REFUSALS = frozenset(
         ATTRIBUTION_NO_ROWS_OF_THE_UNIT_POLARITY,
         ATTRIBUTION_ADMITTED_ANOTHER_UNITS_INPUTS,
         ATTRIBUTION_COVERAGE_NOT_COMPUTED,
+        *CURATED_SELECTION_REFUSALS,
+        TRIAGE_HEADER_DISAGREEMENT,
+        *CROSS_UNIT_REFUSALS,
     }
 )
 # The warning a passed unit carries where its rows alone are below the minimum and unattributed inputs made up the gap.
@@ -1677,6 +1689,15 @@ def analysis_csv_change(built: dict[str, Any], csv_path: str | Path) -> Any:
                 item["console_alias"] = dict(row["console_alias"])
             else:
                 item.pop("console_alias", None)
+        # The CSV in the form a replay hashes on another machine (0.5.69): paths relative to the raw directory, LF,
+        # UTF-8 without a byte-order mark (curated_selection.canonical_analysis_csv). Absent where it cannot be read.
+        try:
+            summary["canonical_sha256"] = canonical_analysis_csv_sha256(
+                csv_path, str(manifest.get("raw_directory") or "")
+            )
+            summary["canonical_form"] = ANALYSIS_CSV_CANONICAL_FORM
+        except (OSError, UnicodeDecodeError):
+            summary.pop("canonical_sha256", None)
         manifest["analysis_csv"] = summary
 
     return change

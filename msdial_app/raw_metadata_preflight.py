@@ -1356,6 +1356,40 @@ def decide_disposition(
     parent_declared: str | None = None,
     multi_energy_aif_console: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
+    """_decide_disposition_from_headers, and then the curated selection's header reconciliation (0.5.69).
+
+    A unit held to a triage (project.repository_metadata.curated_selection) records on its disposition how each
+    inspected input's header compares with what the triage said of it (curated_selection_reconciliation). Where any
+    disagrees, the disposition is a skip that holds, with the reason triage_header_disagreement and no assignments
+    (curated_selection.apply_reconciliation): neither the triage nor the header wins silently, and every caller that
+    decides a disposition - the preflight, a recheck, a split - decides it so. Without a curated selection the
+    disposition is exactly the header decision's.
+
+    A unit the cross-unit check refused (cross_unit_attribution verdict refused) is held the same way, with the
+    refusal's codes (curated_selection.apply_cross_unit_hold), until a fresh cross-unit check passes it. Never raises;
+    changes nothing.
+    """
+    from .curated_selection import apply_cross_unit_hold, apply_reconciliation
+
+    disposition = _decide_disposition_from_headers(
+        manifest,
+        declared=declared,
+        extractor=extractor,
+        decided_at=decided_at,
+        parent_declared=parent_declared,
+        multi_energy_aif_console=multi_energy_aif_console,
+    )
+    return apply_cross_unit_hold(manifest, apply_reconciliation(manifest, disposition))
+
+
+def _decide_disposition_from_headers(
+    manifest: Mapping[str, Any],
+    declared: Mapping[str, Any] | None = None,
+    extractor: Mapping[str, Any] | None = None,
+    decided_at: str | None = None,
+    parent_declared: str | None = None,
+    multi_energy_aif_console: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
     """What a campaign does with a unit, from its recorded preflight. Never raises; changes nothing.
 
     Returns the campaign_disposition record (msdial-campaign-disposition.v1), plus ``assignments``: for

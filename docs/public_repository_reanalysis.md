@@ -574,6 +574,51 @@ bytes is cut off and refused as `timeout`. Metabolomics Workbench
 `studydownload`, the MetaboLights FTP tree over HTTPS, MetaboBank (DDBJ) and
 Zenodo answered Range requests with 206 on 2026-11-15.
 
+## A curated selection (0.5.69)
+
+A unit of a multi-unit accession is held to the file list an agent decided before
+download (msdial-unit-triage.v1, checked by `validate-triage.py`, carried by the
+approved campaign manifest). Pass the triage as `curated_selection_path` with the
+unit's handoff; a Both unit also names its single-polarity child
+(`curated_selection_child_key`, unit `<unit_id>-<child_key>`). Interactive then:
+
+1. checks the triage before download: its schema, `status: ready`, the unit and
+   accession, the Catalog handoff sha256 it was made from (the handoff file read;
+   for a rewritten copy, `original_handoff_sha256` with the triaged bytes to
+   compare it with: `original_handoff_path`, or the decision record's
+   `catalog_handoff` input; an assertion with nothing to compare is refused), the
+   row count, one polarity, a member for every kept row, and, under a campaign
+   approval, that the approval names its manifest and the manifest carries this
+   triage's sha256 for the unit, its decision record's, and its `selection_sha256`;
+2. cuts the sample rows to the kept rows and declares one input per kept row by
+   its archive member path, so the lease of the whole archive admits only those;
+3. records `repository_metadata.curated_selection`: every hash (triage, decision
+   record, handoff, and the selection in `msdial-selection-canonical.v1` with the
+   crc32 and size of the archive listing the record binds), who decided it, rows
+   kept and dropped with reasons, and whether it is a model inference or an
+   accepted decision. The record is `decision_record_path`, else
+   `<triage file stem>.record.json` beside the triage;
+4. compares each input's raw header with the triage after the preflight (the
+   row's value, or the unit's where the row's is unknown; a converted mzML by its
+   mzXML's row); a disagreement holds the unit for a person
+   (`triage_header_disagreement`);
+5. lets `msdial_repository_cross_unit_check` compare the units of one group once
+   all are preflighted (rules P, C, S and D). A refusal is sticky: the unit's
+   disposition holds it, the execution gate blocks it through every recheck, a new
+   lease of the workspace and the parts of a split carry it, and only a check that
+   passes the unit over a group holding every unit it was refused against
+   (`refused_against`) lifts it.
+
+`workspace_unit_key` gives a reopened unit (`<unit key>@<campaign>`) a workspace
+folder of its own, so an earlier run's artifacts are never overwritten; it starts
+with the Catalog unit id.
+
+A batch plan names both children of a Both unit with a list under its Catalog
+unit id in `curated_selection_paths`.
+
+Every refusal is final for the triage as written (`retryable: false`): a revised
+triage is planned again; nothing reruns on its own.
+
 ## Reproducible candidate selection
 
 Run commands from the repository root with the Python used for MS-DIAL

@@ -4,6 +4,169 @@ Notable changes to MS-DIAL Interactive. The package version is kept in
 `pyproject.toml` and `msdial_app/__init__.py`; the Agent API version is separate.
 Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
 
+## [0.5.69] - Unreleased
+
+Agent-based triage before download, held by Interactive. Campaign stage3b was stopped on 2026-11-15 after multi-unit
+accessions ran every unit on the whole study's files (79 done unit/parts over 29 accessions). The author approved
+triage before download: an agent writes one msdial-unit-triage.v1 file per Catalog unit, validate-triage.py checks
+them as a set, and a person approves the campaign manifest digest that carries their sha256 (msdial-public-reanalysis
+#58). This version makes a unit's lease, preflight and siblings answer to that file. Built from origin/main (0.5.67):
+0.5.68 is reserved by #101 (remote zip listing), which this version does not need. If this version merges first,
+#101 takes the next free patch version at its merge (0.5.70) rather than land a 0.5.68 section below this one.
+
+### Added
+- **`curated_selection_path` on `msdial_repository_reanalysis_plan` and `msdial_download_repository_raw`**, with
+  `curated_selection_child_key`, `decision_record_path`, `original_handoff_sha256`, `original_handoff_path` and
+  `curated_selection_validator`, and **`curated_selection_paths` on `msdial_repository_batch_plan`** (keyed by Catalog
+  unit id; a path, or {path, child_key, decision_record_path, original_handoff_sha256, original_handoff_path,
+  validator, workspace_unit_key}, or a list of those, which plans each child of a Both unit as its own run from the one
+  handoff) (`msdial_app.curated_selection`).
+  - The Catalog handoff's sample rows are cut to the triage's kept rows, and one analysis input is declared per kept
+    row by its archive member path (`selected_by: curated_selection`, `triage_row_index`). The lease's exact path
+    match then admits only those members; the whole-study archive is still the one download object.
+  - `sample_count` and `download_scope.analysis_file_count` are the kept rows'; the ion mode and, where the triage
+    states DDA, DIA, SWATH or AIF, the acquisition mode are the triage's (or its child's).
+  - The Catalog's own input-count check is recorded under `analysis_input_check.catalog` and judges nothing
+    (`status: superseded_by_curated_selection`): its whole-study attribution is what the triage replaces.
+  - The approved Class proposal is cut to the kept rows' samples (`curated_from`, carried into
+    `class_proposal_provenance`).
+  - A child of a Both unit is a unit of its own, `<unit_id>-<child_key>`, as split parts are, with its own workspace.
+- **`workspace_unit_key` on `msdial_repository_reanalysis_plan` and `msdial_download_repository_raw`**, and per entry
+  or through `workspace_unit_keys` (keyed by the run's unit id) on `msdial_repository_batch_plan`: the unit's
+  workspace folder where it is not its analysis unit id, so a reopened unit (`<unit key>@<campaign>`) never overwrites
+  an earlier run's artifacts. One folder name of letters, digits and `. _ - @ +` (at most 128, no `..`), not a
+  reserved name, starting with the Catalog unit id followed by nothing or one of `- _ . @ +`
+  (`repository_reanalysis.validate_workspace_unit_key`, checked again by the lease). Recorded as
+  `repository_metadata.workspace_unit_key`; the unit id, its campaign coverage and its store claims are unchanged. A
+  batch run with an invalid name is blocked (`workspace_unit_key:invalid`) and no other.
+- **`repository_metadata.curated_selection`** (`msdial-curated-selection.v1`) in the project and the run manifest:
+  the triage's path and sha256 (`triage_sha256`), its decision record (`triage_record`: name, path, sha256,
+  decision_id, `located` explicit or beside_triage, the archive listings it binds, its catalog_handoff input) and
+  `triage_record_sha256` (its `payload.sha256` must be the triage's). The record is `decision_record_path` where given,
+  else `<triage file stem>.record.json` beside the triage: `<unit_id>.json` has `<unit_id>.record.json`, a revision
+  `<unit_id>.r<N>.json` its own `<unit_id>.r<N>.record.json` (never the base one), and a runner's copy named
+  `<unit_id>.json` the copy beside it (`curated_selection.decision_record_candidates`). Then `catalog_handoff_sha256`,
+  `original_handoff_sha256` and `copy_handoff_sha256`, `catalog_handoff_verification` (how the handoff that drives
+  the plan is tied to the one the triage names: `handoff_file`, the file passed is it;
+  `original_read_and_copy_compared`, the triaged original was read, by `original_handoff_path` or from the decision
+  record's `catalog_handoff` input (`original_handoff.source`), and the copy holds its every value but the rewritten
+  sidecar paths, sidecar contents included, and what the Class decides). The triage runs before any Class is saved
+  and never reads it, so the handoff it names normally has no Class or an unratified one, and the campaign saves and
+  ratifies the Class afterwards: the triage binds the evidence it read, and the Class binds through its own
+  ratification and the runner's class-digest check (WS0 decision F, which supersedes decision A's
+  ratification-only exclusion). Left out of the comparison, exactly as the Catalog's handoff builder derives them from
+  the Class (`curated_selection.HANDOFF_CLASS_KEYS`, which the runner holds identically): the whole `class_proposal`
+  (proposal, assignments, contrast, status, ratification, ratified_by); the `blocking_reasons` codes
+  `class_proposal:missing`, `class_proposal:not_accepted` and `class_proposal:other_unit`, `blocking_reasons` being
+  compared with only those removed, so any other code appearing or disappearing is still a difference; and
+  `next_action` and `ready_for_download_planning`, only where the remaining blocking reasons are equal. The files,
+  the sample rows, the technical settings, the sidecars, the unit and every other key are compared. Both sides'
+  Class is recorded in `original_handoff.class` {excluded_keys, excluded_blocking_reason_codes, readiness_keys,
+  readiness_left_out, original, copy (each the class_proposal, its Class blocking codes and the readiness values),
+  differs}. The run uses the copy's Class, which its own `blocking_reasons` hold as any handoff's do (a Class
+  missing or not accepted stays a blocking reason of the download). An `original_handoff_sha256` asserted for a copy
+  whose bytes differ, with no original to compare, is refused (`curated_selection_handoff_mismatch`): a handoff whose
+  bytes changed is a hold, never a silent pass. Then `decided_by` (agent, model, skill, skill version) and
+  `decided_at` as the triage records them, `validator` as the caller passes it, `approval_id` and `manifest_digest`
+  where an approval covers it, `selection_sha256` in `msdial-selection-canonical.v1` (the normative definition of
+  msdial-public-reanalysis#59 docs/llm-assisted-curation.md section 3.1, implemented as
+  `curated_selection.selection_canonical(triage, listing, child)` with `selection_sha256` and `parse_archive_listing`,
+  for the plan, the runner and the replay to import; it reproduces the doc's two worked-example hashes): every kept row
+  and added member, crc32 and size from the archive listing(s) the decision record binds (read beside the record,
+  sha256 checked; a listing missing or changed refuses with `curated_selection_record_mismatch`), the bare Catalog unit
+  id with `child_key` for a child. `selection_listing_entries`, and `selection_sha256_matches_manifest` where the
+  approved manifest names a `selection_sha256`: one that differs refuses before download
+  (`curated_selection_selection_mismatch`). Then `rows_kept` and `rows_dropped` with each reason and the unit it
+  belongs to, the archive members no row names (`added_members_not_admitted`), the triage's flags, and `standing`:
+  `accepted_decision` where an approved campaign manifest names this triage's sha256 for the unit, else
+  `model_inference`.
+- **Header reconciliation.** `decide_disposition` now applies the curated selection's reconciliation after the header
+  decision, so the preflight, a recheck and a split decide alike. Each inspected input's header polarity and
+  acquisition are compared with its kept row, or with the unit's as applied where the row's is unknown or not
+  comparable (`triage_basis` row or unit), so a row the triage left unknown is never skipped (DIA, SWATH and AIF are
+  one family; MS1 is FullScan). An mzML converted from an mzXML member is matched to its source's row through the
+  lineage's conversion source. A disagreement, an
+  input that is no kept row's, or an unread header for a row the triage only inferred holds the unit: disposition
+  `skip`, `hold: true`, reason `triage_header_disagreement`, no assignments, and `curated_selection_reconciliation`
+  {per-file triage against header, verdict} on the disposition and the manifest. `execution_allowed` is false in or
+  out of a campaign, and `evaluate_repository_execution_gate` reads the reconciliation again, so no later write of
+  `execution_allowed` lets the unit run. No retry and no automatic rerun: the hold stands until a revised triage is
+  planned again. A person's answer to it (accept the header, accept the triage, exclude the file) therefore reaches
+  the run only as a revised triage with its own plan and approval, or as a skip; answers taken directly by a runner
+  request are future work. A file that is no kept row's is recorded by a portable path (relative to the data root, else
+  `raw:/<path under the raw directory>`, else `<external>/<name>`), never an absolute one.
+- **`msdial_repository_cross_unit_check(manifest_paths)`** and the pure `cross_unit_attribution(manifests)`, after
+  every sibling's preflight. Only Sample inputs are compared. A curated row's stated role decides: `sample` is
+  compared whatever its name reads as (a biological sample named `QC_liver_1` counts, so two units holding the same
+  such samples are refused at rule D), any other stated role is left out; a person's answer reaches the run as the
+  row of a revised triage. Only a row whose role is `unknown` or empty, or an input no curated row names, is read by
+  its names (blanks, QCs and standards by the coverage gate's reading or by
+  `curated_selection.shared_reference_name`). The latter reads by whole tokens the shared QC, reference and blank names the coverage gate takes for samples (LTR, SR,
+  PoolQC, QCpool, batchQC, PBQC, MQC, LQC, PooledQC, Solvent, Water, MeOH), so two units sharing their LTRs no longer
+  refuse each other at rule S. A file is a declared checksum, else the sha256 of a file
+  downloaded as itself, else the store object (archive sha256) plus the member path, never a bare name; byte copies
+  under other names are found by the CRC32 and size of the archive's member listing.
+  - P, first: a header of the other polarity, held by a sibling of that polarity or in a unit whose polarity is
+    declared, refuses the unit (`cross_unit_polarity_contradiction`); an inferred polarity no sibling contests is
+    overridden by the header, on record.
+  - C: one polarity, different chromatographies, containment of at least 0.5: refused
+    (`cross_unit_inputs_indistinguishable_chromatography`). The same files keep only for a member every one of whose
+    shared files states its chromatography, and only it, by name (the other member is then refused); any other share
+    refuses both, so ST002283 as stage3b ran it (both units holding 40 Hilic-named and 40 Lipid-named files) refuses
+    both units. Byte copies under other names refuse both sides, since ST002283's copies were named HILIC and were
+    reversed phase. Containment below 0.5 warns (`cross_unit_inputs_partly_shared`). Every pair is compared, whatever
+    P decided.
+  - S: one polarity, chromatographies that do not tell the units apart (the same, or one unknown), sets that differ
+    with the smaller contained at 0.5 or more in the larger: both refused (`cross_unit_inputs_contained`), since one
+    holds files the other claims and nothing on record says which (a liver unit holding the plasma unit's files).
+    Below 0.5 warns both; the overlap is recorded either way. Every pair is compared, so a third unit cannot escape
+    through a sibling already refused.
+  - D: a set identical to an earlier standing unit's, as files or as listed content, is refused for every unit after
+    the first (`cross_unit_duplicate_inputs`).
+  - With `record` (the default) each manifest gets `cross_unit_attribution`, and a refused unit `execution_allowed`
+    false with `reason_code` and `retryable: false`. Every refusal names the units it is against
+    (`refused_against`).
+  - The refusal is sticky: `decide_disposition` holds a refused unit (skip, `hold: true`, the refusal's codes among
+    the reasons, `cross_unit_attribution_hold`), `_record_preflight` keeps `execution_allowed` false in or out of a
+    campaign, and `evaluate_repository_execution_gate` blocks while the verdict is refused. A new lease of the same
+    workspace carries the refusal (`carried_from`, `execution_allowed` false), and so do the parts of a split parent.
+    A later check lifts it only when it passes the unit over a group holding every unit in `refused_against`
+    (`merge_prior_refusals`); a check that leaves one out keeps it, with `prior_refusal_stands` and `prior_refusal`.
+    The rule set is `cross_unit_attribution_2026_11_16b`.
+  - The result keys a campaign runner reads are fixed in the tool's docstring and pinned by a test: per unit
+    `verdict` `passed` or `refused`, `reason` (the first code), `reasons` (every code), `refused_against`, `warnings`,
+    `details`, `retryable: false`, `prior_refusal_stands`; the header reconciliation's items are nested
+    ({file, member_path, row_index, basis, outcome, ion_mode {triage, triage_basis, header, result},
+    acquisition_mode {...}, result, reasons}).
+- **Canonical hashes for a third-party replay.** `analysis_csv.canonical_sha256` (paths relative to the unit's raw
+  directory, forward slashes, LF, UTF-8 without a byte-order mark; `msdial-analysis-csv-canonical.v1`), and at
+  finalisation `replay_projection` with `replay_projection_sha256` (`msdial-replay-projection.v1`: a whitelist of the
+  run manifest with no timestamps, job ids, hosts or absolute paths; a converted input is named by its source member,
+  with `converted_to: mzML`).
+
+### Changed
+- Every refusal above is a `CuratedSelectionError` (a ValueError) raised before download, so no byte moves, and a tool
+  returns it as {ok false, reason and reason_code the code, retryable false}. The codes `curated_selection_invalid`,
+  `_not_ready`, `_handoff_mismatch`, `_not_approved`, `_record_mismatch`, `_child_unknown`, `_mixed_polarity`,
+  `_member_unresolved`, `_empty`, `_class_contrast_lost`, `_selection_mismatch`, `triage_header_disagreement` and the
+  four cross-unit codes
+  are in `ATTRIBUTION_COVERAGE_REFUSALS`, which the campaign runner mirrors as terminal.
+- Under a campaign approval, a curated selection is applied only where the approval names its campaign manifest and
+  the manifest's entry for the unit carries this triage's sha256; an approval that names no manifest approved no
+  selection (`curated_selection_not_approved`), whatever its unit coverage says.
+- A batch plan records one unit's refused triage for that unit (`blocking_reasons: curated_selection:<code>`,
+  `refusal`) and plans the others.
+
+### Known limitations
+- Archive members no Catalog row names (`added_members`: a pooled QC, a blank) are recorded and not admitted: they
+  have no sample row for the approved Class to assign. Admitting them needs a Class decided over the kept rows.
+- The Catalog cannot yet save a Class or abstention over a row subset; the proposal is cut, and a contrast that loses a
+  side refuses the unit (`curated_selection_class_contrast_lost`).
+- `selection_sha256` takes crc32 and size only from an archive listing the decision record binds; a triage without a
+  record, or a record binding no listing, gives them null, as section 3.1 defines.
+- The replay projection v1 leaves out libraries, the Console identity and the parameter file.
+- A triage's v2 fields (`confidence`, `rationale`) are copied where present; the v2 schema itself is a proposal.
+
 ## [0.5.68] - Unreleased
 
 Piece 1 of the agent-based unit triage that replaces blind self-driving after the stage3b campaign was stopped
