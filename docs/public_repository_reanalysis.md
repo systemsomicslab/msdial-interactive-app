@@ -544,6 +544,36 @@ partial transfer - with the repeats that changed nothing listed in its
 never taken for units. `msdial_download_store_status` shows every store, read
 only.
 
+### Listing an archive before download
+
+A study archive can hold several analysis units' files side by side, and a
+unit must not run on the whole study's files. `msdial_list_remote_archive`
+(in process, `msdial_app.remote_archive.list_remote_zip`) lists a remote zip's
+members from its central directory alone: a suffix range for the end records,
+then the directory itself, each request after the first conditional on the
+first answer's ETag or Last-Modified. ST002798_rawdata.zip (8.49 GB, ZIP64,
+245 entries) lists in two requests and 30,164 bytes. The listing gives each
+member's path, size, compressed size, CRC32, compression and timestamp, and
+`identical_content_groups` names files filed under two paths with one CRC32
+and size; such a pair goes to a person and is not settled by folder names.
+Its provenance records the URL and the URL answered, every request (range,
+status, bytes), the bytes fetched, the archive's size, ETag and Last-Modified,
+and the SHA-256 of the directory bytes. A server that answers a Range request
+with the whole file is refused (`range_not_supported`) without reading the
+body, as is a listing that would pass `max_bytes` (default 512 KiB, at most
+16 MiB) and an archive that changes between requests (a different size,
+ETag, or, when the server sends no ETag, Last-Modified). Only http and https
+are followed: a redirect to any other scheme is refused as
+`unsupported_redirect`, and a redirect's own body is closed unread, with each
+hop recorded in the request's provenance. A sign-in, landing or
+error page served in the archive's place is refused as
+`not_an_archive_response`, because the problem there is access, not range
+support, and a full download is no way round it. The whole listing has a
+deadline (120 s) that holds while headers and bodies arrive: a server trickling
+bytes is cut off and refused as `timeout`. Metabolomics Workbench
+`studydownload`, the MetaboLights FTP tree over HTTPS, MetaboBank (DDBJ) and
+Zenodo answered Range requests with 206 on 2026-11-15.
+
 ## Reproducible candidate selection
 
 Run commands from the repository root with the Python used for MS-DIAL

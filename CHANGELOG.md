@@ -4,6 +4,57 @@ Notable changes to MS-DIAL Interactive. The package version is kept in
 `pyproject.toml` and `msdial_app/__init__.py`; the Agent API version is separate.
 Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
 
+## [0.5.68] - Unreleased
+
+Piece 1 of the agent-based unit triage that replaces blind self-driving after the stage3b campaign was stopped
+on 2026-11-15: every unit of a multi-unit accession had run on the whole study archive. Triage before download
+needs each archive's member list, which was only ever written after extraction. (0.5.67 is taken by an open
+pull request.)
+
+### Added
+- **`msdial_list_remote_archive`, a read-only listing of a remote zip from its central directory.**
+  - Why: deciding which members of ST002798_rawdata.zip (8.49 GB) belong to its HILIC and its RPLC unit, and
+    finding byte-identical files filed under two units (ST002283's Hilic_Neg and Lipid_Neg folders hold 43
+    pairs with one CRC32 and size), needs the member list before anything is downloaded.
+  - Now `msdial_app.remote_archive.list_remote_zip` reads a suffix range for the end of central directory
+    record (ZIP64 locator and end record included), more of the tail when an archive comment hides the end
+    record, and the central directory, and returns each member's path, size, compressed size, CRC32,
+    compression, timestamp and local header offset. Every request after the first carries If-Range with the
+    first answer's ETag or Last-Modified, and every answer must give the same total size, the same ETag, and,
+    when the server sends no ETag (Zenodo sends none), the same Last-Modified. Bytes before the
+    archive proper are allowed for; a split archive is refused. The provenance records the URL and the URL
+    answered after redirects, each request (range, status, bytes, and each redirect hop with its status,
+    target and declared length; a redirect's body is closed unread), the bytes fetched, the archive's size,
+    ETag and Last-Modified, and the SHA-256 of the central directory bytes. `expected_size_bytes` warns when
+    the served archive differs from a declared size (an integer, a numeric string or a whole-number float;
+    NaN, infinity, a fraction and a bool are refused): the Catalog declares 8,482,560,409 bytes for
+    ST002798_rawdata.zip, and the server sends 8,486,399,643 with the declared MD5.
+  - Refused, with a reason and without reading a body it did not ask for: a 200 answer to a Range request
+    (`range_not_supported`), a sign-in, landing or error page served in the archive's place, recognised by
+    its Content-Type and named with the URL it was redirected to (`not_an_archive_response`: the problem is
+    access, and a full download is no way round it), a fetch that would pass `max_bytes`
+    (`byte_cap_exceeded`; 512 KiB by default, at most 16 MiB, checked before each request), an archive that
+    changes between requests (`changed_during_listing`), a file with no end record (`not_a_zip`), a split
+    archive (`multi_disk`), a malformed directory, an HTTP error, a timeout, a non-numeric
+    `expected_size_bytes` or timeout (`invalid_argument`, before any request), any scheme other than http
+    and https (`unsupported_url`), and a redirect to any other scheme (`unsupported_redirect`: the opener has
+    no ftp, file or data handler, so such a redirect is never followed and no socket outside the deadline's
+    watch is opened).
+  - The timeout holds per socket operation (`timeout_seconds`) and for the whole listing
+    (`deadline_seconds`, 120 s): a watchdog shuts the connection when the deadline passes, so a server that
+    trickles header lines or body bytes inside every per-operation timeout cannot hold the listing. Bodies
+    are read piece by piece and what arrived before the cut is counted in the provenance.
+  - An end record without a ZIP64 locator is read at face value: CPython's zipfile writes a plain end record
+    holding 0xFFFF for an archive of exactly 65,535 entries, and the directory's fit and its parsed entry count
+    decide whether the values hold.
+  - The MCP tool adds `identical_content_groups` (files with one CRC32 and size under two or more paths),
+    bounds the members in its reply with `member_limit`, and writes the full listing only to a new absolute
+    `.json` `output_path`. Nothing else is written.
+  - Checked on 2026-11-15: Metabolomics Workbench `studydownload`, the MetaboLights FTP tree over HTTPS,
+    MetaboBank (DDBJ) and Zenodo answer Range requests with 206. ST002798_rawdata.zip lists in two requests
+    and 30,164 bytes, ST002283_AB_Human_Bone.zip in 17,340, both identical in paths, sizes and CRC32 to the
+    listings written after their extraction.
+
 ## [0.5.67] - Unreleased
 
 From the triage of the 162 attribute failures of campaign stage3b-poola-20261106 and the author's decisions of
