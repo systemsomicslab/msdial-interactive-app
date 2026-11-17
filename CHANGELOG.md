@@ -50,7 +50,14 @@ them as a set, and a person approves the campaign manifest digest that carries t
   the plan is tied to the one the triage names: `handoff_file`, the file passed is it;
   `original_read_and_copy_compared`, the triaged original was read, by `original_handoff_path` or from the decision
   record's `catalog_handoff` input (`original_handoff.source`), and the copy holds its every value but the rewritten
-  sidecar paths, sidecar contents included). An `original_handoff_sha256` asserted for a copy whose bytes differ, with
+  sidecar paths, sidecar contents included, and the Class proposal's campaign ratification). The ratification a
+  campaign runner writes when it saves the approved proposal under its own approval, before it takes the handoff, is
+  the one thing of `class_proposal` that may differ: exactly `class_proposal.ratified_by` and
+  `class_proposal.ratification.{approval_id, manifest_digest, authorization_sha256, campaign_id, ratified_at}`
+  (`curated_selection.HANDOFF_RATIFICATION_KEYS`). Both sides' values are recorded in
+  `original_handoff.ratification` {excluded_keys, original, copy, differs}; every other key of the proposal and of
+  its ratification (kind, boundary, proposal_id, abstention, assignments, contrast) is compared, so a ratification
+  that appears where the triaged handoff had none is still a difference. An `original_handoff_sha256` asserted for a copy whose bytes differ, with
   no original to compare, is refused (`curated_selection_handoff_mismatch`): a handoff whose bytes changed is a hold,
   never a silent pass. Then `decided_by` (agent, model, skill, skill version) and
   `decided_at` as the triage records them, `validator` as the caller passes it, `approval_id` and `manifest_digest`
@@ -77,12 +84,17 @@ them as a set, and a person approves the campaign manifest digest that carries t
   {per-file triage against header, verdict} on the disposition and the manifest. `execution_allowed` is false in or
   out of a campaign, and `evaluate_repository_execution_gate` reads the reconciliation again, so no later write of
   `execution_allowed` lets the unit run. No retry and no automatic rerun: the hold stands until a revised triage is
-  planned again. A file that is no kept row's is recorded by a portable path (relative to the data root, else
+  planned again. A person's answer to it (accept the header, accept the triage, exclude the file) therefore reaches
+  the run only as a revised triage with its own plan and approval, or as a skip; answers taken directly by a runner
+  request are future work. A file that is no kept row's is recorded by a portable path (relative to the data root, else
   `raw:/<path under the raw directory>`, else `<external>/<name>`), never an absolute one.
 - **`msdial_repository_cross_unit_check(manifest_paths)`** and the pure `cross_unit_attribution(manifests)`, after
-  every sibling's preflight. Only Sample inputs are compared (blanks, QCs and standards by the coverage gate's
-  reading or by `curated_selection.shared_reference_name`, and curated rows whose role is not sample). The latter
-  reads by whole tokens the shared QC, reference and blank names the coverage gate takes for samples (LTR, SR,
+  every sibling's preflight. Only Sample inputs are compared. A curated row's stated role decides: `sample` is
+  compared whatever its name reads as (a biological sample named `QC_liver_1` counts, so two units holding the same
+  such samples are refused at rule D), any other stated role is left out; a person's answer reaches the run as the
+  row of a revised triage. Only a row whose role is `unknown` or empty, or an input no curated row names, is read by
+  its names (blanks, QCs and standards by the coverage gate's reading or by
+  `curated_selection.shared_reference_name`). The latter reads by whole tokens the shared QC, reference and blank names the coverage gate takes for samples (LTR, SR,
   PoolQC, QCpool, batchQC, PBQC, MQC, LQC, PooledQC, Solvent, Water, MeOH), so two units sharing their LTRs no longer
   refuse each other at rule S. A file is a declared checksum, else the sha256 of a file
   downloaded as itself, else the store object (archive sha256) plus the member path, never a bare name; byte copies

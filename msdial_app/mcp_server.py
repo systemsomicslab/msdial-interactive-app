@@ -1226,8 +1226,9 @@ def _curated_selection_context(
     THE HANDOFF is tied to the triage's catalog_handoff_sha256: the handoff file read here is it; or
     ``original_handoff_path`` names the triaged original; or ``original_handoff_sha256`` is asserted for a copy and the
     decision record's catalog_handoff input holds those bytes. In the last two the original is hashed (it must be the
-    triaged sha256) and the copy must hold its every value but the rewritten sidecar paths
-    (curated_selection.verify_handoff_copy). An asserted sha256 for a copy whose bytes differ, with no original to
+    triaged sha256) and the copy must hold its every value but the rewritten sidecar paths and the Class proposal's
+    campaign ratification (curated_selection.verify_handoff_copy, HANDOFF_RATIFICATION_KEYS; both sides' ratification
+    is recorded in original_handoff.ratification). An asserted sha256 for a copy whose bytes differ, with no original to
     compare it with, is refused (curated_selection_handoff_mismatch). Where the campaign approval names its manifest,
     the manifest's entry for the unit (``<unit_id>`` or ``<unit_id>-<child_key>``) must carry this triage's sha256,
     the record's where it names one, and the selection_sha256 where it names one.
@@ -2389,8 +2390,10 @@ def msdial_repository_cross_unit_check(manifest_paths: list[str], record: bool =
     (curated_selection.cross_unit_attribution): P, a header polarity that contradicts the unit's; C, a set shared at
     a containment of 0.5 or more across different chromatographies; S, at one polarity and a chromatography that does
     not tell them apart, a set contained at 0.5 or more in a different one (both refused); D, a set identical to an
-    earlier unit's, which keeps it. QC, reference and blank injections are left out by the coverage gate's reading
-    and by curated_selection.shared_reference_name (LTR, SR, PoolQC, PBQC, Solvent, MeOH and the like).
+    earlier unit's, which keeps it. A curated row's stated role decides (sample is compared whatever its name, any
+    other role is not); only a row whose role is unknown, or an input no curated row names, is read by its names: QC,
+    reference and blank injections are then left out by the coverage gate's reading and by
+    curated_selection.shared_reference_name (LTR, SR, PoolQC, PBQC, Solvent, MeOH and the like).
 
     With ``record`` each manifest gets cross_unit_attribution (its own verdict, the group and the overlaps), and a
     refused unit execution_allowed false, with reason_code and retryable false: the same manifests give the same

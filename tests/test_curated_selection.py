@@ -636,7 +636,7 @@ def _row(path: str, *, archive_sha: str = "a" * 64, member: str | None = None, d
 
 def _manifest(unit_id: str, polarity: str, chromatography: str, members: list[str], *, root: str = "D:/ws",
               headers: dict[str, str] | None = None, archive_sha: str = "a" * 64, tsv: str = "",
-              basis: str = "declared") -> dict:
+              basis: str = "declared", roles: dict[str, str] | None = None) -> dict:
     data_root = f"{root}/{unit_id}/raw/data"
     rows = [_row(f"{data_root}/{member}", archive_sha=archive_sha, member=member, tsv=tsv) for member in members]
     return {
@@ -650,7 +650,8 @@ def _manifest(unit_id: str, polarity: str, chromatography: str, members: list[st
             "repository_metadata": {
                 "curated_selection": {
                     "unit_technical": {"chromatography": chromatography},
-                    "rows_kept": [{"member_path": member, "role": "sample", "basis": basis} for member in members],
+                    "rows_kept": [{"member_path": member, "role": (roles or {}).get(member, "sample"), "basis": basis}
+                                  for member in members],
                 }
             },
         },
@@ -674,11 +675,16 @@ class TheCrossUnitCheck(_Files):
         self.assertFalse(result["units"][1]["retryable"])
 
     def test_shared_blanks_and_qcs_alone_pass(self) -> None:
-        result = cs.cross_unit_attribution([
-            _manifest("AN-1", "Positive", "HILIC", ["Blank_01.mzML", "QC_01.mzML", "H_S1.mzML"]),
-            _manifest("AN-2", "Positive", "RP", ["Blank_01.mzML", "QC_01.mzML", "R_S1.mzML"]),
-        ])
-        self.assertEqual("passed", result["verdict"], result)
+        # Stated blank and qc rows are left out; rows of unknown role are read by their names (WS0 decision D).
+        for roles in ({"Blank_01.mzML": "blank", "QC_01.mzML": "qc"},
+                      {"Blank_01.mzML": "unknown", "QC_01.mzML": ""}):
+            with self.subTest(roles=roles):
+                result = cs.cross_unit_attribution([
+                    _manifest("AN-1", "Positive", "HILIC", ["Blank_01.mzML", "QC_01.mzML", "H_S1.mzML"], roles=roles),
+                    _manifest("AN-2", "Positive", "RP", ["Blank_01.mzML", "QC_01.mzML", "R_S1.mzML"], roles=roles),
+                ])
+                self.assertEqual("passed", result["verdict"], result)
+                self.assertEqual([1, 1], [item["sample_inputs"] for item in result["units"]])
 
     def test_one_name_in_two_archives_with_different_checksums_passes(self) -> None:
         result = cs.cross_unit_attribution([

@@ -106,7 +106,9 @@ _DIA_FAMILY = {"DIA", "SWATH", "AIF"}
 _HEADER_POLARITIES = {"Positive", "Negative"}
 _HEADER_SWITCHING = {"PolaritySwitching", "MixedFunctions"}
 _READ_OUTCOMES = {"ok", "reused"}
-_SAMPLE_ROLES = {"sample", "unknown", ""}
+# A triage row role that states nothing: only such a row is read by its file and sample names (_unit_view); any other
+# stated role decides by itself whether the input is a Sample input of the cross-unit check.
+_UNKNOWN_ROLES = {"unknown", ""}
 
 
 class CuratedSelectionError(ValueError):
@@ -561,16 +563,57 @@ def decision_record(
 # at the copy of a sidecar. Everything else in the copy must be the original's.
 HANDOFF_COPY_REWRITTEN_KEYS = ("file_manifest_path", "sample_table_path", "analysis_input_manifest_path")
 
+# The ratification a campaign runner writes onto the Class proposal before it takes its handoff (WS0 decision A,
+# 2026-11-17): the runner's _state_pending saves the approved proposal under the current campaign approval, and the
+# Catalog's handoff embeds the proposal with that ratification (msdial_repository_catalog ratification_record, the
+# class_proposal row's ratified_by column). These, and only these, may differ between the triaged handoff and the copy
+# the runner passes; every other key of class_proposal and of its ratification (kind, authorization_schema, boundary,
+# proposal_id, abstention, the assignments, the contrast) is compared. ratified_by is the row column holding the
+# ratification's approval_id; authorization_sha256 is the hash of that approval's authorization file. Paths are
+# (key, ...) under the handoff's class_proposal.
+HANDOFF_RATIFICATION_KEYS: tuple[tuple[str, ...], ...] = (
+    ("ratified_by",),
+    ("ratification", "approval_id"),
+    ("ratification", "manifest_digest"),
+    ("ratification", "authorization_sha256"),
+    ("ratification", "campaign_id"),
+    ("ratification", "ratified_at"),
+)
+
+
+def _without_ratification(proposal: Any) -> tuple[Any, dict[str, Any]]:
+    """The class_proposal value with HANDOFF_RATIFICATION_KEYS removed, and those keys' values by dotted path.
+
+    Only a key present is removed, so a proposal and an unratified one still differ in the ratification's other keys
+    (kind, boundary, proposal_id...): exclusion covers a re-ratification, never a ratification appearing or vanishing.
+    """
+    if not isinstance(proposal, Mapping):
+        return proposal, {}
+    from copy import deepcopy
+
+    stripped = deepcopy(dict(proposal))
+    removed: dict[str, Any] = {}
+    for path in HANDOFF_RATIFICATION_KEYS:
+        holder: Any = stripped
+        for part in path[:-1]:
+            holder = holder.get(part) if isinstance(holder, dict) else None
+        if isinstance(holder, dict) and path[-1] in holder:
+            removed[".".join(path)] = holder.pop(path[-1])
+    return stripped, removed
+
 
 def verify_handoff_copy(original_path: str | Path, copy: Mapping[str, Any]) -> dict[str, Any]:
     """Bind a rewritten handoff copy to the Catalog original it was copied from. Raises CuratedSelectionError.
 
     The original is read by path and hashed (its sha256 is what a triage names); the copy must hold the same value
     for every key but HANDOFF_COPY_REWRITTEN_KEYS (compared as canonical JSON): the sample rows, the files with their
-    URLs, sizes and checksums, the technical settings, the unit and accession. The sidecars the rewritten keys name
-    (the external file manifest, sample table and input manifest a large handoff carries its rows in) must exist on
-    both sides and hold the same JSON value: a copy pointing at other rows is no copy. Returns {sha256, name,
-    compared_keys, sidecars (each side's sha256)}.
+    URLs, sizes and checksums, the technical settings, the unit and accession. class_proposal is compared without the
+    ratification fields HANDOFF_RATIFICATION_KEYS names (a campaign runner re-ratifies the approved proposal under its
+    own approval before it takes the handoff); their values on each side are returned, not compared. The sidecars the
+    rewritten keys name (the external file manifest, sample table and input manifest a large handoff carries its rows
+    in) must exist on both sides and hold the same JSON value: a copy pointing at other rows is no copy. Returns
+    {sha256, name, compared_keys, sidecars (each side's sha256), ratification {excluded_keys, original, copy,
+    differs}}.
     """
     location = Path(str(original_path)).expanduser()
     try:
@@ -583,14 +626,30 @@ def verify_handoff_copy(original_path: str | Path, copy: Mapping[str, Any]) -> d
     if not isinstance(original, dict):
         raise CuratedSelectionError(CURATED_SELECTION_HANDOFF_MISMATCH, "The original handoff is not one JSON object.")
     keys = sorted((set(original) | set(copy)) - set(HANDOFF_COPY_REWRITTEN_KEYS))
-    differing = [key for key in keys if canonical_json(original.get(key)) != canonical_json(copy.get(key))]
+    original_proposal, original_ratification = _without_ratification(original.get("class_proposal"))
+    copy_proposal, copy_ratification = _without_ratification(copy.get("class_proposal"))
+
+    def compared(side: Mapping[str, Any], proposal: Any, key: str) -> str:
+        return canonical_json(proposal if key == "class_proposal" else side.get(key))
+
+    differing = [
+        key for key in keys
+        if compared(original, original_proposal, key) != compared(copy, copy_proposal, key)
+    ]
     if differing:
         raise CuratedSelectionError(
             CURATED_SELECTION_HANDOFF_MISMATCH,
             f"The handoff passed is not a copy of the Catalog's original {location.name}: it differs in "
-            f"{', '.join(differing[:20])}. Only {', '.join(HANDOFF_COPY_REWRITTEN_KEYS)} may be rewritten.",
+            f"{', '.join(differing[:20])}. Only {', '.join(HANDOFF_COPY_REWRITTEN_KEYS)} may be rewritten, and of "
+            f"class_proposal only its ratification ({', '.join('.'.join(path) for path in HANDOFF_RATIFICATION_KEYS)}).",
             differing_keys=differing[:50],
         )
+    ratification = {
+        "excluded_keys": [".".join(("class_proposal", *path)) for path in HANDOFF_RATIFICATION_KEYS],
+        "original": original_ratification,
+        "copy": copy_ratification,
+        "differs": canonical_json(original_ratification) != canonical_json(copy_ratification),
+    }
 
     def sidecar(value: Any) -> tuple[str | None, bytes | None]:
         text = str(value or "").strip()
@@ -618,7 +677,8 @@ def verify_handoff_copy(original_path: str | Path, copy: Mapping[str, Any]) -> d
                 sidecar=key,
             )
         sidecars[key] = {"original_sha256": original_sha, "copy_sha256": copy_sha}
-    return {"sha256": sha256_bytes(data), "name": location.name, "compared_keys": keys, "sidecars": sidecars}
+    return {"sha256": sha256_bytes(data), "name": location.name, "compared_keys": keys, "sidecars": sidecars,
+            "ratification": ratification}
 
 
 def campaign_selection(authorization_path: str | Path | None, unit_key: str) -> dict[str, Any] | None:
@@ -1583,12 +1643,18 @@ def _unit_view(
         path = str(row["path"])
         relative = _relative(path, data_root)
         member = member_for(path, data_root, kept) if kept else ""
-        role = str((kept.get(member) or {}).get("role") or "").casefold() if member else ""
+        role = str((kept.get(member) or {}).get("role") or "").strip().casefold() if member else ""
         name = PurePosixPath(relative).name
-        if role not in _SAMPLE_ROLES or _coverage_file_type(name) != "Sample" or shared_reference_name(name):
-            continue
         sample_id = str(row.get("sample_id") or "")
-        if sample_id and (_coverage_file_type(sample_id) != "Sample" or shared_reference_name(sample_id)):
+        if role not in _UNKNOWN_ROLES:
+            # A role the triage row states (a person's answer reaches the run as the row of a revised triage) decides,
+            # whatever the name reads as (WS0 decision D): a biological sample named QC_liver_1 is compared, so two
+            # units holding the same such samples are refused at rule D; a row stated qc or blank is not.
+            if role != "sample":
+                continue
+        elif (_coverage_file_type(name) != "Sample" or shared_reference_name(name)
+              or (sample_id and (_coverage_file_type(sample_id) != "Sample" or shared_reference_name(sample_id)))):
+            # Only a row whose role is unknown (or a lineage row no curated row names) is read by its names.
             continue
         identity, basis = _input_identity(row, data_root)
         inputs[identity] = {
@@ -1638,9 +1704,10 @@ def cross_unit_attribution(manifests: list[Mapping[str, Any]], labels: list[str]
     """Whether sibling units' Sample inputs are their own: rules P, C, S and D over their recorded lineage. Pure but for
     reading the archives' member listings the lineage names.
 
-    Only Sample inputs are compared (blanks, QCs and standards by the coverage gate's reading or by
-    shared_reference_name, and a curated row whose role is not sample), so blanks and QCs shared on purpose never
-    refuse a unit. A file is identified by
+    Only Sample inputs are compared, so blanks and QCs shared on purpose never refuse a unit. A curated row's stated
+    role decides (sample is compared, any other role is not, whatever the name reads as); only a row whose role is
+    unknown, or an input no curated row names, is read by its names (blanks, QCs and standards by the coverage gate's
+    reading or by shared_reference_name). A file is identified by
     _input_identity, never by its bare name; byte copies under other names are found by the CRC32 and size the
     archive's member listing records (_listed_content).
 

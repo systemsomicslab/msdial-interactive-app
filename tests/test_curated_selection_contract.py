@@ -323,6 +323,129 @@ class TheHandoffCopyIsComparedWithTheTriagedBytes(_Recorded):
         self.assertIn("is not the sha256 of the original handoff read", str(caught.exception))
 
 
+def _ratification(approval: str, campaign: str, digest: str, authorization: str, at: str) -> dict:
+    """msdial_repository_catalog ratification_record as its handoff embeds it in class_proposal.ratification."""
+    return {
+        "kind": "campaign_approval", "authorization_schema": "msdial-campaign-authorization.v1", "boundary": 3,
+        "approval_id": approval, "manifest_digest": "sha256:" + digest * 64, "authorization_sha256": authorization * 64,
+        "campaign_id": campaign, "proposal_id": "class-syn-0001", "abstention": False, "ratified_at": at,
+    }
+
+
+def _catalog_proposal(ratification: dict | None) -> dict:
+    """A Class proposal as msdial_repository_catalog Catalog.get_class_proposal returns it into a handoff: the row's
+    columns, the ratified_by column and the ratification record, and the assignments ordered by sample_id."""
+    return {
+        "proposal_id": "class-syn-0001", "unit_id": "AN-SYN-POS", "purpose": "Compare group A with group B.",
+        "rationale": "Group is the declared factor.", "model": "", "prompt_hash": "", "status": "accepted",
+        "created_at": "2026-11-16T01:00:00+00:00",
+        "ratified_by": (ratification or {}).get("approval_id", ""),
+        "selected_fields": ["Group"],
+        "contrast_definition": {"kind": "declared_factor", "groups": ["A", "B"]},
+        "warnings": [],
+        "ratification": ratification,
+        "assignments": sorted(
+            ({"sample_id": Path(path).stem, "class_label": group, "values": {"Group": group}}
+             for path, _ion, _role, group in MEMBERS),
+            key=lambda item: item["sample_id"],
+        ),
+    }
+
+
+class ARatifiedHandoffCopyIsTheTriagedOne(_Recorded):
+    """WS0 decision A (2026-11-17), against a handoff of the Catalog's shape: the triage names the handoff as the
+    Catalog wrote it under campaign A's ratification; the runner re-ratifies the approved proposal under campaign B,
+    takes the handoff again and copies it with its sidecars. Only the ratification may differ, and both sides of it
+    are recorded."""
+
+    RATIFIED_A = _ratification("appr-A", "campaign-a", "1", "2", "2026-11-16T02:00:00+00:00")
+    RATIFIED_B = _ratification("appr-B", "campaign-b", "3", "4", "2026-11-17T03:00:00+00:00")
+
+    def catalog_handoff(self, folder: str, ratification: dict | None, rows: list | None = None) -> tuple[dict, Path]:
+        """The handoff file with its three sidecars at absolute paths, as the Catalog (or a runner's copy) writes."""
+        handoff = _handoff(unit_id=self.UNIT, ion_mode="Positive", class_proposal=_catalog_proposal(ratification))
+        samples = rows if rows is not None else handoff["sample_metadata"]
+        sidecars = {
+            "file_manifest_path": self.write(f"{folder}/{self.UNIT}.files.json", handoff["files"]),
+            "sample_table_path": self.write(f"{folder}/{self.UNIT}.samples.json", samples),
+            "analysis_input_manifest_path": self.write(f"{folder}/{self.UNIT}.inputs.json", []),
+        }
+        handoff.update({key: str(path) for key, path in sidecars.items()})
+        handoff["unit_attributes"] = {"Group": ["A", "B", "QC"]}
+        return handoff, self.write(f"{folder}/{self.UNIT}.json", handoff)
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.handoff, self.handoff_path = self.catalog_handoff("catalog/handoffs", self.RATIFIED_A)
+        self.handoff_sha = _sha(self.handoff_path)
+        self.triage = _triage(self.handoff_sha, [0, 1, 2], unit_id=self.UNIT)
+
+    def test_a_copy_reratified_under_another_campaign_is_verified_and_both_ratifications_recorded(self) -> None:
+        triage_path = self.triage_dir()
+        copy, copy_path = self.catalog_handoff("campaign/handoffs", self.RATIFIED_B)
+        self.assertNotEqual(self.handoff_sha, _sha(copy_path))
+        for options in ({"original_handoff_sha256": self.handoff_sha},
+                        {"original_handoff_sha256": self.handoff_sha, "original_handoff_path": str(self.handoff_path)}):
+            with self.subTest(**{key: bool(value) for key, value in options.items()}):
+                record, _curated = self.applied(triage_path, copy, copy_path, **options)
+                self.assertEqual("original_read_and_copy_compared", record["catalog_handoff_verification"])
+                ratification = record["original_handoff"]["ratification"]
+                self.assertEqual(
+                    ["class_proposal.ratified_by", "class_proposal.ratification.approval_id",
+                     "class_proposal.ratification.manifest_digest", "class_proposal.ratification.authorization_sha256",
+                     "class_proposal.ratification.campaign_id", "class_proposal.ratification.ratified_at"],
+                    ratification["excluded_keys"],
+                )
+                self.assertTrue(ratification["differs"])
+                self.assertEqual("appr-A", ratification["original"]["ratified_by"])
+                self.assertEqual("appr-B", ratification["copy"]["ratification.approval_id"])
+                self.assertEqual("campaign-b", ratification["copy"]["ratification.campaign_id"])
+                self.assertEqual(sorted(cs.HANDOFF_COPY_REWRITTEN_KEYS),
+                                 sorted(record["original_handoff"]["sidecars"]))
+
+    def test_everything_else_of_the_proposal_and_its_ratification_is_still_compared(self) -> None:
+        triage_path = self.triage_dir()
+        changes = {
+            "the assignments": lambda proposal: proposal["assignments"][0].update(class_label="B"),
+            "the contrast": lambda proposal: proposal["contrast_definition"].update(groups=["A", "QC"]),
+            "the status": lambda proposal: proposal.update(status="proposed"),
+            "the ratified proposal id": lambda proposal: proposal["ratification"].update(proposal_id="class-other"),
+            "the ratification's kind": lambda proposal: proposal["ratification"].update(boundary=4),
+            "an added ratification key": lambda proposal: proposal["ratification"].update(note="x"),
+        }
+        for label, change in changes.items():
+            with self.subTest(label):
+                copy, copy_path = self.catalog_handoff("campaign/handoffs", json.loads(json.dumps(self.RATIFIED_B)))
+                change(copy["class_proposal"])
+                copy_path = self.write("campaign/handoffs/changed.json", copy)
+                error = self.refuses(cs.CURATED_SELECTION_HANDOFF_MISMATCH, self.applied, triage_path, copy, copy_path,
+                                     original_handoff_sha256=self.handoff_sha)
+                self.assertEqual(["class_proposal"], error.detail["differing_keys"])
+
+    def test_a_ratification_appearing_where_the_triaged_handoff_had_none_is_a_difference(self) -> None:
+        self.handoff, self.handoff_path = self.catalog_handoff("catalog/handoffs", None)
+        self.handoff_sha = _sha(self.handoff_path)
+        self.triage = _triage(self.handoff_sha, [0, 1, 2], unit_id=self.UNIT)
+        triage_path = self.triage_dir()
+        copy, copy_path = self.catalog_handoff("campaign/handoffs", self.RATIFIED_B)
+        error = self.refuses(cs.CURATED_SELECTION_HANDOFF_MISMATCH, self.applied, triage_path, copy, copy_path,
+                             original_handoff_sha256=self.handoff_sha)
+        self.assertEqual(["class_proposal"], error.detail["differing_keys"])
+
+    def test_the_sidecar_rows_and_the_other_keys_are_still_bound(self) -> None:
+        triage_path = self.triage_dir()
+        copy, copy_path = self.catalog_handoff("campaign/handoffs", self.RATIFIED_B, rows=[{"sample_id": "other"}])
+        error = self.refuses(cs.CURATED_SELECTION_HANDOFF_MISMATCH, self.applied, triage_path, copy, copy_path,
+                             original_handoff_sha256=self.handoff_sha)
+        self.assertEqual("sample_table_path", error.detail["sidecar"])
+        copy, copy_path = self.catalog_handoff("campaign/handoffs", self.RATIFIED_B)
+        copy["unit_attributes"] = {"Group": ["A"]}
+        copy_path = self.write("campaign/handoffs/changed.json", copy)
+        error = self.refuses(cs.CURATED_SELECTION_HANDOFF_MISMATCH, self.applied, triage_path, copy, copy_path,
+                             original_handoff_sha256=self.handoff_sha)
+        self.assertEqual(["unit_attributes"], error.detail["differing_keys"])
+
+
 class AWorkspaceUnitKeyKeepsEarlierRuns(_Files):
     def test_the_name_is_validated(self) -> None:
         good = ("AN-1", "AN-1-pos", "AN-1@stage3c", "AN-1.r2", "AN-1+x", "AN-1_reopen")
@@ -392,10 +515,12 @@ class AWorkspaceUnitKeyKeepsEarlierRuns(_Files):
 # Cross-unit.
 
 
-def _shared(unit: str, own: list[str], shared: list[str], role: str = "") -> dict:
+def _shared(unit: str, own: list[str], shared: list[str], role: str = "", own_role: str | None = None) -> dict:
+    """A unit holding its own files and the shared ones; ``role`` for the shared rows, ``own_role`` (else the same)
+    for its own."""
     manifest = _manifest(unit, "Positive", "RP", own + shared)
     for row in manifest["project"]["repository_metadata"]["curated_selection"]["rows_kept"]:
-        row["role"] = role
+        row["role"] = role if row["member_path"] in shared or own_role is None else own_role
     return manifest
 
 
@@ -412,13 +537,68 @@ class SharedReferenceInjectionsAreNoSamples(unittest.TestCase):
         plasma = [f"plasma_{i}.mzML" for i in range(6)]
         for stem in ("LTR", "PoolQC", "QCpool", "batchQC", "Solvent", "SR"):
             shared = [f"{stem}_{i}.mzML" for i in range(1, 5)]
-            for role in ("", "sample", "unknown"):
+            # A row with no role is read by its name; a row stated qc or blank is left out whatever its name.
+            for role, own_role in (("", None), ("unknown", None), ("qc", "sample"), ("blank", "sample")):
                 with self.subTest(stem=stem, role=role):
                     result = cs.cross_unit_attribution([
-                        _shared("AN-LIVER", liver, shared, role), _shared("AN-PLASMA", plasma, shared, role),
+                        _shared("AN-LIVER", liver, shared, role, own_role),
+                        _shared("AN-PLASMA", plasma, shared, role, own_role),
                     ])
                     self.assertEqual("passed", result["verdict"], result["units"])
                     self.assertEqual([4, 6], [item["sample_inputs"] for item in result["units"]])
+
+
+class AStatedRoleOverridesTheNameFilter(unittest.TestCase):
+    """WS0 decision D (2026-11-17): the role a triage row states, or a person's answer carried by a revised triage,
+    decides; shared_reference_name and the coverage gate's name reading apply only where the role is unknown."""
+
+    QC_NAMED_SAMPLES = ["QC_liver_1.mzML", "PoolA_2.mzML", "LTR_mouse_3.mzML", "batchQC_plasma_4.mzML"]
+
+    def test_qc_named_biological_samples_stated_sample_count_and_a_duplicate_unit_is_refused(self) -> None:
+        for name in self.QC_NAMED_SAMPLES:
+            self.assertTrue(cs.shared_reference_name(name) or name.startswith("QC_"), name)
+        result = cs.cross_unit_attribution([
+            _shared("AN-FIRST", [], self.QC_NAMED_SAMPLES, "sample"),
+            _shared("AN-SECOND", [], self.QC_NAMED_SAMPLES, "Sample"),
+        ])
+        self.assertEqual([4, 4], [item["sample_inputs"] for item in result["units"]])
+        self.assertEqual([("passed", ""), ("refused", cs.CROSS_UNIT_DUPLICATE_INPUTS)],
+                         [(item["verdict"], item["reason"]) for item in result["units"]])
+
+    def test_the_same_names_without_a_role_are_still_left_out(self) -> None:
+        for role in ("", "unknown"):
+            with self.subTest(role=role):
+                result = cs.cross_unit_attribution([
+                    _shared("AN-FIRST", [], self.QC_NAMED_SAMPLES, role),
+                    _shared("AN-SECOND", [], self.QC_NAMED_SAMPLES, role),
+                ])
+                self.assertEqual([0, 0], [item["sample_inputs"] for item in result["units"]])
+                self.assertEqual("passed", result["verdict"], result["units"])
+
+    def test_shared_references_stated_sample_are_compared_as_samples(self) -> None:
+        liver = [f"liver_{i}.mzML" for i in range(4)]
+        plasma = [f"plasma_{i}.mzML" for i in range(6)]
+        shared = [f"LTR_{i}.mzML" for i in range(1, 5)]
+        result = cs.cross_unit_attribution([
+            _shared("AN-LIVER", liver, shared, "sample"), _shared("AN-PLASMA", plasma, shared, "sample"),
+        ])
+        self.assertEqual([8, 10], [item["sample_inputs"] for item in result["units"]])
+        self.assertEqual({cs.CROSS_UNIT_CONTAINED_INPUTS}, {item["reason"] for item in result["units"]})
+
+    def test_a_qc_named_sample_id_does_not_override_a_stated_sample_role(self) -> None:
+        files = [f"S{i}.mzML" for i in range(1, 5)]
+        manifests = [_shared("AN-FIRST", files, [], own_role="sample"),
+                     _shared("AN-SECOND", files, [], own_role="sample")]
+        for manifest in manifests:
+            for index, row in enumerate(manifest["input_lineage"]["rows"]):
+                row["sample_id"] = f"PooledQC_{index}"
+        result = cs.cross_unit_attribution(manifests)
+        self.assertEqual([4, 4], [item["sample_inputs"] for item in result["units"]])
+        self.assertEqual("refused", result["units"][1]["verdict"])
+        for manifest in manifests:
+            for row in manifest["project"]["repository_metadata"]["curated_selection"]["rows_kept"]:
+                row["role"] = ""
+        self.assertEqual([0, 0], [item["sample_inputs"] for item in cs.cross_unit_attribution(manifests)["units"]])
 
 
 class TheMutantsThatSurvived(_Files):
