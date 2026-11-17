@@ -438,6 +438,17 @@ For an accession-to-mzTab-M workflow, prefer the higher-level repository tools:
   stores (`<workspace_root>\<repository>\<accession>\_dl`): each object and the
   units whose claims keep it, partial transfers, lock holders, unclaimed
   objects, and live claims of units whose raw data are already released.
+- `msdial_list_remote_archive`: read-only listing of a remote zip archive's
+  members (path, size, CRC32, compression) from its central directory alone,
+  over HTTP Range requests, before anything is downloaded. It groups
+  byte-identical files (same CRC32 and size), records the URL, each request,
+  the bytes fetched, ETag, Last-Modified and the directory's SHA-256, and
+  refuses a server without Range support (`range_not_supported`) or a listing
+  beyond `max_bytes` (default 512 KiB) without reading more. A sign-in or
+  landing page served instead is `not_an_archive_response` (an access problem;
+  do not fall back to a full download), a listing past its 120 s deadline
+  is `timeout`, and a redirect to anything but http or https is
+  `unsupported_redirect` (not followed; a redirect's body is never read).
 - `msdial_restore_project_for_viewing`: preview with `confirmed=false`, then,
   after the user approves, make a finalised campaign unit's MS-DIAL project
   openable for viewing: its retained containers are copied back to the paths

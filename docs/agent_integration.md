@@ -284,6 +284,7 @@ User worksets are stored in the per-user MS-DIAL Interactive data directory.
 - `msdial_cleanup_repository_raw`
 - `msdial_discard_repository_raw`
 - `msdial_download_store_status` (read-only)
+- `msdial_list_remote_archive` (read-only; Range requests for a zip's central directory only)
 - `msdial_restore_project_for_viewing` / `msdial_undo_project_restore` (preview by default; changes require `confirmed=true`)
 - `msdial_list_worksets`
 - `msdial_download_official_library`

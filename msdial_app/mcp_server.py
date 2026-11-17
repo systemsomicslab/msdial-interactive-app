@@ -2988,6 +2988,86 @@ def msdial_download_store_status(
     )
 
 
+@_mcp_tool()
+@_structured_validation_errors
+def msdial_list_remote_archive(
+    url: str,
+    max_bytes: int = 512 * 1024,
+    timeout_seconds: float = 30.0,
+    expected_size_bytes: int | None = None,
+    member_limit: int = 1000,
+    output_path: str = "",
+) -> dict[str, Any]:
+    """List a remote zip archive's members from its central directory, over HTTP Range requests. Read-only.
+
+    Nothing is downloaded beyond the archive's tail and its central directory, and nothing is written unless
+    ``output_path`` names a new .json file for the full listing. Each member carries its path, size,
+    compressed size, CRC32, compression and timestamp; byte-identical files (same CRC32 and size) are
+    grouped in ``identical_content_groups``. The provenance records the URL, every request with its range,
+    status and bytes, the total fetched, the archive's size, ETag and Last-Modified, and the SHA-256 of the
+    central directory bytes.
+
+    Refused, with ``ok: false`` and a ``reason``: a server that does not answer Range requests with 206
+    (``range_not_supported``, its body unread), a sign-in, landing or error page answered in the archive's
+    place (``not_an_archive_response``: an access problem, not missing range support), a listing that would
+    fetch more than ``max_bytes`` (``byte_cap_exceeded``; default 512 KiB, at most 16 MiB), an archive that
+    changed between requests (``changed_during_listing``), a file that is not a zip (``not_a_zip``), a split
+    zip (``multi_disk``), a malformed directory, a timeout (``timeout_seconds`` per socket operation, and 120 s
+    for the whole listing, enforced while headers and bodies arrive), any URL that is not http or https
+    (``unsupported_url``), and a redirect to any other scheme (``unsupported_redirect``, not followed). A
+    redirect's body is never read; each hop is recorded with its status, target and declared length.
+    ``expected_size_bytes`` (a size the repository or the Catalog declared, an integer or a whole-number float)
+    adds a warning when the served archive differs. ``member_limit``
+    bounds the members in this reply; the counts, groups and ``output_path`` cover all of them.
+    """
+    from .remote_archive import RemoteArchiveError, identical_content_groups, list_remote_zip
+
+    destination: Path | None = None
+    if str(output_path or "").strip():
+        destination = Path(str(output_path)).expanduser()
+        if not destination.is_absolute() or destination.suffix.lower() != ".json":
+            raise ValueError("output_path must be an absolute path to a .json file.")
+        if destination.exists():
+            raise ValueError(f"output_path already exists and is not overwritten: {destination}")
+        if not destination.parent.is_dir():
+            raise ValueError(f"The folder of output_path does not exist: {destination.parent}")
+    try:
+        limit = int(member_limit)
+    except (TypeError, ValueError):
+        raise ValueError(f"member_limit must be a whole number, not {member_limit!r}.")
+    if limit < 0:
+        raise ValueError("member_limit must be 0 or more.")
+    try:
+        listing = list_remote_zip(
+            url,
+            max_bytes=max_bytes,
+            timeout_seconds=timeout_seconds,
+            expected_size_bytes=expected_size_bytes,
+        )
+    except RemoteArchiveError as error:
+        return error.as_result()
+    listing["identical_content_groups"] = identical_content_groups(listing["members"])
+    if destination is not None:
+        temporary = destination.with_name(destination.name + ".partial")
+        temporary.write_text(json.dumps(listing, indent=1, ensure_ascii=False), encoding="utf-8")
+        temporary.replace(destination)
+        listing["output_path"] = str(destination)
+    members = listing["members"]
+    if len(members) > limit:
+        listing["members"] = members[:limit]
+        listing["members_truncated"] = True
+        listing["members_in_reply"] = limit
+        listing["members_note"] = (
+            f"{len(members):,} members, the first {limit:,} shown. "
+            + (
+                f"The full listing is in {destination}."
+                if destination is not None
+                else "Give output_path to keep the full listing, or call list_remote_zip in process."
+            )
+        )
+    return listing
+
+
 def _existing_manifest(manifest_path: str) -> Path:
     path = Path(str(manifest_path or "")).expanduser()
     if not str(manifest_path or "").strip() or not path.is_absolute() or not path.is_file():
