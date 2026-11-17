@@ -563,57 +563,97 @@ def decision_record(
 # at the copy of a sidecar. Everything else in the copy must be the original's.
 HANDOFF_COPY_REWRITTEN_KEYS = ("file_manifest_path", "sample_table_path", "analysis_input_manifest_path")
 
-# The ratification a campaign runner writes onto the Class proposal before it takes its handoff (WS0 decision A,
-# 2026-11-17): the runner's _state_pending saves the approved proposal under the current campaign approval, and the
-# Catalog's handoff embeds the proposal with that ratification (msdial_repository_catalog ratification_record, the
-# class_proposal row's ratified_by column). These, and only these, may differ between the triaged handoff and the copy
-# the runner passes; every other key of class_proposal and of its ratification (kind, authorization_schema, boundary,
-# proposal_id, abstention, the assignments, the contrast) is compared. ratified_by is the row column holding the
-# ratification's approval_id; authorization_sha256 is the hash of that approval's authorization file. Paths are
-# (key, ...) under the handoff's class_proposal.
-HANDOFF_RATIFICATION_KEYS: tuple[tuple[str, ...], ...] = (
-    ("ratified_by",),
-    ("ratification", "approval_id"),
-    ("ratification", "manifest_digest"),
-    ("ratification", "authorization_sha256"),
-    ("ratification", "campaign_id"),
-    ("ratification", "ratified_at"),
-)
+# What of a handoff the Class decides, and so what the triage does not bind (WS0 decision F, 2026-11-17, superseding
+# decision A's ratification-only scope). The triage runs before any Class is saved: it reads the Catalog's rows, files
+# and listing, never the Class, so the handoff it names normally carries no Class, or an unratified one, and the
+# campaign saves and ratifies the Class afterwards. The triage binds the evidence it read; the Class binds through its
+# own ratification (the Catalog's, which the runner writes under the campaign approval and checks against the approved
+# class digest). So between the triaged handoff and the copy the runner passes, these are left out, exactly as
+# msdial_repository_catalog's msdial_catalog_reanalysis_handoff derives them (4ffa0ff):
+#
+# - "keys": the whole class_proposal object (the proposal, its assignments, contrast, status, ratification and
+#   ratified_by).
+# - "blocking_reason_codes": the blocking_reasons codes the builder adds from the Class alone (no proposal; a proposal
+#   saved for another unit; a proposal not accepted). blocking_reasons is compared with only these codes removed: any
+#   other code (technical_metadata:*, analysis_input:*) appearing or disappearing is still a difference.
+# - "readiness_keys": next_action and ready_for_download_planning, which the builder derives from blocking_reasons,
+#   required_review, analysis_input_issues and whether a proposal exists. They are left out only where the remaining
+#   (non-Class) blocking_reasons are equal on both sides; otherwise they are compared like any key.
+#
+# Everything else is compared: the files, the sample rows, the technical settings, the sidecars' contents, the unit and
+# accession, every other top-level key. msdial-public-reanalysis's scripts/campaign/curated.py holds the same value
+# (its integration test compares the two).
+HANDOFF_CLASS_KEYS: dict[str, tuple[str, ...]] = {
+    "keys": ("class_proposal",),
+    "blocking_reason_codes": ("class_proposal:missing", "class_proposal:not_accepted", "class_proposal:other_unit"),
+    "readiness_keys": ("next_action", "ready_for_download_planning"),
+}
 
 
-def _without_ratification(proposal: Any) -> tuple[Any, dict[str, Any]]:
-    """The class_proposal value with HANDOFF_RATIFICATION_KEYS removed, and those keys' values by dotted path.
+def handoff_class_split(blocking_reasons: Any) -> tuple[Any, list[str]]:
+    """blocking_reasons without the Class-derived codes (HANDOFF_CLASS_KEYS), and those codes in their order.
 
-    Only a key present is removed, so a proposal and an unratified one still differ in the ratification's other keys
-    (kind, boundary, proposal_id...): exclusion covers a re-ratification, never a ratification appearing or vanishing.
+    A value that is not a list is returned as it is, with no Class code: it is compared whole."""
+    if not isinstance(blocking_reasons, list):
+        return blocking_reasons, []
+    codes = set(HANDOFF_CLASS_KEYS["blocking_reason_codes"])
+    return ([item for item in blocking_reasons if str(item) not in codes],
+            [str(item) for item in blocking_reasons if str(item) in codes])
+
+
+def handoff_differing_keys(original: Mapping[str, Any], copy: Mapping[str, Any]) -> tuple[list[str], dict[str, Any]]:
+    """The top-level keys in which ``copy`` is not ``original`` as a triage binds it, and the Class record.
+
+    Every key but HANDOFF_COPY_REWRITTEN_KEYS and HANDOFF_CLASS_KEYS["keys"] is compared as canonical JSON;
+    blocking_reasons without the Class-derived codes; the readiness keys only where those remaining blocking_reasons
+    differ. The record is {excluded_keys, excluded_blocking_reason_codes, readiness_keys, readiness_left_out,
+    original, copy (each {class_proposal, class_blocking_reasons, and the readiness keys' values}), differs (whether
+    the two class_proposal values differ)}. Pure; the sidecars are verify_handoff_copy's.
     """
-    if not isinstance(proposal, Mapping):
-        return proposal, {}
-    from copy import deepcopy
+    left_out = set(HANDOFF_COPY_REWRITTEN_KEYS) | set(HANDOFF_CLASS_KEYS["keys"])
+    readiness = HANDOFF_CLASS_KEYS["readiness_keys"]
+    original_rest, original_codes = handoff_class_split(original.get("blocking_reasons"))
+    copy_rest, copy_codes = handoff_class_split(copy.get("blocking_reasons"))
+    readiness_left_out = canonical_json(original_rest) == canonical_json(copy_rest)
+    differing: list[str] = []
+    for key in sorted((set(original) | set(copy)) - left_out):
+        if key in readiness and readiness_left_out:
+            continue
+        if key == "blocking_reasons":
+            same = readiness_left_out
+        else:
+            same = canonical_json(original.get(key)) == canonical_json(copy.get(key))
+        if not same:
+            differing.append(key)
 
-    stripped = deepcopy(dict(proposal))
-    removed: dict[str, Any] = {}
-    for path in HANDOFF_RATIFICATION_KEYS:
-        holder: Any = stripped
-        for part in path[:-1]:
-            holder = holder.get(part) if isinstance(holder, dict) else None
-        if isinstance(holder, dict) and path[-1] in holder:
-            removed[".".join(path)] = holder.pop(path[-1])
-    return stripped, removed
+    def side(handoff: Mapping[str, Any], codes: list[str]) -> dict[str, Any]:
+        return {"class_proposal": handoff.get("class_proposal"), "class_blocking_reasons": codes,
+                **{key: handoff.get(key) for key in readiness}}
+
+    record = {
+        "excluded_keys": list(HANDOFF_CLASS_KEYS["keys"]),
+        "excluded_blocking_reason_codes": list(HANDOFF_CLASS_KEYS["blocking_reason_codes"]),
+        "readiness_keys": list(readiness),
+        "readiness_left_out": readiness_left_out,
+        "original": side(original, original_codes),
+        "copy": side(copy, copy_codes),
+        "differs": canonical_json(original.get("class_proposal")) != canonical_json(copy.get("class_proposal")),
+    }
+    return differing, record
 
 
 def verify_handoff_copy(original_path: str | Path, copy: Mapping[str, Any]) -> dict[str, Any]:
     """Bind a rewritten handoff copy to the Catalog original it was copied from. Raises CuratedSelectionError.
 
     The original is read by path and hashed (its sha256 is what a triage names); the copy must hold the same value
-    for every key but HANDOFF_COPY_REWRITTEN_KEYS (compared as canonical JSON): the sample rows, the files with their
-    URLs, sizes and checksums, the technical settings, the unit and accession. class_proposal is compared without the
-    ratification fields HANDOFF_RATIFICATION_KEYS names (a campaign runner re-ratifies the approved proposal under its
-    own approval before it takes the handoff); their values on each side are returned, not compared. The sidecars the
+    for every key but HANDOFF_COPY_REWRITTEN_KEYS and what HANDOFF_CLASS_KEYS leaves to the Class (compared as
+    canonical JSON; handoff_differing_keys): the sample rows, the files with their URLs, sizes and checksums, the
+    technical settings, the unit and accession, every non-Class blocking reason. The Class is not the triage's to bind
+    (WS0 decision F): it binds through its own ratification, and the copy's Class is the one the run uses, held by the
+    copy's own blocking_reasons as any handoff's is. Both sides' Class are returned, not compared. The sidecars the
     rewritten keys name (the external file manifest, sample table and input manifest a large handoff carries its rows
     in) must exist on both sides and hold the same JSON value: a copy pointing at other rows is no copy. Returns
-    {sha256, name, compared_keys, sidecars (each side's sha256), ratification {excluded_keys, original, copy,
-    differs}}.
+    {sha256, name, compared_keys, sidecars (each side's sha256), class (handoff_differing_keys's record)}.
     """
     location = Path(str(original_path)).expanduser()
     try:
@@ -625,31 +665,18 @@ def verify_handoff_copy(original_path: str | Path, copy: Mapping[str, Any]) -> d
         ) from error
     if not isinstance(original, dict):
         raise CuratedSelectionError(CURATED_SELECTION_HANDOFF_MISMATCH, "The original handoff is not one JSON object.")
-    keys = sorted((set(original) | set(copy)) - set(HANDOFF_COPY_REWRITTEN_KEYS))
-    original_proposal, original_ratification = _without_ratification(original.get("class_proposal"))
-    copy_proposal, copy_ratification = _without_ratification(copy.get("class_proposal"))
-
-    def compared(side: Mapping[str, Any], proposal: Any, key: str) -> str:
-        return canonical_json(proposal if key == "class_proposal" else side.get(key))
-
-    differing = [
-        key for key in keys
-        if compared(original, original_proposal, key) != compared(copy, copy_proposal, key)
-    ]
+    keys = sorted((set(original) | set(copy)) - set(HANDOFF_COPY_REWRITTEN_KEYS) - set(HANDOFF_CLASS_KEYS["keys"]))
+    differing, class_record = handoff_differing_keys(original, copy)
     if differing:
         raise CuratedSelectionError(
             CURATED_SELECTION_HANDOFF_MISMATCH,
             f"The handoff passed is not a copy of the Catalog's original {location.name}: it differs in "
-            f"{', '.join(differing[:20])}. Only {', '.join(HANDOFF_COPY_REWRITTEN_KEYS)} may be rewritten, and of "
-            f"class_proposal only its ratification ({', '.join('.'.join(path) for path in HANDOFF_RATIFICATION_KEYS)}).",
+            f"{', '.join(differing[:20])}. Only {', '.join(HANDOFF_COPY_REWRITTEN_KEYS)} may be rewritten, and only "
+            f"the Class may change ({', '.join(HANDOFF_CLASS_KEYS['keys'])}; the blocking_reasons codes "
+            f"{', '.join(HANDOFF_CLASS_KEYS['blocking_reason_codes'])}; "
+            f"{' and '.join(HANDOFF_CLASS_KEYS['readiness_keys'])} where no other blocking reason changed).",
             differing_keys=differing[:50],
         )
-    ratification = {
-        "excluded_keys": [".".join(("class_proposal", *path)) for path in HANDOFF_RATIFICATION_KEYS],
-        "original": original_ratification,
-        "copy": copy_ratification,
-        "differs": canonical_json(original_ratification) != canonical_json(copy_ratification),
-    }
 
     def sidecar(value: Any) -> tuple[str | None, bytes | None]:
         text = str(value or "").strip()
@@ -678,7 +705,7 @@ def verify_handoff_copy(original_path: str | Path, copy: Mapping[str, Any]) -> d
             )
         sidecars[key] = {"original_sha256": original_sha, "copy_sha256": copy_sha}
     return {"sha256": sha256_bytes(data), "name": location.name, "compared_keys": keys, "sidecars": sidecars,
-            "ratification": ratification}
+            "class": class_record}
 
 
 def campaign_selection(authorization_path: str | Path | None, unit_key: str) -> dict[str, Any] | None:

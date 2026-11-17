@@ -50,16 +50,23 @@ them as a set, and a person approves the campaign manifest digest that carries t
   the plan is tied to the one the triage names: `handoff_file`, the file passed is it;
   `original_read_and_copy_compared`, the triaged original was read, by `original_handoff_path` or from the decision
   record's `catalog_handoff` input (`original_handoff.source`), and the copy holds its every value but the rewritten
-  sidecar paths, sidecar contents included, and the Class proposal's campaign ratification). The ratification a
-  campaign runner writes when it saves the approved proposal under its own approval, before it takes the handoff, is
-  the one thing of `class_proposal` that may differ: exactly `class_proposal.ratified_by` and
-  `class_proposal.ratification.{approval_id, manifest_digest, authorization_sha256, campaign_id, ratified_at}`
-  (`curated_selection.HANDOFF_RATIFICATION_KEYS`). Both sides' values are recorded in
-  `original_handoff.ratification` {excluded_keys, original, copy, differs}; every other key of the proposal and of
-  its ratification (kind, boundary, proposal_id, abstention, assignments, contrast) is compared, so a ratification
-  that appears where the triaged handoff had none is still a difference. An `original_handoff_sha256` asserted for a copy whose bytes differ, with
-  no original to compare, is refused (`curated_selection_handoff_mismatch`): a handoff whose bytes changed is a hold,
-  never a silent pass. Then `decided_by` (agent, model, skill, skill version) and
+  sidecar paths, sidecar contents included, and what the Class decides). The triage runs before any Class is saved
+  and never reads it, so the handoff it names normally has no Class or an unratified one, and the campaign saves and
+  ratifies the Class afterwards: the triage binds the evidence it read, and the Class binds through its own
+  ratification and the runner's class-digest check (WS0 decision F, which supersedes decision A's
+  ratification-only exclusion). Left out of the comparison, exactly as the Catalog's handoff builder derives them from
+  the Class (`curated_selection.HANDOFF_CLASS_KEYS`, which the runner holds identically): the whole `class_proposal`
+  (proposal, assignments, contrast, status, ratification, ratified_by); the `blocking_reasons` codes
+  `class_proposal:missing`, `class_proposal:not_accepted` and `class_proposal:other_unit`, `blocking_reasons` being
+  compared with only those removed, so any other code appearing or disappearing is still a difference; and
+  `next_action` and `ready_for_download_planning`, only where the remaining blocking reasons are equal. The files,
+  the sample rows, the technical settings, the sidecars, the unit and every other key are compared. Both sides'
+  Class is recorded in `original_handoff.class` {excluded_keys, excluded_blocking_reason_codes, readiness_keys,
+  readiness_left_out, original, copy (each the class_proposal, its Class blocking codes and the readiness values),
+  differs}. The run uses the copy's Class, which its own `blocking_reasons` hold as any handoff's do (a Class
+  missing or not accepted stays a blocking reason of the download). An `original_handoff_sha256` asserted for a copy
+  whose bytes differ, with no original to compare, is refused (`curated_selection_handoff_mismatch`): a handoff whose
+  bytes changed is a hold, never a silent pass. Then `decided_by` (agent, model, skill, skill version) and
   `decided_at` as the triage records them, `validator` as the caller passes it, `approval_id` and `manifest_digest`
   where an approval covers it, `selection_sha256` in `msdial-selection-canonical.v1` (the normative definition of
   msdial-public-reanalysis#59 docs/llm-assisted-curation.md section 3.1, implemented as

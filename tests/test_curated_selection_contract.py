@@ -332,12 +332,12 @@ def _ratification(approval: str, campaign: str, digest: str, authorization: str,
     }
 
 
-def _catalog_proposal(ratification: dict | None) -> dict:
+def _catalog_proposal(ratification: dict | None, status: str = "accepted") -> dict:
     """A Class proposal as msdial_repository_catalog Catalog.get_class_proposal returns it into a handoff: the row's
     columns, the ratified_by column and the ratification record, and the assignments ordered by sample_id."""
     return {
         "proposal_id": "class-syn-0001", "unit_id": "AN-SYN-POS", "purpose": "Compare group A with group B.",
-        "rationale": "Group is the declared factor.", "model": "", "prompt_hash": "", "status": "accepted",
+        "rationale": "Group is the declared factor.", "model": "", "prompt_hash": "", "status": status,
         "created_at": "2026-11-16T01:00:00+00:00",
         "ratified_by": (ratification or {}).get("approval_id", ""),
         "selected_fields": ["Group"],
@@ -352,18 +352,44 @@ def _catalog_proposal(ratification: dict | None) -> dict:
     }
 
 
-class ARatifiedHandoffCopyIsTheTriagedOne(_Recorded):
-    """WS0 decision A (2026-11-17), against a handoff of the Catalog's shape: the triage names the handoff as the
-    Catalog wrote it under campaign A's ratification; the runner re-ratifies the approved proposal under campaign B,
-    takes the handoff again and copies it with its sidecars. Only the ratification may differ, and both sides of it
-    are recorded."""
+# msdial_repository_catalog msdial_catalog_reanalysis_handoff (4ffa0ff): next_action's three values.
+NEXT_INPUTS = "The sample table and the file listing disagree about the analysis inputs; see analysis_input_issues."
+NEXT_PASS = "Pass this handoff to MS-DIAL Interactive for bounded download planning."
+NEXT_RESOLVE = "Resolve required technical metadata and confirm a Class proposal first."
+RATIFIED_A = _ratification("appr-A", "campaign-a", "1", "2", "2026-11-16T02:00:00+00:00")
+RATIFIED_B = _ratification("appr-B", "campaign-b", "3", "4", "2026-11-17T03:00:00+00:00")
+# The Class states a triaged handoff, or the one a campaign takes, can carry: none saved; confirmed by a person in
+# conversation (boundary 3, accepted, no ratification); saved but not accepted; ratified under a campaign.
+NO_CLASS = "none"
+CONFIRMED_UNRATIFIED = "confirmed"
+NOT_ACCEPTED = "proposed"
 
-    RATIFIED_A = _ratification("appr-A", "campaign-a", "1", "2", "2026-11-16T02:00:00+00:00")
-    RATIFIED_B = _ratification("appr-B", "campaign-b", "3", "4", "2026-11-17T03:00:00+00:00")
 
-    def catalog_handoff(self, folder: str, ratification: dict | None, rows: list | None = None) -> tuple[dict, Path]:
-        """The handoff file with its three sidecars at absolute paths, as the Catalog (or a runner's copy) writes."""
-        handoff = _handoff(unit_id=self.UNIT, ion_mode="Positive", class_proposal=_catalog_proposal(ratification))
+def _class_state(state) -> tuple[dict | None, list[str]]:
+    """The class_proposal and the Class-derived blocking_reasons codes the Catalog's builder gives for a state."""
+    if state == NO_CLASS:
+        return None, ["class_proposal:missing"]
+    if state == CONFIRMED_UNRATIFIED:
+        return _catalog_proposal(None), []
+    if state == NOT_ACCEPTED:
+        return _catalog_proposal(None, status="proposed"), ["class_proposal:not_accepted"]
+    return _catalog_proposal(json.loads(json.dumps(state))), []
+
+
+class TheTriageBindsTheEvidenceAndTheClassBindsByRatification(_Recorded):
+    """WS0 decision F (2026-11-17, superseding decision A's scope), against handoffs of the Catalog's shape: the triage
+    runs before any Class is saved and binds the evidence it read; the campaign then saves and ratifies the Class and
+    takes the handoff again. The Class, its blocking codes and (where nothing else blocks differently) the readiness
+    the Catalog derives from it are left out of the copy check and recorded on both sides; everything else is
+    compared."""
+
+    def catalog_handoff(self, folder: str, state, *, rows: list | None = None, other_blocks: list[str] = (),
+                        name: str | None = None) -> tuple[dict, Path]:
+        """The handoff file with its three sidecars at absolute paths, as the Catalog (or a runner's copy) writes,
+        with class_proposal, blocking_reasons, ready_for_download_planning and next_action as the builder derives
+        them for the Class state and the other (non-Class) blocking codes."""
+        proposal, class_blocks = _class_state(state)
+        handoff = _handoff(unit_id=self.UNIT, ion_mode="Positive", class_proposal=proposal)
         samples = rows if rows is not None else handoff["sample_metadata"]
         sidecars = {
             "file_manifest_path": self.write(f"{folder}/{self.UNIT}.files.json", handoff["files"]),
@@ -372,78 +398,168 @@ class ARatifiedHandoffCopyIsTheTriagedOne(_Recorded):
         }
         handoff.update({key: str(path) for key, path in sidecars.items()})
         handoff["unit_attributes"] = {"Group": ["A", "B", "QC"]}
-        return handoff, self.write(f"{folder}/{self.UNIT}.json", handoff)
+        technical = [code for code in other_blocks if code.startswith("technical_metadata:")]
+        blocking = [*technical, *class_blocks, *(code for code in other_blocks if code not in technical)]
+        handoff["required_review"] = [code.split(":", 1)[1] for code in technical]
+        handoff["blocking_reasons"] = blocking
+        handoff["ready_for_download_planning"] = not blocking
+        handoff["next_action"] = (
+            NEXT_INPUTS if any(code.startswith("analysis_input:") for code in other_blocks)
+            else NEXT_PASS if not technical and proposal is not None else NEXT_RESOLVE
+        )
+        return handoff, self.write(f"{folder}/{name or self.UNIT}.json", handoff)
 
-    def setUp(self) -> None:
-        super().setUp()
-        self.handoff, self.handoff_path = self.catalog_handoff("catalog/handoffs", self.RATIFIED_A)
+    def triaged(self, state, **options) -> Path:
+        self.handoff, self.handoff_path = self.catalog_handoff("catalog/handoffs", state, **options)
         self.handoff_sha = _sha(self.handoff_path)
         self.triage = _triage(self.handoff_sha, [0, 1, 2], unit_id=self.UNIT)
+        return self.triage_dir()
 
-    def test_a_copy_reratified_under_another_campaign_is_verified_and_both_ratifications_recorded(self) -> None:
-        triage_path = self.triage_dir()
-        copy, copy_path = self.catalog_handoff("campaign/handoffs", self.RATIFIED_B)
-        self.assertNotEqual(self.handoff_sha, _sha(copy_path))
-        for options in ({"original_handoff_sha256": self.handoff_sha},
-                        {"original_handoff_sha256": self.handoff_sha, "original_handoff_path": str(self.handoff_path)}):
-            with self.subTest(**{key: bool(value) for key, value in options.items()}):
-                record, _curated = self.applied(triage_path, copy, copy_path, **options)
-                self.assertEqual("original_read_and_copy_compared", record["catalog_handoff_verification"])
-                ratification = record["original_handoff"]["ratification"]
-                self.assertEqual(
-                    ["class_proposal.ratified_by", "class_proposal.ratification.approval_id",
-                     "class_proposal.ratification.manifest_digest", "class_proposal.ratification.authorization_sha256",
-                     "class_proposal.ratification.campaign_id", "class_proposal.ratification.ratified_at"],
-                    ratification["excluded_keys"],
-                )
-                self.assertTrue(ratification["differs"])
-                self.assertEqual("appr-A", ratification["original"]["ratified_by"])
-                self.assertEqual("appr-B", ratification["copy"]["ratification.approval_id"])
-                self.assertEqual("campaign-b", ratification["copy"]["ratification.campaign_id"])
-                self.assertEqual(sorted(cs.HANDOFF_COPY_REWRITTEN_KEYS),
-                                 sorted(record["original_handoff"]["sidecars"]))
+    def test_the_excluded_set_is_exactly_what_the_catalog_derives_from_the_class(self) -> None:
+        self.assertEqual(
+            {"keys": ("class_proposal",),
+             "blocking_reason_codes": ("class_proposal:missing", "class_proposal:not_accepted",
+                                       "class_proposal:other_unit"),
+             "readiness_keys": ("next_action", "ready_for_download_planning")},
+            cs.HANDOFF_CLASS_KEYS,
+        )
+        self.assertFalse(hasattr(cs, "HANDOFF_RATIFICATION_KEYS"))
 
-    def test_everything_else_of_the_proposal_and_its_ratification_is_still_compared(self) -> None:
-        triage_path = self.triage_dir()
-        changes = {
-            "the assignments": lambda proposal: proposal["assignments"][0].update(class_label="B"),
-            "the contrast": lambda proposal: proposal["contrast_definition"].update(groups=["A", "QC"]),
-            "the status": lambda proposal: proposal.update(status="proposed"),
-            "the ratified proposal id": lambda proposal: proposal["ratification"].update(proposal_id="class-other"),
-            "the ratification's kind": lambda proposal: proposal["ratification"].update(boundary=4),
-            "an added ratification key": lambda proposal: proposal["ratification"].update(note="x"),
+    def test_the_three_probe_cases_pass_and_both_sides_class_is_recorded(self) -> None:
+        cases = {
+            "re-ratification (triaged under campaign A, run under B)": RATIFIED_A,
+            "triaged with no Class saved, then ratified": NO_CLASS,
+            "Class confirmed by a person but unratified, then ratified": CONFIRMED_UNRATIFIED,
         }
-        for label, change in changes.items():
+        for label, state in cases.items():
+            triage_path = self.triaged(state)
+            copy, copy_path = self.catalog_handoff("campaign/handoffs", RATIFIED_B)
+            self.assertNotEqual(self.handoff_sha, _sha(copy_path))
+            for options in ({"original_handoff_sha256": self.handoff_sha},
+                            {"original_handoff_sha256": self.handoff_sha,
+                             "original_handoff_path": str(self.handoff_path)}):
+                with self.subTest(label, path=bool(options.get("original_handoff_path"))):
+                    curated = self.context(triage_path, copy, copy_path, **options)
+                    project, _workspace = mcp_server._project_from_analysis_unit_handoff(
+                        copy, curated_selection=curated)
+                    record = project["repository_metadata"]["curated_selection"]
+                    self.assertEqual("original_read_and_copy_compared", record["catalog_handoff_verification"])
+                    self.assertNotIn("ratification", record["original_handoff"])
+                    recorded = record["original_handoff"]["class"]
+                    self.assertTrue(recorded["differs"])
+                    self.assertTrue(recorded["readiness_left_out"])
+                    self.assertEqual(["class_proposal"], recorded["excluded_keys"])
+                    self.assertEqual(list(cs.HANDOFF_CLASS_KEYS["blocking_reason_codes"]),
+                                     recorded["excluded_blocking_reason_codes"])
+                    self.assertEqual(self.handoff["class_proposal"], recorded["original"]["class_proposal"])
+                    self.assertEqual(copy["class_proposal"], recorded["copy"]["class_proposal"])
+                    self.assertEqual(self.handoff["blocking_reasons"], recorded["original"]["class_blocking_reasons"])
+                    self.assertEqual({"class_proposal": copy["class_proposal"], "class_blocking_reasons": [],
+                                      "next_action": NEXT_PASS, "ready_for_download_planning": True},
+                                     recorded["copy"])
+                    self.assertEqual(sorted(cs.HANDOFF_COPY_REWRITTEN_KEYS),
+                                     sorted(record["original_handoff"]["sidecars"]))
+                    # The run uses the copy's Class, the ratified one, and nothing holds the unit.
+                    self.assertEqual("appr-B", project["class_proposal"]["ratification"]["approval_id"])
+                    self.assertEqual([], project["blocking_reasons"])
+                    self.assertEqual([], project["pending_decisions"])
+
+    def test_an_unratified_copys_class_still_holds_the_unit_at_run_time(self) -> None:
+        triage_path = self.triaged(NO_CLASS)
+        for state, code in ((NO_CLASS, "class_proposal:missing"), (NOT_ACCEPTED, "class_proposal:not_accepted")):
+            with self.subTest(state=state):
+                copy, copy_path = self.catalog_handoff("campaign/handoffs", state, name=f"{self.UNIT}-{state}")
+                curated = self.context(triage_path, copy, copy_path, original_handoff_sha256=self.handoff_sha)
+                project, _workspace = mcp_server._project_from_analysis_unit_handoff(copy, curated_selection=curated)
+                self.assertEqual([code], project["blocking_reasons"])
+                self.assertIn(code, mcp_server._repository_download_blockers(
+                    project, {"confirmed": True, "pending_decisions": []}, 0, 1, False))
+
+    def test_a_class_change_is_recorded_not_compared(self) -> None:
+        triage_path = self.triaged(RATIFIED_A)
+        copy, copy_path = self.catalog_handoff("campaign/handoffs", RATIFIED_B)
+        copy["class_proposal"]["contrast_definition"] = {"kind": "declared_factor", "groups": ["A", "QC"]}
+        copy_path = self.write("campaign/handoffs/changed.json", copy)
+        record, _curated = self.applied(triage_path, copy, copy_path, original_handoff_sha256=self.handoff_sha)
+        recorded = record["original_handoff"]["class"]
+        self.assertEqual(["A", "B"], recorded["original"]["class_proposal"]["contrast_definition"]["groups"])
+        self.assertEqual(["A", "QC"], recorded["copy"]["class_proposal"]["contrast_definition"]["groups"])
+
+    def refused_copy(self, triage_path: Path, copy: dict) -> cs.CuratedSelectionError:
+        copy_path = self.write("campaign/handoffs/changed.json", copy)
+        return self.refuses(cs.CURATED_SELECTION_HANDOFF_MISMATCH, self.applied, triage_path, copy, copy_path,
+                            original_handoff_sha256=self.handoff_sha)
+
+    def test_the_evidence_is_still_bound(self) -> None:
+        triage_path = self.triaged(NO_CLASS)
+        changes = {
+            "the file list": (lambda handoff: handoff["files"][0].update(size_bytes=1), ["files"]),
+            "a sample row": (lambda handoff: handoff["sample_metadata"][1]["attributes"].update(Group="C"),
+                             ["sample_metadata"]),
+            "the unit id": (lambda handoff: handoff.update(analysis_unit_id="AN-SYN-OTHER"), ["analysis_unit_id"]),
+            "the technical settings": (lambda handoff: handoff["technical_settings"].update(ion_mode="Negative"),
+                                       ["technical_settings"]),
+            "another top-level key": (lambda handoff: handoff.update(warnings=["added"]), ["warnings"]),
+        }
+        for label, (change, expected) in changes.items():
             with self.subTest(label):
-                copy, copy_path = self.catalog_handoff("campaign/handoffs", json.loads(json.dumps(self.RATIFIED_B)))
-                change(copy["class_proposal"])
-                copy_path = self.write("campaign/handoffs/changed.json", copy)
-                error = self.refuses(cs.CURATED_SELECTION_HANDOFF_MISMATCH, self.applied, triage_path, copy, copy_path,
-                                     original_handoff_sha256=self.handoff_sha)
-                self.assertEqual(["class_proposal"], error.detail["differing_keys"])
+                copy, _copy_path = self.catalog_handoff("campaign/handoffs", RATIFIED_B)
+                change(copy)
+                self.assertEqual(expected, self.refused_copy(triage_path, copy).detail["differing_keys"])
 
-    def test_a_ratification_appearing_where_the_triaged_handoff_had_none_is_a_difference(self) -> None:
-        self.handoff, self.handoff_path = self.catalog_handoff("catalog/handoffs", None)
-        self.handoff_sha = _sha(self.handoff_path)
-        self.triage = _triage(self.handoff_sha, [0, 1, 2], unit_id=self.UNIT)
-        triage_path = self.triage_dir()
-        copy, copy_path = self.catalog_handoff("campaign/handoffs", self.RATIFIED_B)
-        error = self.refuses(cs.CURATED_SELECTION_HANDOFF_MISMATCH, self.applied, triage_path, copy, copy_path,
-                             original_handoff_sha256=self.handoff_sha)
-        self.assertEqual(["class_proposal"], error.detail["differing_keys"])
-
-    def test_the_sidecar_rows_and_the_other_keys_are_still_bound(self) -> None:
-        triage_path = self.triage_dir()
-        copy, copy_path = self.catalog_handoff("campaign/handoffs", self.RATIFIED_B, rows=[{"sample_id": "other"}])
+    def test_a_changed_sidecar_is_still_refused(self) -> None:
+        triage_path = self.triaged(NO_CLASS)
+        copy, copy_path = self.catalog_handoff("campaign/handoffs", RATIFIED_B, rows=[{"sample_id": "other"}])
         error = self.refuses(cs.CURATED_SELECTION_HANDOFF_MISMATCH, self.applied, triage_path, copy, copy_path,
                              original_handoff_sha256=self.handoff_sha)
         self.assertEqual("sample_table_path", error.detail["sidecar"])
-        copy, copy_path = self.catalog_handoff("campaign/handoffs", self.RATIFIED_B)
-        copy["unit_attributes"] = {"Group": ["A"]}
-        copy_path = self.write("campaign/handoffs/changed.json", copy)
+        copy, copy_path = self.catalog_handoff("campaign/handoffs", RATIFIED_B)
+        Path(copy["file_manifest_path"]).write_text("[]", encoding="utf-8")
         error = self.refuses(cs.CURATED_SELECTION_HANDOFF_MISMATCH, self.applied, triage_path, copy, copy_path,
                              original_handoff_sha256=self.handoff_sha)
-        self.assertEqual(["unit_attributes"], error.detail["differing_keys"])
+        self.assertEqual("file_manifest_path", error.detail["sidecar"])
+
+    def test_a_non_class_blocking_code_is_a_difference_and_then_readiness_counts(self) -> None:
+        # A technical code appearing: the readiness the builder derives is the same, so blocking_reasons alone differs.
+        triage_path = self.triaged(NO_CLASS)
+        copy, _copy_path = self.catalog_handoff("campaign/handoffs", RATIFIED_B,
+                                                other_blocks=["technical_metadata:ion_mode"])
+        self.assertEqual(["blocking_reasons", "required_review"],
+                         self.refused_copy(triage_path, copy).detail["differing_keys"])
+        # An input code disappearing: the remaining codes differ, so next_action and readiness are compared as well.
+        triage_path = self.triaged(NO_CLASS, other_blocks=["analysis_input:count_mismatch"])
+        copy, _copy_path = self.catalog_handoff("campaign/handoffs", RATIFIED_B)
+        self.assertEqual(["blocking_reasons", "next_action", "ready_for_download_planning"],
+                         self.refused_copy(triage_path, copy).detail["differing_keys"])
+        # A Class-looking code the Catalog does not derive from the Class is no exception.
+        triage_path = self.triaged(RATIFIED_A)
+        copy, _copy_path = self.catalog_handoff("campaign/handoffs", RATIFIED_B)
+        copy["blocking_reasons"] = ["class_proposal:withdrawn"]
+        self.assertEqual(["blocking_reasons"], self.refused_copy(triage_path, copy).detail["differing_keys"])
+
+    def test_readiness_beside_equal_other_codes_is_the_classs_and_is_recorded(self) -> None:
+        # With the non-Class codes equal on both sides, next_action and ready_for_download_planning are what the Class
+        # decides: left out, and both sides recorded.
+        triage_path = self.triaged(RATIFIED_A)
+        copy, copy_path = self.catalog_handoff("campaign/handoffs", RATIFIED_B)
+        copy["next_action"] = "Something else."
+        copy_path = self.write("campaign/handoffs/changed.json", copy)
+        record, _curated = self.applied(triage_path, copy, copy_path, original_handoff_sha256=self.handoff_sha)
+        self.assertEqual("Something else.", record["original_handoff"]["class"]["copy"]["next_action"])
+        self.assertEqual(NEXT_PASS, record["original_handoff"]["class"]["original"]["next_action"])
+
+    def test_the_comparison_is_pure_and_names_each_rule(self) -> None:
+        base = {"analysis_unit_id": "AN-1", "blocking_reasons": ["technical_metadata:ion_mode", "class_proposal:missing"],
+                "next_action": NEXT_RESOLVE, "ready_for_download_planning": False, "class_proposal": None}
+        same = dict(base, blocking_reasons=["technical_metadata:ion_mode"], class_proposal={"status": "accepted"})
+        self.assertEqual([], cs.handoff_differing_keys(base, same)[0])
+        self.assertEqual((["technical_metadata:ion_mode"], ["class_proposal:missing"]),
+                         cs.handoff_class_split(base["blocking_reasons"]))
+        self.assertEqual(("x", []), cs.handoff_class_split("x"))
+        missing = {key: value for key, value in base.items() if key != "blocking_reasons"}
+        self.assertEqual(["blocking_reasons", "next_action", "ready_for_download_planning"],
+                         cs.handoff_differing_keys(base, dict(missing, ready_for_download_planning=True,
+                                                              next_action=NEXT_PASS))[0])
 
 
 class AWorkspaceUnitKeyKeepsEarlierRuns(_Files):

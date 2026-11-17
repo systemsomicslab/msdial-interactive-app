@@ -1226,10 +1226,11 @@ def _curated_selection_context(
     THE HANDOFF is tied to the triage's catalog_handoff_sha256: the handoff file read here is it; or
     ``original_handoff_path`` names the triaged original; or ``original_handoff_sha256`` is asserted for a copy and the
     decision record's catalog_handoff input holds those bytes. In the last two the original is hashed (it must be the
-    triaged sha256) and the copy must hold its every value but the rewritten sidecar paths and the Class proposal's
-    campaign ratification (curated_selection.verify_handoff_copy, HANDOFF_RATIFICATION_KEYS; both sides' ratification
-    is recorded in original_handoff.ratification). An asserted sha256 for a copy whose bytes differ, with no original to
-    compare it with, is refused (curated_selection_handoff_mismatch). Where the campaign approval names its manifest,
+    triaged sha256) and the copy must hold its every value but the rewritten sidecar paths and what the Class decides
+    (curated_selection.verify_handoff_copy, HANDOFF_CLASS_KEYS, WS0 decision F: the triage binds the evidence it read,
+    the Class binds through its own ratification; both sides' Class is recorded in original_handoff.class, and the
+    copy's own blocking_reasons hold the unit as any handoff's do). An asserted sha256 for a copy whose bytes differ,
+    with no original to compare it with, is refused (curated_selection_handoff_mismatch). Where the campaign approval names its manifest,
     the manifest's entry for the unit (``<unit_id>`` or ``<unit_id>-<child_key>``) must carry this triage's sha256,
     the record's where it names one, and the selection_sha256 where it names one.
     """
@@ -1893,7 +1894,8 @@ def msdial_repository_reanalysis_plan(
     ``original_handoff_sha256`` is the triaged handoff's sha256 (the triage's catalog_handoff_sha256) where the
     handoff passed is a rewritten copy: the copy is then compared with the triaged bytes, read by
     ``original_handoff_path`` or from the decision record's catalog_handoff input (every value but the rewritten
-    sidecar paths must match; recorded as original_read_and_copy_compared). A copy whose bytes differ with no
+    sidecar paths and what the Class decides must match, curated_selection.HANDOFF_CLASS_KEYS; recorded as
+    original_read_and_copy_compared, both sides' Class in original_handoff.class). A copy whose bytes differ with no
     original to compare is refused. ``curated_selection_validator`` is what the caller's validate-triage.py run said
     ({script_sha256, verdict, ...}), recorded as given. A triage that does not hold returns its refusal code
     (curated_selection_*), retryable false.
