@@ -6792,6 +6792,13 @@ def preflight_progress_state(manifest: dict[str, Any], now: datetime | None = No
     }
 
 
+def _polarity_split_child(manifest: dict[str, Any]) -> bool:
+    """Whether the unit is a polarity_split child of a curated selection (curated_selection.polarity_split_of)."""
+    from .curated_selection import curated_block
+
+    return isinstance((curated_block(manifest) or {}).get("polarity_split"), dict)
+
+
 def _per_input_entries(
     per_file: list[dict[str, Any]], outcomes: dict[str, dict[str, Any]], inputs: list[Path]
 ) -> list[dict[str, Any]]:
@@ -6961,7 +6968,11 @@ def _record_preflight(
         # label to be wrong for some of the files. "Unknown" still leaves it alone: no header spoke.
         if summary["acquisition_mode"] != "Unknown":
             project.acquisition_mode = summary["acquisition_mode"]
-        if summary["ion_mode"] != "Unknown":
+        if summary["ion_mode"] != "Unknown" and not (
+            summary["ion_mode"] == "Both" and _polarity_split_child(current)
+        ):
+            # A polarity_split child (0.5.70) reads its own polarity's scans of files that hold both: the headers'
+            # Both is what the split was made for, and the child's ion mode stays its own.
             project.ion_mode = summary["ion_mode"]
         if confirm_untargeted:
             project.untargeted = True
