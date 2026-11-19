@@ -74,7 +74,8 @@ CURATED_SELECTION_EMPTY = "curated_selection_empty"
 CURATED_SELECTION_CLASS_CONTRAST_LOST = "curated_selection_class_contrast_lost"
 CURATED_SELECTION_SELECTION_MISMATCH = "curated_selection_selection_mismatch"
 # A polarity_split object that is not {ion_mode, sibling_ion_mode (the opposite), reason polarity_switching,
-# parent_unit_id (the triage's unit)} with ion_mode equal to unit_technical.ion_mode (0.5.70).
+# parent_unit_id (the triage's unit)} with ion_mode equal to unit_technical.ion_mode (0.5.70), or whose optional
+# partner_unit_id is neither null nor another Catalog unit's id (0.5.71).
 CURATED_SELECTION_POLARITY_SPLIT_INVALID = "curated_selection_polarity_split_invalid"
 # After the preflight: the raw headers say otherwise than the triage. A hold for a person, never a rerun.
 TRIAGE_HEADER_DISAGREEMENT = "triage_header_disagreement"
@@ -798,6 +799,12 @@ def polarity_split_of(triage: Mapping[str, Any]) -> dict[str, str] | None:
     The contract (0.5.70): {"ion_mode": "positive" | "negative", "reason": "polarity_switching", "parent_unit_id": the
     Catalog unit id (the triage's unit_id), "sibling_ion_mode": the opposite of ion_mode}, and unit_technical.ion_mode
     equal to ion_mode. Values are compared case-insensitively and returned lower-case.
+
+    Optionally (0.5.71) "partner_unit_id": the Catalog unit that runs the same polarity-switching files at the other
+    polarity, or null where that unit is absent or left out. A repository may register a positive and a negative
+    analysis over one set of switching files as two Catalog units; each then runs once, at its own polarity, and names
+    the other as its partner. A string other than the triage's own unit id, or null; returned as given (stripped) when
+    present, and absent from the result when the key is.
     """
     if "polarity_split" not in triage or triage.get("polarity_split") is None:
         return None
@@ -825,13 +832,21 @@ def polarity_split_of(triage: Mapping[str, Any]) -> dict[str, str] | None:
         problems.append(f"parent_unit_id {value.get('parent_unit_id')!r} is not the triage's unit {unit_id!r}")
     if ion in _OPPOSITE_POLARITY and unit_ion != ion:
         problems.append(f"unit_technical.ion_mode {technical.get('ion_mode')!r} is not the split's {ion}")
+    partnered = "partner_unit_id" in value
+    partner = value.get("partner_unit_id")
+    if partnered and partner is not None:
+        if not isinstance(partner, str) or not partner.strip():
+            problems.append(f"partner_unit_id {partner!r} is neither null nor a Catalog unit id")
+        elif partner.strip() == unit_id:
+            problems.append(f"partner_unit_id {partner!r} is the triage's own unit; the partner is another unit")
     if problems:
         raise CuratedSelectionError(
             CURATED_SELECTION_POLARITY_SPLIT_INVALID,
             f"The polarity_split of the curated selection of {unit_id} does not hold: " + "; ".join(problems) + ".",
             problems=problems,
         )
-    return {"ion_mode": ion, "sibling_ion_mode": sibling, "reason": reason, "parent_unit_id": parent}
+    return {"ion_mode": ion, "sibling_ion_mode": sibling, "reason": reason, "parent_unit_id": parent,
+            **({"partner_unit_id": partner.strip() if isinstance(partner, str) else None} if partnered else {})}
 
 
 def run_key(unit_id: str, triage: Mapping[str, Any], child_key: str = "") -> str:
@@ -1968,13 +1983,21 @@ def _unit_view(
 
 
 def polarity_split_siblings(a: Mapping[str, Any], b: Mapping[str, Any]) -> bool:
-    """Whether two units are the two polarity_split children of one Catalog unit (0.5.70): the same files, read once as
-    Positive and once as Negative by the author's decision, so neither holds the other's files."""
+    """Whether two units are the two polarity_split children of one Catalog unit (0.5.70), or two partner units
+    (0.5.71): two Catalog units of opposite polarities whose polarity_split names each other as partner_unit_id. Either
+    way the same files, read once as Positive and once as Negative by the author's decision, so neither holds the
+    other's files."""
     one, other = a.get("polarity_split"), b.get("polarity_split")
     if not (isinstance(one, dict) and isinstance(other, dict)):
         return False
+    mine, theirs = str(one.get("parent_unit_id") or ""), str(other.get("parent_unit_id") or "")
+    partners = (
+        mine != "" and theirs != "" and mine != theirs
+        and str(one.get("partner_unit_id") or "") == theirs
+        and str(other.get("partner_unit_id") or "") == mine
+    )
     return (
-        str(one.get("parent_unit_id") or "") == str(other.get("parent_unit_id") or "") != ""
+        (mine == theirs != "" or partners)
         and str(one.get("ion_mode") or "") == str(other.get("sibling_ion_mode") or "")
         and str(other.get("ion_mode") or "") == str(one.get("sibling_ion_mode") or "")
         and str(one.get("ion_mode") or "") != str(other.get("ion_mode") or "")
@@ -2034,8 +2057,9 @@ def cross_unit_attribution(manifests: list[Mapping[str, Any]], labels: list[str]
     - D: of the units left, every unit whose Sample inputs are identical to an earlier unit's, as files or as listed
       content, is refused; the earlier keeps them.
 
-    The two polarity_split children of one Catalog unit (polarity_split_siblings) hold the same files by decision,
-    so neither P's shared-file refusal nor D applies between them (0.5.70).
+    The two polarity_split children of one Catalog unit, and two partner units naming each other
+    (polarity_split_siblings), hold the same files by decision, so neither P's shared-file refusal nor D applies
+    between them (0.5.70, partners 0.5.71).
 
     Every refusal is recorded with retryable false: the same manifests give the same verdict.
     """
