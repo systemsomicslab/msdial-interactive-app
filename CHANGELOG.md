@@ -4,6 +4,67 @@ Notable changes to MS-DIAL Interactive. The package version is kept in
 `pyproject.toml` and `msdial_app/__init__.py`; the Agent API version is separate.
 Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
 
+## [0.5.70] - Unreleased
+
+Two shapes of curated selection the stage 4 campaign meets, held by Interactive. Built from origin/main (0.5.69).
+
+### Added
+- **A selection that keeps no Catalog row and keeps added members runs on those members** (`msdial_app.curated_selection`).
+  23 units of Metabolomics Workbench ST004700-ST004811 have only MS1-only Catalog rows (all samples ran full MS with
+  polarity switching); the MS/MS is in pooled DDA runs that are archive members no row names (for example
+  `Rahman_m24-L176-UnlPool-NegMSMS-original-1.mzML` in `ST004805_mzml.zip`). Such a triage is no longer refused as
+  `curated_selection_empty`:
+  - each added member (the child's, by its member_paths, where a child is named) is one analysis input, declared by its
+    member path (`selected_by: curated_selection`, `triage_row_index: null`, `triage_added_member: true`), and one
+    sample row (sample id: its stem; `sample_type` QC, Blank or Sample from its `role`; `other` and `unknown` are read
+    by name as any row is), in member order, so the analytical order is the names' or the headers' as for any row that
+    declares none;
+  - the Class is the run's one label for every member: the abstention's (`All`), or the one label the proposal assigns;
+    a proposal of two or more levels keeps no side here and is refused (`curated_selection_class_contrast_lost`);
+  - `repository_metadata.curated_selection` records `admitted_from: added_members_only`, `added_members_admitted` (each
+    with role, file type, polarity, acquisition, basis) and their count; the header reconciliation, the lineage tags and
+    the cross-unit check read them as they read kept rows. The coverage gate, the lease's exact path match and
+    `selection_sha256` (which already counted added members) are unchanged.
+  - A selection that keeps neither rows nor added members is still `curated_selection_empty`; added members beside kept
+    rows are still recorded under `added_members_not_admitted` and not admitted, as in 0.5.69.
+- **Polarity-split children** (author's decision of 2026-11-19: a unit whose every file was acquired with polarity
+  switching is analysed twice, once as a Positive and once as a Negative MS-DIAL project, since MS-DIAL 5 LC-MS reads only
+  the scans whose polarity is the project's IonMode). A triage may carry
+  `"polarity_split": {"ion_mode": "positive" | "negative", "reason": "polarity_switching", "parent_unit_id": <the
+  triage's unit_id>, "sibling_ion_mode": <the opposite>}`, with `unit_technical.ion_mode` equal to its `ion_mode`.
+  - A malformed object (not an object, an ion mode other than positive or negative, a sibling that is not the opposite,
+    another reason, another parent, or `unit_technical.ion_mode` that differs) is refused before download with
+    `curated_selection_polarity_split_invalid` (`retryable: false`, `refusal.problems` lists each).
+  - The run is keyed `<unit_id>-pos` or `<unit_id>-neg` (`curated_selection.run_key`; a `curated_selection_child_key`
+    still wins): its `analysis_unit_id`, the campaign manifest entry and coverage it is checked against, its store
+    claims and its batch row. The two siblings never share one, and each takes the `workspace_unit_key` its caller gives.
+  - The project's ion mode is the child's whatever the Catalog handoff declared (Positive, Negative, Mixed or Both);
+    `curated_selection.polarity_split` records both (`run_ion_mode`, `handoff_declared_ion_mode`). Kept rows may state
+    `switching` or `both` as well as the child's polarity; a row of the other polarity alone is still refused.
+  - At the preflight, a header of both polarities (PolaritySwitching, MixedFunctions) is the child's polarity
+    (assignment `polarity_source: polarity_split`, `header_polarity`, `polarity_scan_basis: whole_file_header`), and
+    agrees with the triage; a header of the other polarity alone is refused for that child
+    (`polarity_split_no_scans_of_child_polarity`, an out-of-scope file reason) and is no triage disagreement. The
+    disposition records `polarity_split` (the split, `switching_inputs`, `refused_inputs`, `scan_basis`). The headers'
+    summary `Both` no longer replaces the child's ion mode on the project.
+  - The cross-unit check does not refuse the two siblings of one parent for holding the same files (rule P's shared-file
+    refusal and rule D), and a sibling's view leaves out a file it refuses for want of its polarity.
+
+### Changed
+- `_curated_unit_key` and the campaign entry lookup of `_curated_selection_context` use `curated_selection.run_key`.
+
+### Known limitations
+- The raw-metadata extractor records one polarity, one acquisition and one set of MS levels per file
+  (RawMetadataInference.SetPolarity says only that both polarities occur). A switching file's MS1 and product-ion scans,
+  and its DDA or DIA verdict, are therefore the whole file's, not checked per polarity (`whole_file_header`, on record).
+  A file with both polarities whose MS/MS was acquired in one polarity only runs in both children.
+- Interactive never deletes raw data on its own: `msdial_cleanup_repository_raw` and `msdial_discard_repository_raw`
+  delete a unit's own workspace raw tree when called, and release only its own store claims, now keyed per child. The
+  campaign runner deletes shared raw once both siblings are done, through its claims.
+- `selection_sha256` (msdial-selection-canonical.v1) has no polarity: the two siblings' selections hash alike; their
+  triage sha256 differ by the `polarity_split` object.
+- 0.5.69's limitation on added members is lifted only for a selection that keeps no Catalog row.
+
 ## [0.5.69] - Unreleased
 
 Agent-based triage before download, held by Interactive. Campaign stage3b was stopped on 2026-11-15 after multi-unit

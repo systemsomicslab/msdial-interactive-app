@@ -1244,6 +1244,17 @@ POLARITY_SOURCE_FILE_NAME = "file_name"
 UNTARGETED_FROM_DECLARED_ACQUISITION = "untargeted_inferred_from_declared_acquisition"
 UNTARGETED_DECLARED_MODES = frozenset({"DDA", "DIA", "AIF", "SWATH"})
 POLARITY_FROM_FILE_NAME_WARNING = "polarity_inferred_from_file_name"
+# POLARITY-SPLIT CHILDREN (0.5.70; author's decision of 2026-11-19). A unit whose files were each acquired with polarity
+# switching is analysed twice, once per polarity: two curated selections over the same files, each carrying
+# polarity_split (curated_selection.polarity_split_of). In such a child a header of both polarities (PolaritySwitching,
+# MixedFunctions) is the child's polarity, since MS-DIAL 5 reads only the scans whose polarity is the project's ion
+# mode, and a header of the other polarity alone is refused for this child: the file has no scans to read.
+POLARITY_SPLIT_NO_SCANS = "polarity_split_no_scans_of_child_polarity"
+POLARITY_SOURCE_POLARITY_SPLIT = "polarity_split"
+# The extractor records one polarity, one acquisition and one set of MS levels per file
+# (RawMetadataInference.SetPolarity says only that both polarities occur), so a switching file's MS1 and product-ion
+# scans, and its acquisition, are the whole file's, not its polarity's: recorded on each such assignment.
+POLARITY_SPLIT_SCAN_BASIS = "whole_file_header"
 _SEPARATION_NAMES = {
     "LiquidChromatography": "LC-MS",
     "GasChromatography": "GC-MS",
@@ -1256,6 +1267,7 @@ _OUT_OF_SCOPE_FILE_REASONS = (
     VENDOR_COMPANION_MISSING,
     "acquisition_out_of_scope:",
     "polarity_switching",
+    POLARITY_SPLIT_NO_SCANS,
     "conversion_required",
     "ms1_only_beside_dia",
     MS1_ONLY_IN_DECLARED_DIA_UNIT,
@@ -1306,6 +1318,14 @@ def declared_technical(project: Mapping[str, Any] | None) -> dict[str, Any]:
         "separation": str(project.get("separation") or "Unknown"),
         "untargeted": untargeted if isinstance(untargeted, bool) else None,
     }
+
+
+def _polarity_split(manifest: Mapping[str, Any]) -> dict[str, Any] | None:
+    """The curated selection's validated polarity_split the unit was planned with (0.5.70), or None."""
+    from .curated_selection import curated_block
+
+    split = (curated_block(manifest) or {}).get("polarity_split")
+    return dict(split) if isinstance(split, dict) else None
 
 
 def _is_out_of_scope(reason: str) -> bool:
@@ -1517,6 +1537,19 @@ def _decide_disposition_from_headers(
     if len(copied) > 5:
         detail.append(f"{len(copied) - 5} more declared archive(s) had copies left unused (declared_archive_inputs).")
 
+    def polarity_split_record() -> dict[str, Any]:
+        """What a polarity_split child's disposition records: the split, its inputs of both polarities run as the
+        child's, those refused for it, and the basis of their scan levels (POLARITY_SPLIT_SCAN_BASIS)."""
+        return {
+            **(_polarity_split(manifest) or {}),
+            "switching_inputs": sorted(
+                str(item["path"]) for item in assignments.values()
+                if item.get("polarity_source") == POLARITY_SOURCE_POLARITY_SPLIT
+            ),
+            "refused_inputs": sorted(str(item["path"]) for item in excluded if item["reason"] == POLARITY_SPLIT_NO_SCANS),
+            "scan_basis": POLARITY_SPLIT_SCAN_BASIS,
+        }
+
     def result(disposition: str, split_key: dict[str, Any] | None = None, **extra: Any) -> dict[str, Any]:
         settle_overrides(disposition)
         note_fallbacks_not_taken()
@@ -1540,6 +1573,7 @@ def _decide_disposition_from_headers(
             "declared_vs_header": disagreements[:50],
             "detail": detail,
             **({"polarity_inferences": polarity_inferences} if polarity_inferences else {}),
+            **({"polarity_split": polarity_split_record()} if _polarity_split(manifest) else {}),
             **({"untargeted_inference": dict(untargeted_inference)} if untargeted_inference else {}),
             **extra,
             "assignments": assignments,
@@ -1883,10 +1917,27 @@ def _decide_disposition_from_headers(
 
     groups: dict[tuple[str, str], list[str]] = {}
     polarity_warned = False
+    split = _polarity_split(manifest)
+    split_polarity = str((split or {}).get("ion_mode") or "").capitalize()
+    split_switching: list[str] = []
     for path, entry, console, basis in included:
         header_polarity = str(entry.get("polarity") or "").strip()
+        if header_polarity in _SWITCHING and split_polarity in _POLARITIES:
+            # A polarity_split child: the file's scans of the child's polarity are what MS-DIAL reads.
+            polarity = split_polarity
+            split_switching.append(path)
+            groups.setdefault((console, polarity), []).append(path)
+            assignments[file_key(path)] = {
+                "path": path, "console_acquisition_type": console, "polarity": polarity, "basis": basis,
+                "polarity_source": POLARITY_SOURCE_POLARITY_SPLIT, "header_polarity": header_polarity,
+                "polarity_scan_basis": POLARITY_SPLIT_SCAN_BASIS,
+            }
+            continue
         if header_polarity in _SWITCHING:
             exclude(path, "polarity_switching")
+            continue
+        if split_polarity in _POLARITIES and header_polarity in _POLARITIES and header_polarity != split_polarity:
+            exclude(path, POLARITY_SPLIT_NO_SCANS)
             continue
         if header_polarity in _POLARITIES:
             polarity = header_polarity
@@ -1933,6 +1984,17 @@ def _decide_disposition_from_headers(
             + f"), the unit declaring no single polarity: an inference, on record ({FILE_NAME_POLARITY_RULE})."
         )
 
+    split_refused = sum(1 for item in excluded if item["reason"] == POLARITY_SPLIT_NO_SCANS)
+    if split is not None:
+        detail.append(
+            f"A polarity_split child ({split_polarity}) of {split.get('parent_unit_id') or 'its Catalog unit'}: "
+            f"{len(split_switching)} input(s) record scans of both polarities and run as {split_polarity}, MS-DIAL "
+            "reading only that polarity's scans; their MS levels and acquisition are the whole file's header's "
+            f"({POLARITY_SPLIT_SCAN_BASIS})"
+            + (f"; {split_refused} input(s) record only the other polarity and are refused for this child "
+               f"({POLARITY_SPLIT_NO_SCANS})" if split_refused else "")
+            + "."
+        )
     switching = sum(1 for item in excluded if item["reason"] == "polarity_switching")
     unresolved_polarity = sum(1 for item in excluded if item["reason"] == "polarity_unresolved")
     if switching:

@@ -29,8 +29,18 @@ from the released triage without any model. Nothing here calls a model.
 
 WHAT IT NEVER DOES. It never chooses a file. It never widens a selection: a row the triage does not keep is not an
 input, and a kept row whose archive member is unresolved refuses the unit rather than falling back to names. Archive
-members no Catalog row names (``added_members``: a pooled QC, a blank) are recorded and not admitted in this version,
-since they have no sample row for the approved Class to assign.
+members no Catalog row names (``added_members``: a pooled QC, a blank) are recorded and not admitted beside kept rows,
+since they have no sample row for the approved Class to assign. A selection that keeps no Catalog row and keeps added
+members (0.5.70: Metabolomics Workbench ST004700-ST004811, where only the pooled DDA runs carry MS/MS and every Catalog
+row is MS1-only) runs on those members alone: each is one input and one sample row of its own, typed by its role, in
+the run's one Class (``All`` for an abstention).
+
+POLARITY-SPLIT CHILDREN (0.5.70). A triage's optional ``polarity_split`` (polarity_split_of) makes the selection one of
+two runs over the same files, each file acquired with polarity switching: the author's decision is that MS-DIAL 5
+reads only the scans whose polarity matches the project's ion mode, so each such file is analysed once as Positive and
+once as Negative. The run is keyed ``<unit_id>-pos`` or ``<unit_id>-neg`` (run_key), so the siblings never share a
+campaign entry, a store claim or a batch row; a switching header is that child's polarity at the preflight, and the
+cross-unit check does not refuse the siblings for holding the same files.
 """
 
 from __future__ import annotations
@@ -63,6 +73,9 @@ CURATED_SELECTION_MEMBER_UNRESOLVED = "curated_selection_member_unresolved"
 CURATED_SELECTION_EMPTY = "curated_selection_empty"
 CURATED_SELECTION_CLASS_CONTRAST_LOST = "curated_selection_class_contrast_lost"
 CURATED_SELECTION_SELECTION_MISMATCH = "curated_selection_selection_mismatch"
+# A polarity_split object that is not {ion_mode, sibling_ion_mode (the opposite), reason polarity_switching,
+# parent_unit_id (the triage's unit)} with ion_mode equal to unit_technical.ion_mode (0.5.70).
+CURATED_SELECTION_POLARITY_SPLIT_INVALID = "curated_selection_polarity_split_invalid"
 # After the preflight: the raw headers say otherwise than the triage. A hold for a person, never a rerun.
 TRIAGE_HEADER_DISAGREEMENT = "triage_header_disagreement"
 # After every sibling's preflight (cross_unit_attribution).
@@ -86,6 +99,7 @@ CURATED_SELECTION_REFUSALS = frozenset(
         CURATED_SELECTION_EMPTY,
         CURATED_SELECTION_CLASS_CONTRAST_LOST,
         CURATED_SELECTION_SELECTION_MISMATCH,
+        CURATED_SELECTION_POLARITY_SPLIT_INVALID,
     }
 )
 CROSS_UNIT_REFUSALS = frozenset(
@@ -109,6 +123,13 @@ _READ_OUTCOMES = {"ok", "reused"}
 # A triage row role that states nothing: only such a row is read by its file and sample names (_unit_view); any other
 # stated role decides by itself whether the input is a Sample input of the cross-unit check.
 _UNKNOWN_ROLES = {"unknown", ""}
+# polarity_split (0.5.70): the reasons a unit's files are analysed once per polarity, the opposite of each polarity,
+# and the run key's suffix for each (as a split part's polarity is keyed: raw_metadata_preflight's part_key).
+POLARITY_SPLIT_REASONS = ("polarity_switching",)
+_OPPOSITE_POLARITY = {"positive": "negative", "negative": "positive"}
+_POLARITY_SPLIT_SUFFIX = {"positive": "pos", "negative": "neg"}
+# An added member's role as the analysis CSV's file type, where it states one (the others are read by name).
+_ROLE_FILE_TYPE = {"qc": "QC", "blank": "Blank", "sample": "Sample"}
 
 
 class CuratedSelectionError(ValueError):
@@ -762,9 +783,140 @@ def _kept_rows(triage: Mapping[str, Any], child: Mapping[str, Any] | None) -> li
     return [row for row in rows if _member_key(row.get("member_path")) in members]
 
 
+def _kept_added_members(triage: Mapping[str, Any], child: Mapping[str, Any] | None) -> list[dict[str, Any]]:
+    """The triage's added members, or the child's where a child is named (by its member_paths, as its rows are)."""
+    added = [item for item in triage.get("added_members") or [] if isinstance(item, dict)]
+    if child is None:
+        return added
+    members = {_member_key(item) for item in child.get("member_paths") or []}
+    return [item for item in added if _member_key(item.get("member_path")) in members]
+
+
+def polarity_split_of(triage: Mapping[str, Any]) -> dict[str, str] | None:
+    """The triage's polarity_split, validated, or None where it has none. Raises CURATED_SELECTION_POLARITY_SPLIT_INVALID.
+
+    The contract (0.5.70): {"ion_mode": "positive" | "negative", "reason": "polarity_switching", "parent_unit_id": the
+    Catalog unit id (the triage's unit_id), "sibling_ion_mode": the opposite of ion_mode}, and unit_technical.ion_mode
+    equal to ion_mode. Values are compared case-insensitively and returned lower-case.
+    """
+    if "polarity_split" not in triage or triage.get("polarity_split") is None:
+        return None
+    value = triage.get("polarity_split")
+    unit_id = str(triage.get("unit_id") or "").strip()
+    if not isinstance(value, dict):
+        raise CuratedSelectionError(
+            CURATED_SELECTION_POLARITY_SPLIT_INVALID,
+            f"The curated selection of {unit_id} has a polarity_split that is not an object.",
+        )
+    ion = str(value.get("ion_mode") or "").strip().casefold()
+    sibling = str(value.get("sibling_ion_mode") or "").strip().casefold()
+    reason = str(value.get("reason") or "").strip().casefold()
+    parent = str(value.get("parent_unit_id") or "").strip()
+    technical = triage.get("unit_technical") if isinstance(triage.get("unit_technical"), dict) else {}
+    unit_ion = str(technical.get("ion_mode") or "").strip().casefold()
+    problems = []
+    if ion not in _OPPOSITE_POLARITY:
+        problems.append(f"ion_mode {value.get('ion_mode')!r} is not positive or negative")
+    elif sibling != _OPPOSITE_POLARITY[ion]:
+        problems.append(f"sibling_ion_mode {value.get('sibling_ion_mode')!r} is not the opposite of {ion}")
+    if reason not in POLARITY_SPLIT_REASONS:
+        problems.append(f"reason {value.get('reason')!r} is not one of {list(POLARITY_SPLIT_REASONS)}")
+    if not parent or parent != unit_id:
+        problems.append(f"parent_unit_id {value.get('parent_unit_id')!r} is not the triage's unit {unit_id!r}")
+    if ion in _OPPOSITE_POLARITY and unit_ion != ion:
+        problems.append(f"unit_technical.ion_mode {technical.get('ion_mode')!r} is not the split's {ion}")
+    if problems:
+        raise CuratedSelectionError(
+            CURATED_SELECTION_POLARITY_SPLIT_INVALID,
+            f"The polarity_split of the curated selection of {unit_id} does not hold: " + "; ".join(problems) + ".",
+            problems=problems,
+        )
+    return {"ion_mode": ion, "sibling_ion_mode": sibling, "reason": reason, "parent_unit_id": parent}
+
+
+def run_key(unit_id: str, triage: Mapping[str, Any], child_key: str = "") -> str:
+    """The campaign unit key of a run held to this triage: <unit_id>-<child_key> for a child, <unit_id>-pos or
+    <unit_id>-neg for a polarity_split child (the siblings over one set of files must not share a campaign entry, a
+    store claim or a batch row), else the Catalog unit id. Raises on a malformed polarity_split."""
+    unit_id = str(unit_id or "").strip()
+    child_key = str(child_key or "").strip()
+    if child_key:
+        return f"{unit_id}-{child_key}"
+    split = polarity_split_of(triage)
+    return f"{unit_id}-{_POLARITY_SPLIT_SUFFIX[split['ion_mode']]}" if split else unit_id
+
+
 def unit_key(triage: Mapping[str, Any], child_key: str = "") -> str:
-    unit_id = str(triage.get("unit_id") or "")
-    return f"{unit_id}-{child_key}" if child_key else unit_id
+    return run_key(str(triage.get("unit_id") or ""), triage, child_key)
+
+
+def _admitted_by_member(block: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
+    """{member key: what the selection said of it} for every input it admitted: its kept rows, and the added members
+    a selection without kept rows runs on (added_members_admitted, row_index null)."""
+    found = {_member_key(row.get("member_path")): row for row in block.get("added_members_admitted") or []
+             if isinstance(row, dict)}
+    found.update({_member_key(row.get("member_path")): row for row in block.get("rows_kept") or []
+                  if isinstance(row, dict)})
+    return found
+
+
+def _added_sample_ids(members: list[str]) -> list[str]:
+    """A sample id for each added member: its stem, or its path less the suffix where two members share a stem."""
+    stems = [PurePosixPath(member).stem for member in members]
+    counts: dict[str, int] = {}
+    for stem in stems:
+        counts[stem.casefold()] = counts.get(stem.casefold(), 0) + 1
+    return [
+        stem if counts[stem.casefold()] == 1 else str(PurePosixPath(member).with_suffix(""))
+        for stem, member in zip(stems, members)
+    ]
+
+
+def added_class_proposal(
+    proposal: Mapping[str, Any] | None, sample_ids: list[str], key: str, triage_sha256: str
+) -> dict[str, Any] | None:
+    """The run's Class for a selection that keeps no Catalog row and runs on added members: every member takes the
+    run's one label, the abstention's (``All``) or the one label the proposal assigns. A proposal of more than one label
+    has a contrast none of whose sides keeps a sample here, and is refused (CURATED_SELECTION_CLASS_CONTRAST_LOST)."""
+    if not proposal:
+        return None
+    from copy import deepcopy
+
+    cut = deepcopy(dict(proposal))
+    contrast = cut.get("contrast_definition") if isinstance(cut.get("contrast_definition"), dict) else {}
+    every = [item for item in cut.get("assignments") or [] if isinstance(item, dict)]
+    labels = sorted({str(item.get("class_label") or "").strip() for item in every} - {""})
+    if str(contrast.get("kind") or "") == "abstention":
+        label = str(contrast.get("class_label") or "").strip() or "All"
+    elif len(labels) == 1:
+        label = labels[0]
+    else:
+        raise CuratedSelectionError(
+            CURATED_SELECTION_CLASS_CONTRAST_LOST,
+            f"The curated selection of {key} keeps no Catalog row and runs on archive members no row names, so the "
+            f"approved Class proposal's {len(labels)} levels keep no sample on any side. A Class decided over the "
+            "added members is needed.",
+            levels_before=labels,
+            levels_after=[],
+        )
+    cut["assignments"] = [{"sample_id": sample_id, "class_label": label} for sample_id in sample_ids]
+    cut["curated_from"] = {
+        "analysis_unit_key": key,
+        "triage_sha256": triage_sha256,
+        "assignments_kept": 0,
+        "assignments_in_proposal": len(every),
+        "added_members_assigned": len(sample_ids),
+        "class_label": label,
+        "note": "The curated selection keeps no Catalog row; its samples are archive members no row names "
+        "(added_members), each in the run's one Class. No sample was regrouped.",
+    }
+    warnings = list(cut.get("warnings") or [])
+    warnings.append(
+        f"This run holds none of the {len(every)} samples the proposal assigned: the curated selection of {key} runs "
+        f"on {len(sample_ids)} archive member(s) no Catalog row names, each in Class {label}."
+    )
+    cut["warnings"] = warnings
+    return cut
 
 
 def _contrast_groups(proposal: Mapping[str, Any]) -> list[str]:
@@ -890,6 +1042,8 @@ def apply_curated_selection(
             f"The curated selection is for {triage.get('accession')}/{triage.get('unit_id')}, not the handoff's "
             f"{accession}/{unit_id}.",
         )
+    split = polarity_split_of(triage)
+    key = run_key(unit_id, triage, child_key)
     status = str(triage.get("status") or "")
     if status != "ready":
         raise CuratedSelectionError(
@@ -969,6 +1123,13 @@ def apply_curated_selection(
                 f"{[str(item.get('child_key')) for item in children] or 'none'}.",
             )
     ion = str((child or {}).get("ion_mode") or unit_ion).strip().casefold()
+    if split is not None and ion != split["ion_mode"]:
+        raise CuratedSelectionError(
+            CURATED_SELECTION_POLARITY_SPLIT_INVALID,
+            f"The curated selection of {key} is the {split['ion_mode']} polarity_split child, and its child "
+            f"{child_key!r} states ion mode {ion or 'none'}.",
+            problems=[f"child ion_mode {ion!r} is not the split's {split['ion_mode']}"],
+        )
     if ion in _MIXED_POLARITY:
         raise CuratedSelectionError(
             CURATED_SELECTION_MIXED_POLARITY,
@@ -979,21 +1140,33 @@ def apply_curated_selection(
             ion_mode=ion,
         )
     kept = _kept_rows(triage, child)
-    if not kept:
-        raise CuratedSelectionError(CURATED_SELECTION_EMPTY, f"The curated selection of {key} keeps no Catalog row.")
+    # ADDED MEMBERS ONLY WHERE NO CATALOG ROW IS KEPT (0.5.70). Beside kept rows they stay recorded and not admitted, as
+    # in 0.5.69; a selection whose every Catalog row is excluded (MS1-only samples beside pooled DDA runs that carry the
+    # MS/MS) runs on them.
+    added = [] if kept else _kept_added_members(triage, child)
+    if not kept and not added:
+        raise CuratedSelectionError(
+            CURATED_SELECTION_EMPTY, f"The curated selection of {key} keeps no Catalog row and no archive member."
+        )
     unresolved = [row["row_index"] for row in kept if not str(row.get("member_path") or "").strip()]
-    if unresolved:
+    unresolved_added = [index for index, item in enumerate(added) if not str(item.get("member_path") or "").strip()]
+    if unresolved or unresolved_added:
         raise CuratedSelectionError(
             CURATED_SELECTION_MEMBER_UNRESOLVED,
-            f"{len(unresolved)} kept row(s) of {key} name no archive member ({unresolved[:10]}); a row is held to its "
-            "member by path, never by name.",
+            f"{len(unresolved) + len(unresolved_added)} kept item(s) of {key} name no archive member "
+            f"({(unresolved or unresolved_added)[:10]}); an input is held to its member by path, never by name.",
             row_indices=unresolved[:50],
+            **({"added_member_positions": unresolved_added[:50]} if unresolved_added else {}),
         )
-    row_polarities = {str(row.get("ion_mode") or "").casefold() for row in kept} - {"unknown", ""}
-    if row_polarities - {ion} or row_polarities & {"both", "switching"}:
+    # A polarity_split child's files hold both polarities, so a row may state switching (or both) as well as its
+    # polarity; a row stating the other polarity alone is still refused.
+    allowed = {ion} | ({"both", "switching"} if split is not None else set())
+    row_polarities = {str(row.get("ion_mode") or "").casefold() for row in [*kept, *added]} - {"unknown", ""}
+    if row_polarities - allowed or (split is None and row_polarities & {"both", "switching"}):
         raise CuratedSelectionError(
             CURATED_SELECTION_MIXED_POLARITY,
-            f"The kept rows of {key} state polarities {sorted(row_polarities)} in a {ion} unit.",
+            f"The kept {'rows' if kept else 'members'} of {key} state polarities {sorted(row_polarities)} in a {ion} "
+            "unit.",
             row_polarities=sorted(row_polarities),
         )
 
@@ -1116,8 +1289,71 @@ def apply_curated_selection(
                     }
                 )
     rows_dropped.sort(key=lambda item: item["row_index"])
+    # The added members a selection without kept rows runs on: one input and one sample row each, in member order (the
+    # analytical order is then the names' or the headers', as for any row that declares none), typed by role.
+    added_admitted: list[dict[str, Any]] = []
+    ordered = sorted(added, key=lambda item: _member_key(item.get("member_path")))
+    members = [str(item["member_path"]).replace("\\", "/").strip("/") for item in ordered]
+    common = {
+        name: value
+        for name, value in dict(handoff.get("unit_attributes") or {}).items()
+        if not any(token in str(name).casefold() for token in ("type", "class", "group", "sample"))
+    }
+    for item, member, sample_id in zip(ordered, members, _added_sample_ids(members)):
+        role = str(item.get("role") or "").strip().casefold()
+        file_type = _ROLE_FILE_TYPE.get(role, "")
+        kept_samples.append(
+            {
+                "sample_id": sample_id,
+                "raw_file": PurePosixPath(member).name,
+                "values": {
+                    **common,
+                    **({"sample_type": file_type} if file_type else {}),
+                    "triage_role": role,
+                    "triage_added_member": member,
+                },
+            }
+        )
+        suffix = PurePosixPath(member).suffix.casefold()
+        analysis_inputs.append(
+            {
+                "path": member,
+                "kind": "file",
+                "sample_id": sample_id,
+                "archive": str(item.get("archive") or ""),
+                "requires_conversion": suffix == ".mzxml",
+                "conversion_target": "mzML" if suffix == ".mzxml" else "",
+                "selected_by": "curated_selection",
+                "triage_row_index": None,
+                "triage_added_member": True,
+            }
+        )
+        added_admitted.append(
+            {
+                "row_index": None,
+                "added_member": True,
+                "sample_id": sample_id,
+                "member_path": member,
+                "archive": str(item.get("archive") or ""),
+                "role": role,
+                "file_type": file_type or None,
+                "ion_mode": str((child or {}).get("ion_mode") or item.get("ion_mode") or ""),
+                "acquisition_mode": str((child or {}).get("acquisition_mode") or item.get("acquisition_mode") or ""),
+                "chromatography": str(item.get("chromatography") or ""),
+                "basis": str(item.get("basis") or ""),
+                **({"confidence": item["confidence"]} if item.get("confidence") is not None else {}),
+                **({"rationale": item["rationale"]} if item.get("rationale") else {}),
+            }
+        )
+    admitted_keys = {_member_key(item["member_path"]) for item in added_admitted}
     kept_ids = {str(sample.get("sample_id") or "").strip() for sample in kept_samples}
-    proposal = cut_class_proposal(handoff.get("class_proposal"), kept_ids, key, triage_sha256)
+    if kept:
+        proposal = cut_class_proposal(handoff.get("class_proposal"), kept_ids, key, triage_sha256)
+    else:
+        proposal = added_class_proposal(
+            handoff.get("class_proposal"), [item["sample_id"] for item in added_admitted], key, triage_sha256
+        )
+    declared_ion = str((handoff.get("technical_settings") or {}).get("ion_mode") or "")
     decided_by = triage.get("decided_by") if isinstance(triage.get("decided_by"), dict) else {}
     provenance: dict[str, Any] = {
         "schema": PROVENANCE_SCHEMA,
@@ -1151,6 +1387,11 @@ def apply_curated_selection(
         "rows_dropped": rows_dropped,
         "rows_kept_count": len(rows_kept),
         "rows_dropped_count": len(rows_dropped),
+        # rows: the inputs are the kept Catalog rows' members; added_members_only: no Catalog row is kept, and the
+        # inputs are the triage's added members (0.5.70).
+        "admitted_from": "rows" if kept else "added_members_only",
+        "added_members_admitted": added_admitted,
+        "added_members_admitted_count": len(added_admitted),
         "added_members_not_admitted": [
             {
                 "member_path": str(item.get("member_path") or ""),
@@ -1158,8 +1399,14 @@ def apply_curated_selection(
                 "role": str(item.get("role") or ""),
             }
             for item in triage.get("added_members") or []
-            if isinstance(item, dict)
+            if isinstance(item, dict) and _member_key(item.get("member_path")) not in admitted_keys
         ],
+        # A polarity_split child (0.5.70): the run's ion mode is the child's, whatever the Catalog handoff declared
+        # (Positive, Negative, Mixed or Both), and both are recorded.
+        "polarity_split": (
+            {**split, "run_ion_mode": _POLARITY[ion], "handoff_declared_ion_mode": declared_ion}
+            if split is not None else None
+        ),
         "flags": [dict(item) for item in triage.get("flags") or [] if isinstance(item, dict)],
         **({"rationale": triage["rationale"]} if triage.get("rationale") else {}),
         "standing": "accepted_decision" if approved else "model_inference",
@@ -1214,7 +1461,7 @@ def tag_curated_lineage(table: dict[str, Any], project: Any, data_root: Path) ->
     block = metadata.get("curated_selection") if isinstance(metadata, dict) else None
     if not isinstance(block, dict):
         return
-    by_member = {_member_key(row.get("member_path")): row for row in block.get("rows_kept") or []}
+    by_member = _admitted_by_member(block)
     for row in [*(table.get("rows") or []), *(table.get("excluded") or [])]:
         if not isinstance(row, dict):
             continue
@@ -1228,6 +1475,8 @@ def tag_curated_lineage(table: dict[str, Any], project: Any, data_root: Path) ->
             row["selected_by"] = "curated_selection"
             row["triage_row_index"] = kept.get("row_index")
             row["triage_member_path"] = kept.get("member_path")
+            if kept.get("added_member"):
+                row["triage_added_member"] = True
         else:
             row["selected_by"] = "curated_selection_unmatched"
 
@@ -1315,13 +1564,18 @@ def _acquisition_result(triage_value: str, header_value: str) -> str:
     return "agree" if header in _DIA_FAMILY else "disagree"
 
 
-def _polarity_result(triage_value: str, header_value: str) -> str:
+def _polarity_result(triage_value: str, header_value: str, split: bool = False) -> str:
+    """agree, disagree, unresolved or not_compared. In a polarity_split child (``split``) a header of both polarities
+    agrees (the child reads its own polarity's scans), and one of the other polarity alone is no_child_polarity_scans:
+    no disagreement with the triage, a file the disposition refuses for this child (POLARITY_SPLIT_NO_SCANS)."""
     triage = _POLARITY.get(str(triage_value or "").casefold(), "")
     header = str(header_value or "")
     if not triage:
         return "not_compared"
     if header in _HEADER_SWITCHING:
-        return "disagree"
+        return "agree" if split else "disagree"
+    if split and header in _HEADER_POLARITIES and header != triage:
+        return "no_child_polarity_scans"
     if header not in _HEADER_POLARITIES:
         return "unresolved"
     return "agree" if header == triage else "disagree"
@@ -1342,8 +1596,9 @@ def reconcile_curated_selection(manifest: Mapping[str, Any]) -> dict[str, Any] |
     preflight = manifest.get("raw_metadata_preflight") if isinstance(manifest.get("raw_metadata_preflight"), dict) else {}
     summary = preflight.get("summary") if isinstance(preflight.get("summary"), dict) else {}
     per_file = [item for item in summary.get("per_file") or [] if isinstance(item, dict) and item.get("file")]
-    by_member = {_member_key(row.get("member_path")): row for row in block.get("rows_kept") or []}
+    by_member = _admitted_by_member(block)
     applied = block.get("applied_technical") if isinstance(block.get("applied_technical"), dict) else {}
+    split = isinstance(block.get("polarity_split"), dict)
     data_root = str(manifest.get("input_directory") or "")
     raw_directory = _raw_directory(manifest)
     sources = _conversion_sources(manifest)
@@ -1374,7 +1629,7 @@ def reconcile_curated_selection(manifest: Mapping[str, Any]) -> dict[str, Any] |
         triage_acquisition, acquisition_basis = _triage_value(
             row.get("acquisition_mode"), applied.get("acquisition_mode"), _acquisition_comparable
         )
-        polarity = _polarity_result(triage_ion, entry.get("polarity")) if read else "not_read"
+        polarity = _polarity_result(triage_ion, entry.get("polarity"), split) if read else "not_read"
         acquisition = _acquisition_result(triage_acquisition, entry.get("acquisition_mode")) if read else "not_read"
         reasons = []
         if polarity == "disagree":
@@ -1654,7 +1909,9 @@ def _unit_view(
             chromatography = unit_chromatography(project_from_dict(dict(project)))
         except (TypeError, ValueError, KeyError):
             chromatography = ""
-    kept = {_member_key(row.get("member_path")): row for row in block.get("rows_kept") or []}
+    kept = _admitted_by_member(block)
+    split = block.get("polarity_split")
+    split_polarity = _POLARITY.get(str((split or {}).get("ion_mode") or "").casefold(), "") if isinstance(split, dict) else ""
     bases = {str(row.get("basis") or "") for row in kept.values()}
     preflight = manifest.get("raw_metadata_preflight") if isinstance(manifest.get("raw_metadata_preflight"), dict) else {}
     headers = {
@@ -1683,6 +1940,11 @@ def _unit_view(
               or (sample_id and (_coverage_file_type(sample_id) != "Sample" or shared_reference_name(sample_id)))):
             # Only a row whose role is unknown (or a lineage row no curated row names) is read by its names.
             continue
+        header = headers.get(_file_key(path), "")
+        if split_polarity and header in _HEADER_POLARITIES and header != split_polarity:
+            # A polarity_split child does not run a file with no scans of its polarity (the disposition refuses it
+            # there, POLARITY_SPLIT_NO_SCANS), so the file is not this child's to be compared.
+            continue
         identity, basis = _input_identity(row, data_root)
         inputs[identity] = {
             "path": relative,
@@ -1697,11 +1959,27 @@ def _unit_view(
         "accession": str(project.get("accession") or ""),
         "polarity": _polarity_of(manifest),
         "polarity_basis": "inferred" if bases == {"inferred"} else "declared",
+        "polarity_split": split if isinstance(split, dict) else None,
         "chromatography": chromatography,
         "acquisition_mode": str(project.get("acquisition_mode") or ""),
         "inputs": inputs,
         "contents": {item["content"]: identity for identity, item in inputs.items() if item["content"]},
     }
+
+
+def polarity_split_siblings(a: Mapping[str, Any], b: Mapping[str, Any]) -> bool:
+    """Whether two units are the two polarity_split children of one Catalog unit (0.5.70): the same files, read once as
+    Positive and once as Negative by the author's decision, so neither holds the other's files."""
+    one, other = a.get("polarity_split"), b.get("polarity_split")
+    if not (isinstance(one, dict) and isinstance(other, dict)):
+        return False
+    return (
+        str(one.get("parent_unit_id") or "") == str(other.get("parent_unit_id") or "") != ""
+        and str(one.get("ion_mode") or "") == str(other.get("sibling_ion_mode") or "")
+        and str(other.get("ion_mode") or "") == str(one.get("sibling_ion_mode") or "")
+        and str(one.get("ion_mode") or "") != str(other.get("ion_mode") or "")
+        and str(a.get("analysis_unit_id") or "") != str(b.get("analysis_unit_id") or "")
+    )
 
 
 def _overlap(a: dict[str, Any], b: dict[str, Any]) -> dict[str, Any]:
@@ -1755,6 +2033,9 @@ def cross_unit_attribution(manifests: list[Mapping[str, Any]], labels: list[str]
       Applied to every pair whatever P or C decided, so a third unit cannot escape it through a refused sibling.
     - D: of the units left, every unit whose Sample inputs are identical to an earlier unit's, as files or as listed
       content, is refused; the earlier keeps them.
+
+    The two polarity_split children of one Catalog unit (polarity_split_siblings) hold the same files by decision,
+    so neither P's shared-file refusal nor D applies between them (0.5.70).
 
     Every refusal is recorded with retryable false: the same manifests give the same verdict.
     """
@@ -1830,6 +2111,9 @@ def cross_unit_attribution(manifests: list[Mapping[str, Any]], labels: list[str]
     for position, a in enumerate(units):
         for b in units[position + 1:]:
             if not (a["polarity"] and b["polarity"] and a["polarity"] != b["polarity"]):
+                continue
+            if polarity_split_siblings(a, b):
+                # One set of polarity-switching files, read once per polarity: the decision of 2026-11-19.
                 continue
             found = _overlap(a, b)
             if not found["shared"] or any(
@@ -1945,7 +2229,7 @@ def cross_unit_attribution(manifests: list[Mapping[str, Any]], labels: list[str]
         basis = ""
         for a in units[:position]:
             # Only a unit still standing keeps a set: one P or C refused keeps nothing for D to protect.
-            if not a["inputs"] or not standing(a):
+            if not a["inputs"] or not standing(a) or polarity_split_siblings(a, b):
                 continue
             if set(a["inputs"]) == set(b["inputs"]):
                 first, basis = a, "identity"

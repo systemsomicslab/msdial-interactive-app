@@ -428,6 +428,10 @@ For an accession-to-mzTab-M workflow, prefer the higher-level repository tools:
   gives `selection_sha256` (msdial-selection-canonical.v1) its crc32 and size.
   `workspace_unit_key` gives a reopened unit a folder of its own. A triage that does not
   hold returns its `curated_selection_*` code with `retryable: false`, before any download.
+  0.5.70: a triage keeping no Catalog row runs on its `added_members` (typed by role, in
+  the run's one Class); a triage with `polarity_split` ({ion_mode, reason
+  polarity_switching, parent_unit_id, sibling_ion_mode}) runs as `<unit_id>-pos` or
+  `<unit_id>-neg`, reading the switching files' scans of its own polarity.
 - `msdial_repository_cross_unit_check`: after every sibling unit's preflight, compare
   their Sample inputs and refuse a polarity contradiction, a set shared across
   chromatographies, a set mostly inside another at one polarity and chromatography,

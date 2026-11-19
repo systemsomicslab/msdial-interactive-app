@@ -616,6 +616,30 @@ with the Catalog unit id.
 A batch plan names both children of a Both unit with a list under its Catalog
 unit id in `curated_selection_paths`.
 
+A triage that keeps no Catalog row but keeps `added_members` (0.5.70: pooled DDA
+runs beside MS1-only sample rows, as in ST004700-ST004811) runs on those members:
+one input and one sample row each, typed QC, Blank or Sample by its `role`, all in
+the run's one Class (`All` for an abstention). Beside kept rows, added members
+are still recorded and not admitted. A triage keeping neither is refused
+(`curated_selection_empty`).
+
+A unit whose files were each acquired with polarity switching is analysed twice
+(0.5.70): two triage files over the same files, each with
+`"polarity_split": {"ion_mode": "positive" | "negative", "reason":
+"polarity_switching", "parent_unit_id": <unit_id>, "sibling_ion_mode": <the
+opposite>}` and `unit_technical.ion_mode` equal to its `ion_mode`. Each runs as
+its own unit, `<unit_id>-pos` or `<unit_id>-neg` (the key its campaign manifest
+entry, coverage and store claims use), with the child's ion mode whatever the
+handoff declared. At the preflight a header of both polarities is the child's
+polarity (MS-DIAL reads only that polarity's scans), and a header of the other
+polarity alone is refused for that child
+(`polarity_split_no_scans_of_child_polarity`); without `polarity_split` a
+switching file is still excluded. The cross-unit check lets the two siblings hold
+the same files. A malformed object is refused as
+`curated_selection_polarity_split_invalid`. Interactive deletes no raw data on its
+own; each sibling's cleanup removes its own workspace raw tree and releases its
+own claims.
+
 Every refusal is final for the triage as written (`retryable: false`): a revised
 triage is planned again; nothing reruns on its own.
 

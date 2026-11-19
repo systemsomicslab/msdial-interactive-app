@@ -1190,7 +1190,10 @@ def _project_from_analysis_unit_handoff(
         record = curated["provenance"]
         typed.evidence.append(
             f"Inputs fixed by the curated selection {record['triage_sha256']} ({record['standing']}): "
-            f"{record['rows_kept_count']} of the Catalog unit's {catalog_row_count} rows kept, "
+            f"{record['rows_kept_count']} of the Catalog unit's {catalog_row_count} rows kept"
+            + (f" and {record['added_members_admitted_count']} archive member(s) no row names admitted in their place"
+               if record.get("added_members_admitted_count") else "")
+            + ", "
             f"{record['rows_dropped_count']} dropped with reasons; decided by "
             f"{record['decided_by'].get('model') or 'an agent'} with skill {record['decided_by'].get('skill')} "
             f"{record['decided_by'].get('skill_version')}."
@@ -1269,8 +1272,12 @@ def _curated_selection_context(
                 f"{asserted} the caller names.",
             )
         original = {**verify_handoff_copy(record_handoff, handoff), "source": "decision_record_input"}
-    key = str(handoff.get("analysis_unit_id") or "").strip()
+    from .curated_selection import run_key
+
     child = str(child_key or "").strip()
+    # <unit_id>, <unit_id>-<child_key>, or <unit_id>-pos / -neg for a polarity_split child (0.5.70): the key the
+    # approved manifest names the run under. A malformed polarity_split is refused here, before anything is read.
+    key = run_key(str(handoff.get("analysis_unit_id") or ""), triage, child)
     return {
         "triage": triage,
         "triage_sha256": triage_sha,
@@ -1280,7 +1287,7 @@ def _curated_selection_context(
         "original_handoff": original,
         "child_key": child,
         "validator": dict(validator) if validator else None,
-        "campaign": campaign_selection(campaign_authorization_path, f"{key}-{child}" if child else key),
+        "campaign": campaign_selection(campaign_authorization_path, key),
         "record": record,
         "listing": listing,
     }
@@ -1302,10 +1309,14 @@ def _apply_workspace_unit_key(project: dict[str, Any], workspace_unit_key: str, 
 
 
 def _curated_unit_key(handoff: dict[str, Any], curated: dict[str, Any] | None) -> str:
-    """The campaign unit key of a handoff's unit: its id, or <id>-<child_key> for a triage child."""
+    """The campaign unit key of a handoff's unit: its id, <id>-<child_key> for a triage child, or <id>-pos / <id>-neg
+    for a polarity_split child (curated_selection.run_key, 0.5.70)."""
     key = str(handoff.get("analysis_unit_id") or "").strip()
-    child = str((curated or {}).get("child_key") or "")
-    return f"{key}-{child}" if child else key
+    if curated is None:
+        return key
+    from .curated_selection import run_key
+
+    return run_key(key, curated.get("triage") or {}, str(curated.get("child_key") or ""))
 
 
 def _repository_inspection(
