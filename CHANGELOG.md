@@ -4,6 +4,24 @@ Notable changes to MS-DIAL Interactive. The package version is kept in
 `pyproject.toml` and `msdial_app/__init__.py`; the Agent API version is separate.
 Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
 
+## [0.5.71] - Unreleased
+
+Partner units of a polarity-switching deposit. Built from origin/main (0.5.70).
+
+### Added
+- **`polarity_split.partner_unit_id`** (`msdial_app.curated_selection`, author's decision of 2026-11-20). Metabolomics
+  Workbench sometimes registers a positive and a negative analysis over one set of polarity-switching files, which the
+  Catalog lists as two units of opposite polarities keeping the same files (for example ST003452 AN005668/AN005669).
+  Each such unit now runs once, at its own polarity, as a polarity_split child of itself (`parent_unit_id` its own
+  unit id, run key `<unit_id>-pos` or `<unit_id>-neg` as in 0.5.70) that names the other unit in the optional
+  `partner_unit_id`, or null where that unit is absent or left out. The field is validated (a string other than the
+  triage's own unit id, or null; anything else is `curated_selection_polarity_split_invalid`) and recorded in
+  `repository_metadata.curated_selection.polarity_split`. A split without the field behaves exactly as in 0.5.70.
+- **Partners are siblings in the cross-unit check.** `polarity_split_siblings` is also true for two units of opposite
+  polarities whose polarity_split names each other as partner, so neither rule P's shared-file refusal nor rule D
+  applies between them, as between the two children of one unit. A unit that names a partner which does not name it
+  back, or two units of one polarity, are refused as before.
+
 ## [0.5.70] - Unreleased
 
 Two shapes of curated selection the stage 4 campaign meets, held by Interactive. Built from origin/main (0.5.69).
