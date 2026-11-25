@@ -4,6 +4,21 @@ Notable changes to MS-DIAL Interactive. The package version is kept in
 `pyproject.toml` and `msdial_app/__init__.py`; the Agent API version is separate.
 Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
 
+## [0.5.72] - Unreleased
+
+GC-MS alignment's EI similarity tolerance in the Kovats template. Built from origin/main (0.5.71).
+
+### Changed
+- **`resources/gcms_console_param_kovats.txt` writes `Spectrum similarity tolerance for alignment: 0.5`** (was 0.8),
+  the GC-MS default the MS-DIAL author chose on 2026-11-25 (MsdialWorkbench #934). In a GC-MS alignment two spectra of
+  one compound in two files commonly score 0.6-0.75 on the integrated EI similarity, so 0.8 splits most compounds:
+  on the Kovats demo, 45,536 spots and none detected in all 8 files. Retention is judged separately, by the retention
+  index (or time) tolerance for alignment, which is unchanged.
+- The change is inert with every released Console: they parse the key but the GC-MS joiner reads
+  `MS1 tolerance for alignment` (0.015 here) instead, which admits any spectrum within the retention window. The
+  template's value takes effect with the first Console that carries MsdialWorkbench #934. `MS1 tolerance for
+  alignment` and `MS1 factor for alignment` are left as they were, so a released Console aligns exactly as before.
+
 ## [0.5.71] - Unreleased
 
 Partner units of a polarity-switching deposit. Built from origin/main (0.5.70).

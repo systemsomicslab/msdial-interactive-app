@@ -63,7 +63,7 @@ Execute annotation process only for alignment file: False
 Alignment reference file ID: 0
 Retention time tolerance for alignment: 0.05
 Retention time factor for alignment: 0.5
-Spectrum similarity tolerance for alignment: 0.8
+Spectrum similarity tolerance for alignment: 0.5
 Spectrum similarity factor for alignment: 0.5
 MS1 tolerance for alignment: 0.015
 MS1 factor for alignment: 0.5
