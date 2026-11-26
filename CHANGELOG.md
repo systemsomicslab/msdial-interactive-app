@@ -18,6 +18,11 @@ GC-MS alignment's EI similarity tolerance and the quant-mass setting in the Kova
   `MS1 tolerance for alignment` (0.015 here) instead, which admits any spectrum within the retention window. The
   template's value takes effect with the first Console that carries MsdialWorkbench #934. `MS1 tolerance for
   alignment` and `MS1 factor for alignment` are left as they were, so a released Console aligns exactly as before.
+- **The Kovats template writes `Replace quant mass by user defined value: True`**, so a peak annotated from the MSP is
+  quantified on the library's QUANTMASS ion (nicotinic acid 180, pyruvic acid 174 on the Kovats demo). Released
+  Consoles already do this for this template: with `Only report top hit for MSP-based annotation: False` they take the
+  library ion whatever the setting says. MsdialWorkbench #944 makes them honour the setting, and this line keeps the
+  template's quantification as it is once that lands.
 
 ## [0.5.71] - Unreleased
 
