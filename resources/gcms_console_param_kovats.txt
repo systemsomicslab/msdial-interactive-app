@@ -87,3 +87,4 @@ RI compound: Alkanes
 Retention type: RT
 Alignment index type: RT
 Retention index alignment tolerance: 10
+Replace quant mass by user defined value: True

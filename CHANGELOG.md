@@ -6,7 +6,7 @@ Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
 
 ## [0.5.72] - Unreleased
 
-GC-MS alignment's EI similarity tolerance in the Kovats template. Built from origin/main (0.5.71).
+GC-MS alignment's EI similarity tolerance and the quant-mass setting in the Kovats template. Built from origin/main (0.5.71).
 
 ### Changed
 - **`resources/gcms_console_param_kovats.txt` writes `Spectrum similarity tolerance for alignment: 0.5`** (was 0.8),
