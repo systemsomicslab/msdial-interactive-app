@@ -4,6 +4,34 @@ Notable changes to MS-DIAL Interactive. The package version is kept in
 `pyproject.toml` and `msdial_app/__init__.py`; the Agent API version is separate.
 Agent API 0.5 requires the repository split endpoint introduced after API 0.4.
 
+## [0.5.72] - Unreleased
+
+GC-MS alignment's EI similarity tolerance, the quant-mass setting and the library-search amplitude cutoff in the Kovats template. Built from origin/main (0.5.71).
+
+### Changed
+- **`resources/gcms_console_param_kovats.txt` writes `Spectrum similarity tolerance for alignment: 0.5`** (was 0.8),
+  the GC-MS default the MS-DIAL author chose on 2026-11-25 (MsdialWorkbench #934). In a GC-MS alignment two spectra of
+  one compound in two files commonly score 0.6-0.75 on the integrated EI similarity, so 0.8 splits most compounds:
+  on the Kovats demo, 45,536 spots and none detected in all 8 files. Retention is judged separately, by the retention
+  index (or time) tolerance for alignment, which is unchanged.
+- The change is inert with every released Console: they parse the key but the GC-MS joiner reads
+  `MS1 tolerance for alignment` (0.015 here) instead, which admits any spectrum within the retention window. The
+  template's value takes effect with the first Console that carries MsdialWorkbench #934. `MS1 tolerance for
+  alignment` and `MS1 factor for alignment` are left as they were, so a released Console aligns exactly as before.
+- **The Kovats template writes `Replace quant mass by user defined value: True`**, so a peak annotated from the MSP is
+  quantified on the library's QUANTMASS ion (nicotinic acid 180, pyruvic acid 174 on the Kovats demo). Released
+  Consoles already do this for this template: with `Only report top hit for MSP-based annotation: False` they take the
+  library ion whatever the setting says. MsdialWorkbench #944 makes them honour the setting, and this line keeps the
+  template's quantification as it is once that lands.
+
+### Fixed
+- **The Kovats template writes `Relative amplitude cutoff for MSP-based annotation: 0`** (was 0.1). Every released
+  Console reads this key as a fraction of the base peak (since 2021; it was a percent when the key was added in 2020,
+  and the GUI still shows percent), so 0.1 cut each measured EI spectrum at 10% of its base peak before the library
+  search. The library spectrum is not cut, so the reverse dot product and the matched peaks percentage fell for every
+  pair, and the Console named 6 of 61,344 features of the Kovats demo; with the cutoff at 0.1% it names 405. 0 means
+  no cut in either unit, so the template keeps its meaning if the Console returns to percent (MsdialWorkbench #955).
+
 ## [0.5.71] - Unreleased
 
 Partner units of a polarity-switching deposit. Built from origin/main (0.5.70).

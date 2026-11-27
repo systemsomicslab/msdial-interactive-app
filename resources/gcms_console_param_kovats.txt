@@ -44,7 +44,7 @@ RT tolerance for MSP-based annotation: 100
 RI tolerance for MSP-based annotation: 20
 Mass range begin for MSP-based annotation: 85
 Mass range end for MSP-based annotation: 600
-Relative amplitude cutoff for MSP-based annotation: 0.1
+Relative amplitude cutoff for MSP-based annotation: 0
 Absolute amplitude cutoff for MSP-based annotation: 5
 Weighted dot product cutoff for MSP-based annotation: 0.5
 Simple dot product cutoff for MSP-based annotation: 0.5
@@ -63,7 +63,7 @@ Execute annotation process only for alignment file: False
 Alignment reference file ID: 0
 Retention time tolerance for alignment: 0.05
 Retention time factor for alignment: 0.5
-Spectrum similarity tolerance for alignment: 0.8
+Spectrum similarity tolerance for alignment: 0.5
 Spectrum similarity factor for alignment: 0.5
 MS1 tolerance for alignment: 0.015
 MS1 factor for alignment: 0.5
@@ -87,3 +87,4 @@ RI compound: Alkanes
 Retention type: RT
 Alignment index type: RT
 Retention index alignment tolerance: 10
+Replace quant mass by user defined value: True
